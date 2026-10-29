@@ -1,0 +1,10 @@
+{
+  "status": "ok",
+  "requestId": "head-1",
+  "head": {
+    "sessionId": "00000000-0000-4000-8000-000000000001",
+    "sessionFile": "/tmp/pi-web-fixture/session.jsonl",
+    "leafId": "00000002",
+    "idle": true
+  }
+}

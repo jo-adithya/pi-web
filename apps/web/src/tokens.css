@@ -1,0 +1,62 @@
+/* Palette and radius tokens shared with ../budget-tracker/apps/web/src/styles.css. */
+:root {
+  color-scheme: light;
+  --background: oklch(0.982 0.006 250);
+  --foreground: oklch(0.24 0.022 250);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.24 0.022 250);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.24 0.022 250);
+  --primary: oklch(0.51 0.18 277);
+  --primary-foreground: oklch(0.99 0.003 277);
+  --secondary: oklch(0.95 0.01 250);
+  --secondary-foreground: oklch(0.3 0.022 250);
+  --muted: oklch(0.955 0.007 250);
+  --muted-foreground: oklch(0.51 0.018 250);
+  --accent: oklch(0.945 0.025 277);
+  --accent-foreground: oklch(0.4 0.12 277);
+  --error: oklch(0.577 0.245 27.325);
+  --success: oklch(0.43 0.11 150);
+  --success-muted: oklch(0.96 0.025 150);
+  --error-muted: oklch(0.97 0.018 27);
+  --border: oklch(0.905 0.01 250);
+  --input: oklch(0.65 0.012 250);
+  --ring: oklch(0.51 0.18 277);
+  --chart-1: oklch(0.785 0.115 274.713);
+  --chart-2: oklch(0.585 0.233 277.117);
+  --chart-3: oklch(0.511 0.262 276.966);
+  --chart-4: oklch(0.457 0.24 277.023);
+  --chart-5: oklch(0.398 0.195 277.366);
+  --radius: 0.625rem;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: oklch(0.175 0.012 250);
+  --foreground: oklch(0.96 0.006 250);
+  --card: oklch(0.225 0.014 250);
+  --card-foreground: oklch(0.96 0.006 250);
+  --popover: oklch(0.26 0.016 250);
+  --popover-foreground: oklch(0.96 0.006 250);
+  --primary: oklch(0.76 0.12 277);
+  --primary-foreground: oklch(0.22 0.045 277);
+  --secondary: oklch(0.295 0.018 250);
+  --secondary-foreground: oklch(0.94 0.008 250);
+  --muted: oklch(0.275 0.012 250);
+  --muted-foreground: oklch(0.73 0.016 250);
+  --accent: oklch(0.32 0.045 277);
+  --accent-foreground: oklch(0.9 0.045 277);
+  --error: oklch(0.704 0.191 22.216);
+  --success: oklch(0.78 0.13 150);
+  --success-muted: oklch(0.28 0.045 150);
+  --error-muted: oklch(0.28 0.04 27);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(0.53 0.012 250);
+  --ring: oklch(0.76 0.12 277);
+  --chart-1: oklch(0.785 0.115 274.713);
+  --chart-2: oklch(0.585 0.233 277.117);
+  --chart-3: oklch(0.511 0.262 276.966);
+  --chart-4: oklch(0.457 0.24 277.023);
+  --chart-5: oklch(0.398 0.195 277.366);
+}
+

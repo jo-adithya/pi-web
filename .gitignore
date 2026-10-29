@@ -1,0 +1,4 @@
+/target
+node_modules/
+/apps/web/dist/
+__pycache__/

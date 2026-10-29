@@ -1,0 +1,16 @@
+{
+  "name": "pi-web-workspace",
+  "private": true,
+  "packageManager": "bun@1.4.4",
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "bun run --cwd apps/web dev",
+    "build": "bun run types:check && bun run --cwd apps/web build",
+    "typecheck": "bun run types:check && bun run --cwd apps/web typecheck",
+    "test": "cargo test --locked --workspace --all-targets && bun run --cwd apps/web test",
+    "types:generate": "cargo run --locked -p pi-web --example export_types",
+    "types:check": "cargo run --locked -p pi-web --example export_types -- --check"
+  }
+}
