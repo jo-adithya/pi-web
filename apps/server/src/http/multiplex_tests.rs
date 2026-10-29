@@ -149,6 +149,43 @@ async fn reopened_runtime_replaces_undrained_old_subscription() {
 }
 
 #[tokio::test]
+async fn separate_sockets_subscribe_to_the_same_runtime() {
+    let (root, manager) = fixture();
+    let task = manager.clone();
+    let outcome = tokio::spawn(async move {
+        let id = task.snapshot().await.selected;
+        let mut desktop = Vec::new();
+        let mut phone = Vec::new();
+        subscribe(&mut desktop, &task, "desktop", &id)
+            .await
+            .unwrap();
+        subscribe(&mut phone, &task, "phone", &id).await.unwrap();
+        assert!(desktop[0].handle.same_runtime(&phone[0].handle));
+        // Repeated subscription on one socket remains idempotent.
+        subscribe(&mut phone, &task, "phone", &id).await.unwrap();
+        assert_eq!(phone.len(), 1);
+        for slots in [&mut desktop, &mut phone] {
+            let (_, frame) = next_frame(slots, &mut 0).await;
+            let message: crate::protocol::ServerMessage =
+                serde_json::from_str(&frame.unwrap().text).unwrap();
+            assert_eq!(message.session_id, id);
+            assert!(matches!(
+                message.body,
+                crate::protocol::ServerBody::Hello { .. }
+            ));
+        }
+        desktop[0].handle.disconnect("desktop".into()).await;
+        // A desktop disconnect does not close the phone's source receiver.
+        assert!(!phone[0].connection.frames.is_closed());
+        phone[0].handle.disconnect("phone".into()).await;
+    })
+    .await;
+    assert!(manager.shutdown().await);
+    fs::remove_dir_all(root).unwrap();
+    outcome.unwrap();
+}
+
+#[tokio::test]
 async fn deletion_prunes_queued_subscription_and_stale_success_target() {
     let (root, manager) = fixture();
     let captured = manager

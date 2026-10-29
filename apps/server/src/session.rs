@@ -4,6 +4,7 @@
 mod admission;
 mod commands;
 mod history;
+mod quota;
 mod settings;
 
 use crate::{
@@ -31,6 +32,7 @@ use tokio::{
 
 const RPC_DEADLINE: Duration = Duration::from_secs(15);
 const HEAD_PREFIX: &str = "pi-web:history-head:v1:";
+const MAX_CLIENTS: usize = 8;
 const OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serialized browser frame holding its byte permit until the writer finishes.
@@ -44,6 +46,7 @@ pub struct Connection {
 }
 #[derive(Clone)]
 pub struct SessionHandle {
+    pub(crate) images: crate::images::Images,
     tx: mpsc::Sender<Control>,
     stop: watch::Sender<bool>,
     stopped: watch::Receiver<Option<bool>>,
@@ -51,7 +54,7 @@ pub struct SessionHandle {
     summary: watch::Receiver<RuntimeSummary>,
 }
 impl SessionHandle {
-    /// Stable catalog identity and bounded lifecycle state, without taking controller ownership.
+    /// Stable catalog identity and bounded lifecycle state, without attaching a subscriber.
     pub(crate) fn same_runtime(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
     }
@@ -72,7 +75,7 @@ impl SessionHandle {
             Err(code) => Err(code),
         }
     }
-    /// Acquires the sole controller and atomically queues hello plus a snapshot.
+    /// Attaches a bounded subscriber and atomically queues its hello plus snapshot.
     pub async fn connect(&self, id: String) -> Result<Connection, &'static str> {
         let (send, receive) = oneshot::channel();
         self.tx
@@ -150,6 +153,7 @@ struct CancelWait {
     deadline: Instant,
 }
 enum Done {
+    QuotaAck(String, Result<Value, rpc::Error>),
     Context(String, Result<Value, rpc::Error>),
     Setting(String, Result<Value, rpc::Error>),
     Capabilities(Result<Value, rpc::Error>, Result<Value, rpc::Error>),
@@ -163,6 +167,7 @@ enum Done {
     Terminated(rpc::Exit),
 }
 struct Runtime {
+    images: crate::images::Images,
     config: Config,
     store: Arc<MetadataStore>,
     ownership: crate::ownership::Ownership,
@@ -177,6 +182,10 @@ struct Runtime {
     view: ViewState,
     commands: Vec<SlashCommand>,
     settings: AgentSettings,
+    background: crate::background::Background,
+    quota: quota::Cache,
+    quota_registered: bool,
+    quota_model: Option<ModelOption>,
     context_usage: Option<ContextUsage>,
     context_pending: bool,
     context_refresh: bool,
@@ -184,13 +193,15 @@ struct Runtime {
     capabilities_pending: bool,
     settings_refresh: bool,
     status: RuntimeStatus,
-    client: Option<Client>,
+    clients: Vec<Client>,
     requests: Requests,
     jobs: JoinSet<Done>,
     dialogs: VecDeque<PendingDialog>,
     head: Option<HeadWait>,
     revision: u64,
     settled: u64,
+    push: Option<crate::push::PushService>,
+    push_run_active: bool,
     seq: u32,
     patches: Vec<ViewPatch>,
     patch_bytes: usize,
@@ -234,6 +245,7 @@ pub fn start(config: Config) -> io::Result<SessionHandle> {
         Arc::new(store),
         metadata,
         crate::ownership::Ownership::default(),
+        None,
     )
 }
 
@@ -243,6 +255,7 @@ pub(crate) fn start_owned(
     store: Arc<MetadataStore>,
     mut metadata: SessionMetadata,
     ownership: crate::ownership::Ownership,
+    push: Option<crate::push::PushService>,
 ) -> io::Result<SessionHandle> {
     if metadata.cwd != config.cwd {
         return Err(io::Error::other("metadata belongs to a different project"));
@@ -268,6 +281,7 @@ pub(crate) fn start_owned(
         persistence: false,
         cancel_unconfirmed: false,
         notice: None,
+        lsp_status: None,
     };
     let epoch = config::identity()?;
     ownership.claim(&metadata.app_id, metadata.pi_session_path.as_deref())?;
@@ -277,7 +291,9 @@ pub(crate) fn start_owned(
         process: ProcessStatus::Starting,
         activity: Activity::Idle,
     });
+    let images = crate::images::Images::default();
     let runtime = Runtime {
+        images: images.clone(),
         config,
         store,
         ownership,
@@ -292,6 +308,10 @@ pub(crate) fn start_owned(
         view: ViewState::default(),
         commands: Vec::new(),
         settings: AgentSettings::default(),
+        background: crate::background::Background::default(),
+        quota: quota::Cache::default(),
+        quota_registered: false,
+        quota_model: None,
         context_usage: None,
         context_pending: false,
         context_refresh: false,
@@ -299,13 +319,15 @@ pub(crate) fn start_owned(
         capabilities_pending: false,
         settings_refresh: false,
         status,
-        client: None,
+        clients: Vec::new(),
         requests: Requests::default(),
         jobs: JoinSet::new(),
         dialogs: VecDeque::new(),
         head: None,
         revision: 0,
         settled: 0,
+        push,
+        push_run_active: false,
         seq: 0,
         patches: Vec::new(),
         patch_bytes: 0,
@@ -324,6 +346,7 @@ pub(crate) fn start_owned(
         let _ = stopped_tx.send(Some(clean));
     });
     Ok(SessionHandle {
+        images,
         tx,
         stop,
         stopped,
@@ -372,7 +395,7 @@ impl Runtime {
                 break;
             }
         }
-        self.client = None;
+        self.clients.clear();
         let dialog_ids: Vec<_> = self
             .dialogs
             .drain(..)
@@ -452,42 +475,47 @@ impl Runtime {
                 }
             }
             Control::Connect(id, reply) => {
-                if self.client.is_some() {
+                if self.clients.iter().any(|c| c.id == id) {
                     let _ = reply.send(Err("already_attached"));
+                    return;
+                }
+                if self.clients.len() >= MAX_CLIENTS {
+                    let _ = reply.send(Err("too_many_clients"));
                     return;
                 }
                 self.flush();
                 let (sender, frames) = mpsc::channel(32);
-                self.client = Some(Client {
-                    id,
+                self.clients.push(Client {
+                    id: id.clone(),
                     sender,
                     budget: Arc::new(Semaphore::new(OUTBOUND_BYTES)),
                 });
-                self.send(ServerBody::Hello {
-                    project: self
-                        .config
-                        .cwd
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into(),
-                    process: self.status.process.clone(),
-                });
-                self.snapshot();
+                self.send_to(
+                    Some(&id),
+                    ServerBody::Hello {
+                        project: self
+                            .config
+                            .cwd
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into(),
+                        process: self.status.process.clone(),
+                    },
+                );
+                self.snapshot_to(Some(&id));
                 if reply.send(Ok(Connection { frames })).is_err() {
-                    self.detach();
+                    self.detach(&id);
                 }
             }
             Control::Disconnect(id) => {
-                if self.client.as_ref().is_some_and(|c| c.id == id) {
-                    self.detach();
-                }
+                self.detach(&id);
             }
             Control::Message(id, message) => self.command(&id, message),
         }
     }
     fn command(&mut self, client_id: &str, message: BrowserMessage) {
-        if !self.client.as_ref().is_some_and(|c| c.id == client_id) {
+        if !self.clients.iter().any(|c| c.id == client_id) {
             return;
         }
         let error = if message.session_id != self.metadata.app_id {
@@ -498,26 +526,32 @@ impl Runtime {
             None
         };
         if let Some(error) = error {
-            self.reject(&message.request_id, error);
+            self.reject(client_id, &message.request_id, error);
             return;
         }
-        match self.requests.begin(&message) {
+        let id = match self.requests.begin(client_id, &message) {
             Err(code) => {
-                self.reject(&message.request_id, code);
+                self.reject(client_id, &message.request_id, code);
                 return;
             }
             Ok(Admission::Duplicate(saved)) => {
-                self.send(ServerBody::Result {
-                    result: saved.unwrap_or_else(|| {
-                        result(&message.request_id, true, "pending", None, None)
-                    }),
-                });
+                self.send_to(
+                    Some(client_id),
+                    ServerBody::Result {
+                        result: saved.unwrap_or_else(|| {
+                            result(&message.request_id, true, "pending", None, None)
+                        }),
+                    },
+                );
                 return;
             }
-            Ok(Admission::Fresh) => {}
-        }
-        let id = message.request_id;
+            Ok(Admission::Fresh(token)) => token,
+        };
         match message.action {
+            BrowserAction::RefreshCodexUsage => {
+                self.request_quota();
+                self.result(&id, true, "accepted", None, None);
+            }
             BrowserAction::SetModel { provider, model_id } => {
                 if !self.settings_idle() {
                     self.result(&id, false, "busy", None, None);
@@ -547,10 +581,10 @@ impl Runtime {
             }
             BrowserAction::Attach => {
                 self.flush();
-                self.snapshot();
+                self.snapshot_to(Some(client_id));
                 self.result(&id, true, "attached", None, None);
             }
-            BrowserAction::Prompt { text } => {
+            BrowserAction::Prompt { text, images } => {
                 // Hold the bounded transport queue until identity reconciliation cuts
                 // over at its exact stdout boundary. Never consume a future epoch
                 // into the current view while the state response is still pending.
@@ -574,6 +608,13 @@ impl Runtime {
                     self.result(&id, false, "busy", None, None);
                     return;
                 }
+                if !images.is_empty() && !self.settings.model.as_ref().is_some_and(|model| model.images) {
+                    self.result(&id, false, "model_does_not_support_images", None, None); return;
+                }
+                let images = match self.images.prompt(&images) {
+                    Ok(images) => images,
+                    Err(code) => { self.result(&id, false, code, None, None); return; }
+                };
                 self.view.activity = Activity::Submitting;
                 self.status.error = None;
                 self.status.last_outcome = None;
@@ -591,7 +632,7 @@ impl Runtime {
                         settled,
                         process
                             .request_with_write_notice(
-                                RpcCommand::Prompt { message: text },
+                                RpcCommand::Prompt { message: text, images },
                                 RPC_DEADLINE,
                                 written,
                             )
@@ -680,11 +721,13 @@ impl Runtime {
                 self.head = None;
                 self.requests = Requests::default();
                 self.view = ViewState::default();
+                self.background = crate::background::Background::default();
                 self.commands.clear();
                 self.reset_settings();
                 self.seq = 0;
                 self.revision = 0;
                 self.settled = 0;
+                self.push_run_active = false;
                 self.patches.clear();
                 self.patch_bytes = 0;
                 self.state_requests = 0;
@@ -768,6 +811,46 @@ impl Runtime {
             Done::Capabilities(models, levels)
         });
     }
+    /// Requests private quota work independently of agent activity; all subscribers share the cache.
+    fn request_quota(&mut self) {
+        if self.status.process != ProcessStatus::Ready
+            || self.exit_observed
+            || !self.quota_registered
+            || self.config.isolated
+            || !self
+                .settings
+                .model
+                .as_ref()
+                .is_some_and(|m| m.provider == "openai-codex")
+        {
+            self.quota = quota::Cache::default();
+            self.send_quota();
+            return;
+        }
+        let Ok(token) = config::identity() else {
+            return;
+        };
+        if !self.quota.begin(token.clone(), Instant::now()) {
+            self.send_quota();
+            return;
+        }
+        self.send_quota();
+        let process = self.process.as_ref().unwrap().clone();
+        self.jobs.spawn(async move {
+            let message = format!("/pi-web-codex-usage {token}");
+            Done::QuotaAck(
+                token,
+                process
+                    .request(RpcCommand::Prompt { message, images: vec![] }, RPC_DEADLINE)
+                    .await,
+            )
+        });
+    }
+    fn send_quota(&mut self) {
+        self.send(ServerBody::CodexUsage {
+            usage: self.quota.value.clone(),
+        });
+    }
     /// Coalesces read-only context samples; a later lifecycle change supersedes an in-flight sample.
     fn request_context(&mut self) {
         let Some(process) = self.process.as_ref().filter(|_| !self.exit_observed) else {
@@ -795,12 +878,19 @@ impl Runtime {
         });
     }
     fn send_settings(&mut self) {
+        if self.quota_model != self.settings.model {
+            self.quota_model = self.settings.model.clone();
+            self.quota = quota::Cache::default();
+            self.send_quota();
+        }
         self.send(ServerBody::Settings {
             settings: self.settings.clone(),
         });
     }
     /// Discards per-epoch settings before replaying a new runtime identity.
     fn reset_settings(&mut self) {
+        self.quota = quota::Cache::default();
+        self.quota_model = None;
         self.settings = AgentSettings::default();
         self.context_usage = None;
         self.context_pending = false;
@@ -829,6 +919,13 @@ impl Runtime {
             return;
         }
         match done {
+            Done::QuotaAck(token, response) => {
+                self.quota.ack(
+                    &token,
+                    response.is_ok_and(|v| v["disposition"] == "handled"),
+                );
+                self.send_quota();
+            }
             Done::Context(epoch, response) => {
                 if epoch != self.epoch {
                     return;
@@ -952,6 +1049,23 @@ impl Runtime {
                     self.fail("Required history-head extension was not registered from the configured path");
                     return;
                 }
+                self.quota_registered = !self.config.isolated
+                    && response.as_ref().is_ok_and(|data| {
+                        let Ok(expected) = self.config.quota_adapter.canonicalize() else {
+                            return false;
+                        };
+                        data["commands"].as_array().is_some_and(|commands| {
+                            let matching: Vec<_> = commands
+                                .iter()
+                                .filter(|c| c["name"] == "pi-web-codex-usage")
+                                .collect();
+                            matching.len() == 1
+                                && matching[0]["source"] == "extension"
+                                && matching[0]["sourceInfo"]["path"].as_str().is_some_and(|p| {
+                                    Path::new(p).canonicalize().ok().as_ref() == Some(&expected)
+                                })
+                        })
+                    });
                 self.commands = commands::project(&response.unwrap());
                 self.send(ServerBody::Commands {
                     commands: self.commands.clone(),
@@ -1085,7 +1199,16 @@ impl Runtime {
         ) {
             self.request_context();
         }
+        if event["type"] == "agent_start" {
+            self.push_run_active = true;
+        }
         if event["type"] == "agent_settled" {
+            // This gate belongs to the runtime epoch, independent of attached clients.
+            if std::mem::take(&mut self.push_run_active) && event["aborted"] != true {
+                if let Some(push) = &self.push {
+                    push.completed();
+                }
+            }
             self.settled += 1;
             self.status.last_outcome = Some(
                 if event["aborted"] == true {
@@ -1113,7 +1236,16 @@ impl Runtime {
             });
             self.request_state(StateReason::Settled);
         }
-        let patches = self.view.apply(&event);
+        if self.background.apply(&event) {
+            self.send(ServerBody::BackgroundTasks {
+                tasks: self.background.tasks(),
+            });
+        }
+        let mut display_event = event;
+        if let Some(message) = display_event.get_mut("message") {
+            self.images.project_message(message);
+        }
+        let patches = self.view.apply(&display_event);
         if !patches.is_empty() {
             self.revision = self.revision.wrapping_add(1);
             self.push_patches(patches);
@@ -1157,6 +1289,11 @@ impl Runtime {
     }
     fn extension(&mut self, event: Value) {
         let method = event["method"].as_str().unwrap_or("");
+        if method == "setStatus" && event["statusKey"] == "lsp" {
+            self.status.lsp_status = settings::lsp_status(&event["statusText"]);
+            self.dirty = true;
+            return;
+        }
         if method == "setStatus" && event["statusKey"] == "codex-fast" {
             self.settings.codex_fast = event["statusText"].as_str().map(|text| {
                 clip(
@@ -1169,6 +1306,11 @@ impl Runtime {
         }
         if method == "notify" {
             let message = event["message"].as_str().unwrap_or("");
+            if let Some(encoded) = message.strip_prefix(quota::PREFIX) {
+                self.quota.notify(encoded);
+                self.send_quota();
+                return;
+            }
             if let Some(encoded) = message.strip_prefix(HEAD_PREFIX) {
                 if message.len() <= 8192
                     && let Ok(HistoryHeadReply::Ok { request_id, head }) =
@@ -1209,9 +1351,9 @@ impl Runtime {
             || self.dialogs.iter().any(|d| d.dialog.id == id);
         // Keep rejecting input until cancellation is confirmed or the child exits;
         // a late dialog must not keep Stop waiting for user interaction.
-        if self.cancelling || self.client.is_none() || invalid {
+        if self.cancelling || self.clients.is_empty() || invalid {
             self.cancel_dialog(id.to_owned());
-            self.status.notice = Some("Extension input was cancelled while stopping, without a controller, or because its limits were exceeded".into());
+            self.status.notice = Some("Extension input was cancelled while stopping, without an attached browser, or because its limits were exceeded".into());
             self.dirty = true;
             return;
         }
@@ -1302,8 +1444,12 @@ impl Runtime {
             self.cancel_dialog(id);
         }
     }
-    fn detach(&mut self) {
-        self.client = None;
+    /// Removes one subscriber; only the last departure cancels pending input.
+    fn detach(&mut self, id: &str) {
+        self.clients.retain(|client| client.id != id);
+        if !self.clients.is_empty() {
+            return;
+        }
         if !self.dialogs.is_empty() {
             self.status.notice =
                 Some("Pending extension input was cancelled when the browser disconnected".into());
@@ -1333,7 +1479,7 @@ impl Runtime {
             Done::HeadAck(
                 token,
                 process
-                    .request(RpcCommand::Prompt { message }, RPC_DEADLINE)
+                    .request(RpcCommand::Prompt { message, images: vec![] }, RPC_DEADLINE)
                     .await,
             )
         });
@@ -1364,10 +1510,11 @@ impl Runtime {
                 let revision = self.revision;
                 let roots = self.config.session_roots.clone();
                 let cwd = self.config.cwd.clone();
+                let images = self.images.clone();
                 self.jobs.spawn(async move {
                     Done::History(
                         tokio::task::spawn_blocking(move || {
-                            history::scan(head, revision, roots, cwd)
+                            history::scan(head, revision, roots, cwd, images)
                         })
                         .await
                         .unwrap_or_else(|_| Err("History worker failed".into())),
@@ -1505,6 +1652,7 @@ impl Runtime {
         self.seq = 0;
         self.revision = 0;
         self.settled = 0;
+        self.push_run_active = false;
         self.patches.clear();
         self.patch_bytes = 0;
         self.status.last_outcome = None;
@@ -1534,6 +1682,9 @@ impl Runtime {
         self.dirty = true;
     }
     fn expire(&mut self) {
+        if self.quota.expire(Instant::now()) {
+            self.send_quota();
+        }
         if self
             .cancel_wait
             .as_ref()
@@ -1577,6 +1728,11 @@ impl Runtime {
         if self.status.process == ProcessStatus::Failed {
             return;
         }
+        if self.background.interrupt() {
+            self.send(ServerBody::BackgroundTasks {
+                tasks: self.background.tasks(),
+            });
+        }
         self.status.process = ProcessStatus::Failed;
         self.status.error = Some(clip(message, 512));
         self.status.last_outcome = Some("error".into());
@@ -1589,7 +1745,13 @@ impl Runtime {
         }
     }
     fn exited(&mut self, exit: rpc::Exit) {
+        if self.background.interrupt() {
+            self.send(ServerBody::BackgroundTasks {
+                tasks: self.background.tasks(),
+            });
+        }
         self.exit_observed = true;
+        self.status.lsp_status = None;
         self.cleanup_complete = exit.reaped && exit.cleanup_error.is_none();
         self.events = None;
         self.head = None;
@@ -1647,26 +1809,65 @@ impl Runtime {
         }
     }
     fn snapshot(&mut self) {
+        self.snapshot_to(None);
+    }
+    /// Replays state to one new/resnapshotting subscriber, or all after a state reset.
+    fn snapshot_to(&mut self, client: Option<&str>) {
         self.status.activity = self.activity();
-        self.send(ServerBody::Snapshot {
-            through_seq: self.seq,
-            status: self.status.clone(),
-            messages: self.view.messages(),
-            dialogs: self.dialogs.iter().map(|d| d.dialog.clone()).collect(),
-            older_history: self.view.older_history,
-        });
-        self.send(ServerBody::Commands {
-            commands: self.commands.clone(),
-        });
-        self.send_settings();
-        self.send_context();
+        self.send_to(
+            client,
+            ServerBody::Snapshot {
+                through_seq: self.seq,
+                status: self.status.clone(),
+                messages: self.view.messages(),
+                dialogs: self.dialogs.iter().map(|d| d.dialog.clone()).collect(),
+                older_history: self.view.older_history,
+            },
+        );
+        self.send_to(
+            client,
+            ServerBody::Commands {
+                commands: self.commands.clone(),
+            },
+        );
+        self.send_to(
+            client,
+            ServerBody::Settings {
+                settings: self.settings.clone(),
+            },
+        );
+        self.send_to(
+            client,
+            ServerBody::ContextUsage {
+                usage: self.context_usage.clone(),
+            },
+        );
+        self.send_to(
+            client,
+            ServerBody::CodexUsage {
+                usage: self.quota.value.clone(),
+            },
+        );
+        self.send_to(
+            client,
+            ServerBody::BackgroundTasks {
+                tasks: self.background.tasks(),
+            },
+        );
     }
     fn flush(&mut self) {
         if !self.dirty && self.patches.is_empty() {
             return;
         }
         let Some(seq) = self.seq.checked_add(1) else {
-            self.detach();
+            let ids: Vec<_> = self
+                .clients
+                .iter()
+                .map(|client| client.id.clone())
+                .collect();
+            for id in ids {
+                self.detach(&id);
+            }
             return;
         };
         self.seq = seq;
@@ -1682,10 +1883,13 @@ impl Runtime {
             older_history: self.view.older_history,
         });
     }
-    fn reject(&mut self, id: &str, code: &str) {
-        self.send(ServerBody::Result {
-            result: result(&clip(id, 64), false, code, None, None),
-        });
+    fn reject(&mut self, client: &str, id: &str, code: &str) {
+        self.send_to(
+            Some(client),
+            ServerBody::Result {
+                result: result(&clip(id, 64), false, code, None, None),
+            },
+        );
     }
     fn result(
         &mut self,
@@ -1699,13 +1903,15 @@ impl Runtime {
             return;
         }
         let result = result(id, ok, code, disposition, draft);
-        self.requests.finish(result.clone());
-        self.send(ServerBody::Result { result });
+        if let Some((client, result)) = self.requests.finish(result) {
+            self.send_to(Some(&client), ServerBody::Result { result });
+        }
     }
     fn send(&mut self, body: ServerBody) {
-        let Some(client) = &self.client else {
-            return;
-        };
+        self.send_to(None, body);
+    }
+    /// Nonblocking fanout with independent queue and byte budgets per subscriber.
+    fn send_to(&mut self, target: Option<&str>, body: ServerBody) {
         let message = ServerMessage {
             v: 1,
             session_id: self.metadata.app_id.clone(),
@@ -1713,26 +1919,32 @@ impl Runtime {
             body,
         };
         let text = serde_json::to_string(&message).expect("application wire serialization");
-        let sent = if text.len() <= OUTBOUND_BYTES {
-            client
-                .budget
-                .clone()
-                .try_acquire_many_owned(text.len() as u32)
-                .ok()
-                .is_some_and(|permit| {
-                    client
-                        .sender
-                        .try_send(Frame {
-                            text,
-                            _permit: permit,
-                        })
-                        .is_ok()
-                })
-        } else {
-            false
-        };
-        if !sent {
-            self.detach();
+        let mut detached = Vec::new();
+        for client in &self.clients {
+            if target.is_some_and(|id| id != client.id) {
+                continue;
+            }
+            let sent = text.len() <= OUTBOUND_BYTES
+                && client
+                    .budget
+                    .clone()
+                    .try_acquire_many_owned(text.len() as u32)
+                    .ok()
+                    .is_some_and(|permit| {
+                        client
+                            .sender
+                            .try_send(Frame {
+                                text: text.clone(),
+                                _permit: permit,
+                            })
+                            .is_ok()
+                    });
+            if !sent {
+                detached.push(client.id.clone());
+            }
+        }
+        for id in detached {
+            self.detach(&id);
         }
     }
 }
@@ -1814,6 +2026,11 @@ fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::Proce
         "--extension".into(),
         config.head_adapter.canonicalize()?.into_os_string(),
     ];
+    if !config.isolated
+        && let Ok(adapter) = config.quota_adapter.canonicalize()
+    {
+        args.extend([OsString::from("--extension"), adapter.into_os_string()]);
+    }
     if let Some(session) = session {
         args.push("--session".into());
         args.push(

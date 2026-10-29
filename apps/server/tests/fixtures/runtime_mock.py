@@ -35,9 +35,14 @@ def emit(value):
 def response(command, data=None):
     emit({"type": "response", "id": command["id"], "command": command["type"], "success": True, "data": data})
 
-model = {"id": "fixture-model", "provider": "fixture", "name": "Fixture", "baseUrl": "PRIVATE"}
+model = {"id": "fixture-model", "provider": "openai-codex" if os.path.exists("codex-usage") else "fixture", "name": "Fixture", "baseUrl": "PRIVATE"}
+if os.path.exists("supports-images"):
+    model["input"] = ["text", "image"]
 thinking = "off"
 emit({"type": "extension_ui_request", "method": "setStatus", "statusKey": "codex-fast", "statusText": "codex fast (requested)"})
+
+if os.path.exists("lsp-status"):
+    emit({"type": "extension_ui_request", "method": "setStatus", "statusKey": "lsp", "statusText": "\x1b[36mLSP: 1/2 servers\x1b[39m"})
 
 for line in sys.stdin:
     command = json.loads(line)
@@ -94,13 +99,25 @@ for line in sys.stdin:
         response(command)
     elif kind == "get_commands":
         commands = [{"name": "pi-web-history-head", "source": "extension", "sourceInfo": {"path": adapter}}]
+        extensions = [args[i + 1] for i, arg in enumerate(args) if arg == "--extension"]
+        if os.path.exists("codex-usage") and len(extensions) > 1:
+            commands.append({"name": "pi-web-codex-usage", "source": "extension", "sourceInfo": {"path": "/wrong/path" if os.path.exists("wrong-quota-path") else extensions[1]}})
         if os.path.exists("slash-commands.json"):
             with open("slash-commands.json") as file:
                 commands += json.load(file)
         response(command, {"commands": commands})
     elif kind == "prompt":
         text = command["message"]
-        if text.startswith("/pi-web-history-head "):
+        if command.get("images"):
+            emit({"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": text}] + command["images"]}})
+            emit({"type": "message_end", "message": {"role": "toolResult", "content": [{"type": "text", "text": "PRIVATE_TOOL_TEXT"}] + command["images"]}})
+            response(command, {"disposition": "handled"})
+        elif text.startswith("/pi-web-codex-usage "):
+            token = text.split(" ", 1)[1]
+            reply = {"requestId": token, "status": "unavailable", "clear": False} if os.path.exists("quota-fail") else {"requestId": token, "status": "ok", "clear": False, "observedAt": 1800000000, "windows": [{"identity": "primary", "durationSeconds": 18000, "usedPercent": 72.5, "resetsAt": 1800003600}]}
+            emit({"type": "extension_ui_request", "method": "notify", "message": "pi-web:codex-usage:v1:" + json.dumps(reply)})
+            response(command, {"disposition": "handled"})
+        elif text.startswith("/pi-web-history-head "):
             token = text.split(" ", 1)[1]
             head_count += 1
             if head_count == 2 and os.path.exists("history-race"):
@@ -115,6 +132,29 @@ for line in sys.stdin:
             with open(path, "w") as file:
                 file.write(json.dumps({"type": "session", "version": 3, "id": pi_id, "cwd": os.getcwd()}) + "\n")
             response(command, {"disposition": "handled"})
+        elif text in ("/lsp-update", "/lsp-clear"):
+            status = {"type": "extension_ui_request", "method": "setStatus", "statusKey": "lsp"}
+            if text == "/lsp-update":
+                status["statusText"] = "\x1b[33mLSP: 2/2 servers, 1 warning(s)\x1b[39m"
+            emit(status)
+            emit({"type": "extension_ui_request", "method": "setStatus", "statusKey": "unrelated", "statusText": "PRIVATE"})
+            response(command, {"disposition": "handled"})
+        elif text in ("/background-launch", "/background-complete"):
+            if text == "/background-launch":
+                emit({"type": "tool_execution_start", "toolName": "Agent", "toolCallId": "background-call", "args": {"prompt": "PRIVATE_PROMPT"}})
+                emit({"type": "tool_execution_end", "toolName": "Agent", "toolCallId": "background-call", "isError": False, "result": {"content": [{"text": "PRIVATE_PATH"}], "details": {"agentId": "12345678-abcd-1234", "status": "background", "displayName": "Scout", "description": "Inspect events"}}})
+            else:
+                emit({"type": "entry_appended", "entry": {"type": "custom", "customType": "subagents:record", "data": {"id": "12345678-abcd-1234", "status": "completed", "result": "Verified result", "startedAt": 1000, "completedAt": 2000}}})
+            response(command, {"disposition": "handled"})
+        elif text in ("/workflow-launch", "/workflow-complete"):
+            if text == "/workflow-launch":
+                emit({"type": "tool_execution_end", "toolName": "SubagentWorkflow", "toolCallId": "workflow-call", "isError": False, "result": {"content": [{"text": "PRIVATE_SCRIPT"}], "details": {"taskId": "wf_012345abcdef"}}})
+            else:
+                emit({"type": "message_end", "message": {"role": "custom", "customType": "subagent-notification", "content": "PRIVATE_NOTIFICATION", "display": True, "details": {"id": "wf_012345abcdef", "description": "Workflow Review", "status": "completed", "resultPreview": "Workflow verified"}}})
+            response(command, {"disposition": "handled"})
+        elif text == "/background-crash":
+            emit({"type": "tool_execution_end", "toolName": "Agent", "toolCallId": "crash-call", "isError": False, "result": {"details": {"agentId": "crash-agent", "status": "background", "displayName": "Worker"}}})
+            sys.exit(0)
         elif text == "/settings":
             thinking = "high"
             emit({"type": "thinking_level_changed", "level": thinking})

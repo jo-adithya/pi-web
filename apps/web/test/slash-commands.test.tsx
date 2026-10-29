@@ -34,14 +34,16 @@ it("filters loaded commands, shows descriptions and inserts with keyboard withou
   expect(within(page.getByRole("listbox")).getAllByRole("option")).toHaveLength(2);
   expect(page.getByText("Review changes")).toBeTruthy();
   expect(input.getAttribute("aria-expanded")).toBe("true");
+  expect(document.getElementById(input.getAttribute("aria-activedescendant")!)?.textContent).toContain("/review");
   key("ArrowDown");
+  expect(document.getElementById(input.getAttribute("aria-activedescendant")!)?.textContent).toContain("/release");
   expect(within(page.getByRole("listbox")).getAllByRole("option")[1].getAttribute("aria-selected")).toBe("true");
   key("Enter");
   expect(input.value).toBe("/release ");
   expect(transport).not.toHaveBeenCalled();
   expect(page.queryByRole("listbox")).toBeNull();
   key("Enter");
-  expect(transport).toHaveBeenCalledWith(expect.objectContaining({ action: { type: "prompt", text: "/release " } }));
+  expect(transport).toHaveBeenCalledWith(expect.objectContaining({ action: { type: "prompt", text: "/release ", images: [] } }));
 });
 
 it("sends with Enter but preserves Shift+Enter and IME input", () => {
@@ -52,13 +54,13 @@ it("sends with Enter but preserves Shift+Enter and IME input", () => {
   expect(transport).not.toHaveBeenCalled();
   type("Hello\nworld");
   key("Enter");
-  expect(transport).toHaveBeenCalledWith(expect.objectContaining({ action: { type: "prompt", text: "Hello\nworld" } }));
+  expect(transport).toHaveBeenCalledWith(expect.objectContaining({ action: { type: "prompt", text: "Hello\nworld", images: [] } }));
 });
 
 it.each([{ ctrlKey: true }, { metaKey: true }])("preserves the modified Enter send shortcut: %j", modifiers => {
   const { type, key, transport } = setup();
   type("/re"); key("Enter", modifiers);
-  expect(transport).toHaveBeenCalledWith(expect.objectContaining({ action: { type: "prompt", text: "/re" } }));
+  expect(transport).toHaveBeenCalledWith(expect.objectContaining({ action: { type: "prompt", text: "/re", images: [] } }));
 });
 
 it("does not send empty, busy or disconnected drafts on Enter", () => {
@@ -78,9 +80,27 @@ it("supports Tab, wraparound navigation and pointer selection while preserving a
   expect(input.selectionStart).toBe(9);
   type("/skill:");
   const option = within(page.getByRole("listbox")).getByRole("option");
-  fireEvent.mouseDown(option); fireEvent.click(option); flush();
+  fireEvent.pointerDown(option, { pointerType: "mouse", button: 0 });
+  fireEvent.mouseDown(option);
+  fireEvent.pointerUp(option, { pointerType: "mouse", button: 0 });
+  fireEvent.click(option); flush();
   expect(input.value).toBe("/skill:testing ");
   expect(input).toBe(document.activeElement);
+  expect(transport).not.toHaveBeenCalled();
+});
+
+it("inserts a non-highlighted suggestion by pointer and keeps the argument caret", () => {
+  const { page, input, type, transport } = setup();
+  type("/re security", 3);
+  const option = within(page.getByRole("listbox")).getAllByRole("option")[1];
+  fireEvent.pointerDown(option, { pointerType: "mouse", button: 0 });
+  fireEvent.mouseDown(option);
+  fireEvent.pointerUp(option, { pointerType: "mouse", button: 0 });
+  fireEvent.click(option); flush();
+  expect(input.value).toBe("/release security");
+  expect(input.selectionStart).toBe(9);
+  expect(document.activeElement).toBe(input);
+  expect(page.queryByRole("listbox")).toBeNull();
   expect(transport).not.toHaveBeenCalled();
 });
 

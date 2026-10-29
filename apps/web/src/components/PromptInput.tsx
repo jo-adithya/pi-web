@@ -1,4 +1,5 @@
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { Show, createMemo, createSignal } from "solid-js";
+import { Listbox } from "@kobalte/core/listbox";
 import { TextField } from "@kobalte/core/text-field";
 import type { SlashCommand } from "../generated/protocol";
 
@@ -9,10 +10,13 @@ interface PromptInputProps {
   completionEnabled: boolean;
   onInput: (value: string) => void;
   onSubmit: () => void;
+  onImages?: (files: File[]) => void;
 }
 
-/** A multiline prompt editor with first-token slash completion. Selection inserts
+/** A multiline prompt editor with Kobalte slash suggestions. Selection inserts
  * a command while preserving arguments. Enter sends; Shift+Enter adds a newline.
+ * The editor owns token matching and keyboard navigation; Listbox keeps pointer
+ * selection and option semantics while virtual focus stays in the textarea.
  */
 export function PromptInput(props: PromptInputProps) {
   let input!: HTMLTextAreaElement;
@@ -80,16 +84,21 @@ export function PromptInput(props: PromptInputProps) {
       onBlur={() => setFocused(false)} onSelect={selectionChanged} onClick={selectionChanged}
       onKeyUp={(event: KeyboardEvent) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) selectionChanged(); }}
       onCompositionStart={() => setComposing(true)} onCompositionEnd={() => { setComposing(false); selectionChanged(); }}
+      onPaste={(event: ClipboardEvent) => { const files = Array.from(event.clipboardData?.files ?? []); if (files.length && props.onImages) { event.preventDefault(); props.onImages(files); } }}
+      onDragOver={(event: DragEvent) => { if (props.onImages && event.dataTransfer?.types.includes("Files")) event.preventDefault(); }}
+      onDrop={(event: DragEvent) => { if (props.onImages && event.dataTransfer?.files.length) { event.preventDefault(); props.onImages(Array.from(event.dataTransfer.files)); } }}
       onKeyDown={keyDown} />
     <TextField.Description id={`${props.id}-hint`} class="sr-only">Commands begin with /. Use arrow keys to navigate, Tab or Enter to insert, Escape to dismiss. Enter sends; Shift+Enter adds a new line.</TextField.Description>
     <Show when={matches().length > 0}>
-      <ul ref={list} id={listId} class="command-suggestions" role="listbox" aria-label="Slash commands">
-        <For each={matches()}>{(command, i) => <li id={optionId(i())} role="option" aria-selected={active() === i() ? "true" : "false"}
-          onMouseDown={event => event.preventDefault()} onClick={() => choose(command)}>
-          <span class="command-name">/{command.name}</span><small>{command.source}</small>
-          <Show when={command.description}><span class="command-description">{command.description}</span></Show>
-        </li>}</For>
-      </ul>
+      <Listbox ref={list} id={listId} class="command-suggestions" aria-label="Slash commands"
+        options={matches()} optionValue="name" optionTextValue="name" selectionMode="single"
+        value={[matches()[active()].name]} allowDuplicateSelectionEvents disallowEmptySelection shouldUseVirtualFocus
+        onChange={keys => { const command = matches().find(command => keys.has(command.name)); if (command) choose(command); }}
+        renderItem={item => <Listbox.Item item={item} id={optionId(matches().findIndex(command => command.name === item.rawValue.name))}
+          onMouseDown={event => event.preventDefault()}>
+          <Listbox.ItemLabel class="command-name">/{item.rawValue.name}</Listbox.ItemLabel><small>{item.rawValue.source}</small>
+          <Show when={item.rawValue.description}><Listbox.ItemDescription class="command-description">{item.rawValue.description}</Listbox.ItemDescription></Show>
+        </Listbox.Item>} />
     </Show>
   </TextField>;
 }

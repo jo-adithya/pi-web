@@ -1,5 +1,9 @@
+import { SelectField } from "./SelectField";
+import { TextField } from "@kobalte/core/text-field";
+import { Checkbox } from "@kobalte/core/checkbox";
 import { For, Show, createSignal } from "solid-js";
 import { Button } from "@kobalte/core/button";
+import { DropdownMenu } from "@kobalte/core/dropdown-menu";
 import type { Activity, CatalogItem, WorkspaceItem } from "../generated/protocol";
 import { validWorkspacePath } from "../workspace-state";
 import type { ThemePreference } from "../theme";
@@ -43,23 +47,23 @@ export function SessionSidebar(props: SessionSidebarProps) {
         <For each={props.catalog.filter(item => item.workspaceId === workspace.workspaceId)}>{item => <div class="session-row"><Button class={["session-item", { selected: props.selected === item.sessionId, stopped: item.lifecycle === "stopped" }]}
           aria-label={`${item.title}, ${props.needsInput(item.sessionId) ? "needs input" : (props.activity(item.sessionId) ?? item.lifecycle).replaceAll("_", " ")}`}
           aria-pressed={props.selected === item.sessionId ? "true" : "false"} onClick={() => props.choose(item)}>
-          <Icon name="chat" /><span class="session-info"><span class="session-title-row"><span class="session-title">{item.title}</span>
+          <span class="session-info"><span class="session-title-row"><span class="session-title">{item.title}</span>
             <Show when={item.lifecycle === "open" && !props.needsInput(item.sessionId) && ["submitting", "running", "retrying", "compacting", "reconciling", "cancelling"].includes(props.activity(item.sessionId) ?? "")}><span class="working-dot" aria-hidden="true" /></Show>
           </span><Show when={props.needsInput(item.sessionId)}><small>Needs input</small></Show></span>
-        </Button><details class="session-options sidebar-session-options" onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }}>
-          <summary class="icon-button" aria-label={`Options for ${item.title}`} title={`Options for ${item.title}`}><Icon name="more" /></summary>
-          <div class="sidebar-session-actions">
-            <Button disabled={!props.canManage} onClick={event => { const menu = event.currentTarget.closest("details")!; menu.open = false; menu.querySelector("summary")?.focus(); props.rename(item); }}>Rename…</Button>
-            <Button class="danger" disabled={!props.canManage || !["open", "stopped"].includes(item.lifecycle)} onClick={event => { const menu = event.currentTarget.closest("details")!; menu.open = false; menu.querySelector("summary")?.focus(); props.remove(item); }}>Delete…</Button>
-          </div>
-        </details></div>}</For>
+        </Button><DropdownMenu placement="bottom-end" gutter={6} modal={false}>
+          <DropdownMenu.Trigger class="icon-button sidebar-session-trigger" aria-label={`Options for ${item.title}`} title={`Options for ${item.title}`}><Icon name="more" /></DropdownMenu.Trigger>
+          <DropdownMenu.Portal><DropdownMenu.Content class="session-menu sidebar-session-actions">
+            <DropdownMenu.Item disabled={!props.canManage} onSelect={() => props.rename(item)}>Rename…</DropdownMenu.Item>
+            <DropdownMenu.Item class="danger" disabled={!props.canManage || !["open", "stopped"].includes(item.lifecycle)} onSelect={() => props.remove(item)}>Delete…</DropdownMenu.Item>
+          </DropdownMenu.Content></DropdownMenu.Portal>
+        </DropdownMenu></div>}</For>
       </section>}</For>
     </nav>
     <footer class="sidebar-footer">
       <p class="shared-project">Separate project folders<br /><span>Conversations in a workspace share its files.</span></p>
-      <label class="theme-picker"><span>Color scheme</span><select value={props.theme} onChange={event => props.setTheme(event.currentTarget.value as ThemePreference)}>
-        <option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option>
-      </select></label>
+      <div class="theme-picker"><span>Color scheme</span><SelectField label="Color scheme" value={props.theme} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} change={value => {
+        if (value === "system" || value === "light" || value === "dark") props.setTheme(value);
+      }} /></div>
     </footer>
   </>;
 }
@@ -70,9 +74,9 @@ function WorkspaceForm(props: { pending: boolean; notice: string; submit: (path:
   const [trusted, setTrusted] = createSignal(false);
   const allowed = () => !props.pending && trusted() && validWorkspacePath(path());
   return <form class="workspace-form" onSubmit={event => { event.preventDefault(); if (allowed()) props.submit(path()); }}>
-    <label>Project folder<input type="text" aria-label="Project folder" placeholder="/absolute/path/to/project" value={path()} onInput={event => setPath(event.currentTarget.value)} spellcheck={false} autocomplete="off" /></label>
+    <TextField value={path()} onChange={setPath}><TextField.Label>Project folder</TextField.Label><TextField.Input type="text" placeholder="/absolute/path/to/project" spellcheck={false} autocomplete="off" /></TextField>
     <p>Use an existing folder on the machine running Pi. Project extensions, skills and prompts may execute code; agents can edit its files.</p>
-    <label class="workspace-trust"><input type="checkbox" checked={trusted()} onChange={event => setTrusted(event.currentTarget.checked)} />I trust this folder and its project resources.</label>
+    <Checkbox class="workspace-trust" checked={trusted()} onChange={setTrusted}><Checkbox.Input /><Checkbox.Control class="checkbox-control"><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control><Checkbox.Label>I trust this folder and its project resources.</Checkbox.Label></Checkbox>
     <Show when={props.notice}><p role="alert">{props.notice}</p></Show>
     <div class="workspace-form-actions"><Button type="button" onClick={props.cancel}>Cancel</Button><Button type="submit" disabled={!allowed()}>Add trusted folder</Button></div>
   </form>;

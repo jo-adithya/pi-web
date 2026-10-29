@@ -40,9 +40,7 @@ async fn stopped(handle: &Handle) {
 async fn fragmented_crlf_utf8_event_precedes_ack() {
     let (handle, mut events) = spawn("echo", limits());
     let request = handle.request(
-        RpcCommand::Prompt {
-            message: "hello".into(),
-        },
+        RpcCommand::Prompt { message: "hello".into(), images: vec![] },
         Duration::from_secs(2),
     );
     let (response, event) = tokio::join!(request, events.recv());
@@ -142,9 +140,7 @@ async fn outstanding_limit_reserves_control_and_cancelled_future_releases_slot()
     let h = handle.clone();
     let pending = tokio::spawn(async move {
         h.request(
-            RpcCommand::Prompt {
-                message: "hello".into(),
-            },
+            RpcCommand::Prompt { message: "hello".into(), images: vec![] },
             Duration::from_secs(10),
         )
         .await
@@ -231,9 +227,7 @@ async fn shutdown_bypasses_stalled_writer_and_kills_group() {
         let h = handle.clone();
         let pending = tokio::spawn(async move {
             h.request(
-                RpcCommand::Prompt {
-                    message: "x".repeat(500_000),
-                },
+                RpcCommand::Prompt { message: "x".repeat(500_000), images: vec![] },
                 Duration::from_secs(10),
             )
             .await
@@ -262,9 +256,7 @@ async fn outbound_byte_budget_rejects_without_closing() {
     assert_eq!(
         handle
             .request(
-                RpcCommand::Prompt {
-                    message: "x".repeat(200)
-                },
+                RpcCommand::Prompt { message: "x".repeat(200), images: vec![] },
                 Duration::from_secs(1)
             )
             .await,
@@ -306,9 +298,7 @@ async fn stalled_write_has_deadline_and_reaps() {
     assert_eq!(events.recv().await.unwrap()["type"], "ready");
     let result = handle
         .request(
-            RpcCommand::Prompt {
-                message: "x".repeat(500_000),
-            },
+            RpcCommand::Prompt { message: "x".repeat(500_000), images: vec![] },
             Duration::from_secs(3),
         )
         .await;

@@ -23,9 +23,7 @@ async fn write_notice_precedes_an_unanswered_rpc_response() {
     let request = tokio::spawn(async move {
         child
             .request_with_write_notice(
-                RpcCommand::Prompt {
-                    message: "hold response".into(),
-                },
+                RpcCommand::Prompt { message: "hold response".into(), images: vec![] },
                 Duration::from_secs(5),
                 written,
             )
@@ -50,9 +48,7 @@ async fn failed_admission_cannot_report_a_successful_write() {
     let (written, notice) = oneshot::channel();
     let result = handle
         .request_with_write_notice(
-            RpcCommand::Prompt {
-                message: "x".repeat(200),
-            },
+            RpcCommand::Prompt { message: "x".repeat(200), images: vec![] },
             Duration::from_secs(2),
             written,
         )

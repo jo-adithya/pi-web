@@ -90,6 +90,8 @@ pub struct ModelOption {
     pub id: String,
     pub provider: String,
     pub name: String,
+    #[serde(default)]
+    pub images: bool,
 }
 
 /// Confirmed settings and advertised capabilities. Null means unavailable.
@@ -114,6 +116,66 @@ pub struct ContextUsage {
     pub context_window: u64,
 }
 
+/// One provider limit window. Times are Unix seconds; duration is seconds, usage is 0–100.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexWindow {
+    pub identity: CodexWindowIdentity,
+    pub duration_seconds: u32,
+    pub used_percent: f64,
+    pub resets_at: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexWindowIdentity {
+    Primary,
+    Secondary,
+}
+/// Per-conversation runtime cache. Stale values remain visible after a failed refresh.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexUsage {
+    pub windows: Vec<CodexWindow>,
+    pub observed_at: Option<u32>,
+    pub loading: bool,
+    pub stale: bool,
+    pub unavailable: bool,
+}
+
+/// Source of an observed background task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundKind {
+    Agent,
+    Workflow,
+}
+
+/// Bounded runtime-only projection of an observed background invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTask {
+    pub id: String,
+    pub kind: BackgroundKind,
+    pub name: String,
+    pub description: String,
+    pub status: BackgroundStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub truncated: bool,
+}
+/// Active includes queued and running: the producer does not distinguish them here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundStatus {
+    Active,
+    Completed,
+    Steered,
+    Error,
+    Aborted,
+    Stopped,
+    Unknown,
+}
+
 /// Outcome of one actual agent settlement in the current epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +194,7 @@ pub enum RunOutcome {
     deny_unknown_fields
 )]
 pub enum BrowserAction {
+    RefreshCodexUsage,
     SetModel {
         provider: String,
         model_id: String,
@@ -142,6 +205,8 @@ pub enum BrowserAction {
     Attach,
     Prompt {
         text: String,
+        #[serde(default)]
+        images: Vec<String>,
     },
     Cancel,
     UiReply {
@@ -156,7 +221,7 @@ pub enum BrowserAction {
     },
 }
 
-/// Browser envelope. Shape decoding precedes bounds, version, controller and epoch checks.
+/// Browser envelope. Shape decoding precedes bounds, version, subscription and epoch checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserMessage {
@@ -199,6 +264,8 @@ pub struct RuntimeStatus {
     pub persistence: bool,
     pub cancel_unconfirmed: bool,
     pub notice: Option<String>,
+    /// Latest plain-text LSP extension status, at most 512 UTF-8 bytes; null when unavailable.
+    pub lsp_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -229,13 +296,19 @@ pub struct SlashCommand {
 }
 
 /// Ordered application messages. Snapshots supersede earlier events through their sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",
     rename_all_fields = "camelCase"
 )]
 pub enum ServerBody {
+    BackgroundTasks {
+        tasks: Vec<BackgroundTask>,
+    },
+    CodexUsage {
+        usage: CodexUsage,
+    },
     ContextUsage {
         usage: Option<ContextUsage>,
     },
@@ -274,7 +347,7 @@ pub enum ServerBody {
         code: String,
     },
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerMessage {
     pub v: u16,
@@ -283,7 +356,7 @@ pub struct ServerMessage {
     pub body: ServerBody,
 }
 
-/// Small lifecycle view available without acquiring a conversation controller.
+/// Small lifecycle view available without subscribing to a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSummary {
@@ -415,6 +488,15 @@ pub fn typescript_bindings() -> String {
         (ModelOption::docs(), ModelOption::decl(&config)),
         (AgentSettings::docs(), AgentSettings::decl(&config)),
         (ContextUsage::docs(), ContextUsage::decl(&config)),
+        (
+            CodexWindowIdentity::docs(),
+            CodexWindowIdentity::decl(&config),
+        ),
+        (CodexWindow::docs(), CodexWindow::decl(&config)),
+        (CodexUsage::docs(), CodexUsage::decl(&config)),
+        (BackgroundKind::docs(), BackgroundKind::decl(&config)),
+        (BackgroundStatus::docs(), BackgroundStatus::decl(&config)),
+        (BackgroundTask::docs(), BackgroundTask::decl(&config)),
         (RunOutcome::docs(), RunOutcome::decl(&config)),
         (BrowserAction::docs(), BrowserAction::decl(&config)),
         (BrowserMessage::docs(), BrowserMessage::decl(&config)),

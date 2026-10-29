@@ -130,6 +130,8 @@ pub enum RpcCommand {
     },
     Prompt {
         message: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Value>,
     },
     ClearQueue,
     Abort,

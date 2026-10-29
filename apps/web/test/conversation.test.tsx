@@ -5,7 +5,7 @@ import { MessageList } from "../src/Conversation";
 import { initialState } from "../src/client-state";
 
 afterEach(cleanup);
-it("mounts only 100 messages and explicitly reveals retained history, resetting on epoch change", async () => {
+it("mounts only 100 messages and preserves revealed history across streaming and epoch changes", async () => {
   const value = initialState(); value.epoch = "first";
   for (let i = 0; i < 500; i++) { const id = String(i); value.order.push(id); value.messages[id] = { id, role: "user", blocks: [], complete: true, error: null, truncated: false }; }
   const [state, setState] = createStore(value);
@@ -13,8 +13,26 @@ it("mounts only 100 messages and explicitly reveals retained history, resetting 
   expect(view.container.querySelectorAll("article")).toHaveLength(100);
   await fireEvent.click(view.getByRole("button", { name: "Show earlier retained messages" })); flush();
   expect(view.container.querySelectorAll("article")).toHaveLength(200);
+  const retainedArticle = view.container.querySelector("article");
+  setState(draft => {
+    draft.seq++;
+    draft.messages["499"].blocks = [{ kind: "text", text: "Streaming update" }];
+  }); flush();
+  expect(view.container.querySelectorAll("article")).toHaveLength(200);
+  expect(view.container.querySelector("article")).toBe(retainedArticle);
+  expect(view.getByText("Streaming update")).toBeTruthy();
   setState(draft => { draft.epoch = "second"; }); flush();
-  expect(view.container.querySelectorAll("article")).toHaveLength(100);
+  expect(view.container.querySelectorAll("article")).toHaveLength(200);
+  await fireEvent.click(view.getByRole("button", { name: "Show earlier retained messages" })); flush();
+  expect(view.container.querySelectorAll("article")).toHaveLength(300);
+  setState(draft => { draft.epoch = "first"; }); flush();
+  expect(view.container.querySelectorAll("article")).toHaveLength(300);
+});
+it("renders retained messages even before an epoch is assigned", () => {
+  const state = initialState(); state.order = ["initial"];
+  state.messages.initial = { id: "initial", role: "user", blocks: [], complete: true, error: null, truncated: false };
+  const view = render(() => <MessageList state={state} />); flush();
+  expect(view.container.querySelectorAll("article")).toHaveLength(1);
 });
 it("hides thinking while rendering assistant text, notices and errors", () => {
   const state = initialState(); state.order = ["reply"];

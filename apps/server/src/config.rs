@@ -8,10 +8,13 @@ use std::{
 
 pub const HELP: &str = "pi-web [--cwd PATH] [--new | --session FILE] [--port PORT]\n\
   [--state-dir PATH] [--session-root PATH] [--pi EXECUTABLE]\n\
-  [--web-dir PATH] [--head-adapter PATH] [--isolated]\n\n\
+  [--web-dir PATH] [--head-adapter PATH] [--quota-adapter PATH] [--isolated]\n\
+  [--remote-origin https://HOSTNAME] [--revoke-push]\n\n\
 Binds only 127.0.0.1. Open the printed URL to authenticate this browser.\n\
+--remote-origin selects one private HTTPS proxy origin (default port 443; no trailing slash).\n\
 Defaults to the remembered exact session for the canonical project.\n\
 --new creates a new session without deleting prior Pi files.\n\
+--revoke-push clears persistent phone subscriptions and exits; stop the server first.\n\
 --isolated disables optional extensions, MCP, context discovery and all tools but read.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +22,53 @@ pub enum Startup {
     Remembered,
     New,
     Session(PathBuf),
+}
+
+/// Canonical HTTPS DNS origin for an operator-managed private reverse proxy on port 443.
+/// Validation excludes URL components and characters that could broaden browser policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOrigin(String);
+impl RemoteOrigin {
+    /// Accepts `https://` followed by a lowercase DNS hostname, without port or trailing slash.
+    /// Returns InvalidInput for other schemes, URL components, malformed DNS labels,
+    /// or numeric final labels that browsers interpret as IPv4 addresses.
+    pub fn parse(value: String) -> io::Result<Self> {
+        let host = value.strip_prefix("https://").unwrap_or("");
+        if host.len() > 253
+            || !host.contains('.')
+            // Browsers also interpret abbreviated, octal and hexadecimal IPv4 forms.
+            || host.rsplit('.').next().is_some_and(|label| {
+                label.bytes().all(|b| b.is_ascii_digit())
+                    || label
+                        .strip_prefix("0x")
+                        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            || !host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+        {
+            return Err(invalid(
+                "remote origin must be https:// followed by a lowercase DNS hostname (port 443, no port, path, trailing slash, query or fragment)",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the exact browser origin, including its HTTPS scheme.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the validated DNS authority used by the proxy's preserved Host header.
+    pub fn authority(&self) -> &str {
+        &self.0[8..]
+    }
 }
 
 /// Validated startup options. Only the project directory may later be selected by a browser.
@@ -32,10 +82,13 @@ pub struct Config {
     pub session_roots: Vec<PathBuf>,
     pub startup: Startup,
     pub port: u16,
+    pub remote_origin: Option<RemoteOrigin>,
     pub pi: PathBuf,
     pub web_dir: PathBuf,
     pub head_adapter: PathBuf,
+    pub quota_adapter: PathBuf,
     pub isolated: bool,
+    pub revoke_push: bool,
 }
 impl Config {
     /// Parses without creating files or starting Pi. `None` requests help.
@@ -47,11 +100,14 @@ impl Config {
         let mut session_roots = Vec::new();
         let mut startup = Startup::Remembered;
         let mut port = 9876;
+        let mut remote_origin = None;
         let mut pi = PathBuf::from("pi-bolt");
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut web_dir = manifest.join("../web/dist");
         let mut head_adapter = manifest.join("pi/history-head.ts");
+        let mut quota_adapter = manifest.join("pi/codex-usage.ts");
         let mut isolated = false;
+        let mut revoke_push = false;
         while let Some(flag) = args.next() {
             if flag == "--help" || flag == "-h" {
                 return Ok(None);
@@ -61,6 +117,10 @@ impl Config {
                     return Err(invalid("--new and --session are mutually exclusive"));
                 }
                 startup = Startup::New;
+                continue;
+            }
+            if flag == "--revoke-push" {
+                revoke_push = true;
                 continue;
             }
             if flag == "--isolated" {
@@ -74,9 +134,11 @@ impl Config {
                     | "--session-root"
                     | "--session"
                     | "--port"
+                    | "--remote-origin"
                     | "--pi"
                     | "--web-dir"
                     | "--head-adapter"
+                    | "--quota-adapter"
             ) {
                 return Err(invalid(format!("unknown option: {flag}")));
             }
@@ -102,9 +164,16 @@ impl Config {
                         .parse::<u16>()
                         .map_err(|_| invalid("port must be 0..65535"))?
                 }
+                "--remote-origin" => {
+                    if remote_origin.is_some() {
+                        return Err(invalid("--remote-origin may only be specified once"));
+                    }
+                    remote_origin = Some(RemoteOrigin::parse(value)?);
+                }
                 "--pi" => pi = value.into(),
                 "--web-dir" => web_dir = value.into(),
                 "--head-adapter" => head_adapter = value.into(),
+                "--quota-adapter" => quota_adapter = value.into(),
                 _ => unreachable!(),
             }
         }
@@ -141,10 +210,13 @@ impl Config {
             session_roots,
             startup,
             port,
+            remote_origin,
             pi,
             web_dir,
             head_adapter,
+            quota_adapter,
             isolated,
+            revoke_push,
         }))
     }
     /// Derives runtime options for a registered folder, retaining operator-only options.

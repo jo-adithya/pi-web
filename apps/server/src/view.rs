@@ -17,6 +17,7 @@ pub enum BlockKind {
     Text,
     Thinking,
     Notice,
+    Image,
 }
 
 /// One safe display block, without provider signatures, binary images or schemas.
@@ -54,19 +55,20 @@ pub enum Activity {
     Failed,
 }
 
-/// Converts visible message content to bounded previews, omitting tool results,
+/// Converts visible message content to bounded previews, omitting tool text/metadata,
 /// tool calls, and internal subagent completion notifications.
 /// Empty completed assistant messages are omitted unless they carry an error; live
 /// placeholders remain available for subsequent text/thinking deltas.
 /// Unknown custom roles remain visible as `custom` text without forwarding metadata.
 pub fn normalize_message(id: String, message: &Value, complete: bool) -> Option<DisplayMessage> {
     let role = message.get("role")?.as_str()?;
-    if matches!(role, "system" | "toolResult")
+    if role == "system"
         || (role == "custom"
             && (message["display"] == false || message["customType"] == "subagent-notification"))
     {
         return None;
     }
+    let tool_image = role == "toolResult";
     let role = match role {
         "user" | "assistant" | "branchSummary" | "compactionSummary" | "bashExecution" => role,
         _ => "custom",
@@ -77,15 +79,16 @@ pub fn normalize_message(id: String, message: &Value, complete: bool) -> Option<
         blocks: Vec::new(),
         complete,
         error: message["errorMessage"]
-            .as_str()
+            .as_str().filter(|_| !tool_image)
             .map(|text| clipped(text, 4096).0),
         truncated: false,
     };
     let mut remaining = MAX_MESSAGE_BYTES;
-    if let Some(text) = message["content"].as_str() {
+    if let Some(text) = message["content"].as_str().filter(|_| !tool_image) {
         push_block(&mut result, &mut remaining, BlockKind::Text, text);
     } else if let Some(blocks) = message["content"].as_array() {
         for block in blocks {
+            if tool_image && !matches!(block["type"].as_str(), Some("image_ref" | "image_unavailable")) { continue; }
             let (kind, text) = match block["type"].as_str() {
                 Some("text") => (
                     BlockKind::Text,
@@ -95,9 +98,10 @@ pub fn normalize_message(id: String, message: &Value, complete: bool) -> Option<
                     BlockKind::Thinking,
                     block["thinking"].as_str().unwrap_or("").to_owned(),
                 ),
-                Some("image") => (
+                Some("image_ref") if block["ref"].as_str().is_some_and(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit())) => (BlockKind::Image, block["ref"].as_str().unwrap().to_owned()),
+                Some("image" | "image_unavailable") => (
                     BlockKind::Notice,
-                    "Image omitted from this text-only view".to_owned(),
+                    "Image unavailable (unsupported format or preview limit)".to_owned(),
                 ),
                 _ => continue,
             };
@@ -105,11 +109,11 @@ pub fn normalize_message(id: String, message: &Value, complete: bool) -> Option<
         }
     } else if let Some(text) = message["summary"]
         .as_str()
-        .or_else(|| message["output"].as_str())
+        .or_else(|| message["output"].as_str()).filter(|_| !tool_image)
     {
         push_block(&mut result, &mut remaining, BlockKind::Text, text);
     }
-    if complete && role == "assistant" && result.blocks.is_empty() && result.error.is_none() {
+    if (tool_image || complete && role == "assistant") && result.blocks.is_empty() && result.error.is_none() {
         return None;
     }
     Some(result)
@@ -245,15 +249,13 @@ impl ViewState {
             Some("message_start" | "message_end") => {
                 let complete = event["type"] == "message_end";
                 let raw = &event["message"];
-                if raw["role"] == "toolResult" {
-                    return patches;
-                }
+
                 if raw["role"] == "assistant" && !complete {
                     self.content_indices.fill(None);
                     if let Some(blocks) = raw["content"].as_array() {
                         let mut visible = 0;
                         for (index, block) in blocks.iter().take(MAX_BLOCKS).enumerate() {
-                            if matches!(block["type"].as_str(), Some("text" | "thinking" | "image"))
+                            if matches!(block["type"].as_str(), Some("text" | "thinking" | "image" | "image_ref" | "image_unavailable"))
                             {
                                 self.content_indices[index] = Some(visible);
                                 visible += 1;

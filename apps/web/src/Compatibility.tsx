@@ -1,3 +1,4 @@
+import { Button } from "@kobalte/core/button";
 import { createStore } from "solid-js";
 import type { ProcessStatus } from "./generated/protocol";
 
@@ -12,9 +13,9 @@ export default function App() {
       <h1>Pi Web</h1>
       <p>Compatibility fixture — no agent connected.</p>
       <p role="status">{state.process}</p>
-      <button type="button" onClick={() => setState((draft) => { draft.process = "ready"; })}>
+      <Button type="button" onClick={() => setState((draft) => { draft.process = "ready"; })}>
         Test staged update
-      </button>
+      </Button>
     </main>
   );
 }

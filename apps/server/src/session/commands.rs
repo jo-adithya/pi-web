@@ -20,6 +20,7 @@ pub(super) fn project(data: &Value) -> Vec<SlashCommand> {
                 || name.starts_with('/')
                 || name.chars().any(|c| c.is_whitespace() || c.is_control())
                 || name == "pi-web-history-head"
+                || name == "pi-web-codex-usage"
             {
                 return None;
             }
@@ -60,6 +61,7 @@ mod tests {
             {"name": "nul\u{0000}", "source": "skill"},
             {"name": "wide\u{2003}space", "source": "skill"},
             {"name": "pi-web-history-head", "source": "extension"},
+            {"name": "pi-web-codex-usage", "source": "extension"},
             {"name": "unknown", "source": "future"},
             {"name": "missing"}, {"name": "object", "source": {}},
             {"name": "valid", "source": "invalid"},

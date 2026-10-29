@@ -97,6 +97,27 @@ fn send(handle: &SessionHandle, identity: &ServerMessage, id: &str, action: Brow
         )
         .unwrap();
 }
+fn send_from(
+    handle: &SessionHandle,
+    client: &str,
+    identity: &ServerMessage,
+    id: &str,
+    action: BrowserAction,
+) {
+    handle
+        .dispatch(
+            client.into(),
+            BrowserMessage {
+                v: 1,
+                session_id: identity.session_id.clone(),
+                epoch: identity.epoch.clone(),
+                request_id: id.into(),
+                action,
+            },
+        )
+        .unwrap();
+}
+
 async fn result(connection: &mut Connection, id: &str) -> pi_web::protocol::CommandResult {
     let message = until(
         connection,
@@ -124,9 +145,7 @@ async fn immediate_stop_cannot_overtake_an_accepted_prompt() {
             &child,
             &identity,
             "instant-prompt",
-            BrowserAction::Prompt {
-                text: "immediate-stop".into(),
-            },
+            BrowserAction::Prompt { text: "immediate-stop".into(), images: vec![] },
         );
         send(&child, &identity, "instant-stop", BrowserAction::Cancel);
         let commands = tokio::time::timeout(Duration::from_secs(3), async {
@@ -178,9 +197,7 @@ async fn stop_waits_for_stdin_but_not_the_prompt_response() {
             &child,
             &identity,
             "no-ack",
-            BrowserAction::Prompt {
-                text: "no-prompt-ack".into(),
-            },
+            BrowserAction::Prompt { text: "no-prompt-ack".into(), images: vec![] },
         );
         send(&child, &identity, "stop-no-ack", BrowserAction::Cancel);
         let cancelled = tokio::time::timeout(
@@ -211,9 +228,7 @@ async fn dialogs_arriving_during_stop_are_cancelled_without_becoming_visible() {
             &child,
             &identity,
             "late-input",
-            BrowserAction::Prompt {
-                text: "dialog-during-stop".into(),
-            },
+            BrowserAction::Prompt { text: "dialog-during-stop".into(), images: vec![] },
         );
         assert!(result(&mut connection, "late-input").await.ok);
         send(&child, &identity, "stop-late-input", BrowserAction::Cancel);
@@ -265,17 +280,13 @@ async fn prompt_dedup_busy_retry_and_ordered_cancellation() {
     let outcome = tokio::spawn(async move {
         let mut connection = task_handle.connect("client".into()).await.unwrap();
         let identity = ready(&mut connection).await;
-        assert!(matches!(
-            task_handle.connect("other".into()).await,
-            Err("already_attached")
-        ));
+        let mut other = task_handle.connect("other".into()).await.unwrap();
+        ready(&mut other).await;
         send(
             &task_handle,
             &identity,
             "p1",
-            BrowserAction::Prompt {
-                text: "retry".into(),
-            },
+            BrowserAction::Prompt { text: "retry".into(), images: vec![] },
         );
         let accepted = result(&mut connection, "p1").await;
         assert_eq!(accepted.disposition.as_deref(), Some("started"));
@@ -283,18 +294,14 @@ async fn prompt_dedup_busy_retry_and_ordered_cancellation() {
             &task_handle,
             &identity,
             "p1",
-            BrowserAction::Prompt {
-                text: "retry".into(),
-            },
+            BrowserAction::Prompt { text: "retry".into(), images: vec![] },
         );
         assert_eq!(result(&mut connection, "p1").await, accepted);
         send(
             &task_handle,
             &identity,
             "p1",
-            BrowserAction::Prompt {
-                text: "different".into(),
-            },
+            BrowserAction::Prompt { text: "different".into(), images: vec![] },
         );
         assert_eq!(
             result(&mut connection, "p1").await.code,
@@ -304,18 +311,14 @@ async fn prompt_dedup_busy_retry_and_ordered_cancellation() {
             &task_handle,
             &identity,
             "p1",
-            BrowserAction::Prompt {
-                text: "retry".into(),
-            },
+            BrowserAction::Prompt { text: "retry".into(), images: vec![] },
         );
         assert_eq!(result(&mut connection, "p1").await, accepted);
         send(
             &task_handle,
             &identity,
             "p2",
-            BrowserAction::Prompt {
-                text: "second".into(),
-            },
+            BrowserAction::Prompt { text: "second".into(), images: vec![] },
         );
         assert_eq!(result(&mut connection, "p2").await.code, "busy");
         send(&task_handle, &identity, "cancel", BrowserAction::Cancel);
@@ -326,9 +329,7 @@ async fn prompt_dedup_busy_retry_and_ordered_cancellation() {
             &task_handle,
             &identity,
             "handled",
-            BrowserAction::Prompt {
-                text: "/handled".into(),
-            },
+            BrowserAction::Prompt { text: "/handled".into(), images: vec![] },
         );
         assert_eq!(
             result(&mut connection, "handled")
@@ -359,9 +360,7 @@ async fn disconnect_cancels_dialog_but_keeps_generation_and_snapshot() {
             &task_handle,
             &identity,
             "p",
-            BrowserAction::Prompt {
-                text: "dialog".into(),
-            },
+            BrowserAction::Prompt { text: "dialog".into(), images: vec![] },
         );
         until(
             &mut connection,
@@ -504,13 +503,13 @@ async fn settlement_during_stop_cannot_admit_a_new_prompt() {
     let task_handle = handle.clone();
     let outcome = tokio::spawn(async move {
         let mut connection = task_handle.connect("client".into()).await.unwrap(); let identity = ready(&mut connection).await;
-        send(&task_handle, &identity, "p", BrowserAction::Prompt { text: "cancel-race".into() }); assert!(result(&mut connection, "p").await.ok);
+        send(&task_handle, &identity, "p", BrowserAction::Prompt { text: "cancel-race".into(), images: vec![] }); assert!(result(&mut connection, "p").await.ok);
         send(&task_handle, &identity, "stop", BrowserAction::Cancel);
         until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.last_outcome.as_deref() == Some("success"))).await;
-        send(&task_handle, &identity, "too-early", BrowserAction::Prompt { text: "must not run".into() });
+        send(&task_handle, &identity, "too-early", BrowserAction::Prompt { text: "must not run".into(), images: vec![] });
         assert_eq!(result(&mut connection, "too-early").await.code, "busy");
         assert!(result(&mut connection, "stop").await.ok);
-        send(&task_handle, &identity, "after", BrowserAction::Prompt { text: "/handled".into() }); assert!(result(&mut connection, "after").await.ok);
+        send(&task_handle, &identity, "after", BrowserAction::Prompt { text: "/handled".into(), images: vec![] }); let after = result(&mut connection, "after").await; assert!(after.ok, "{after:?}");
     }).await;
     handle.shutdown().await;
     outcome.unwrap();
@@ -529,9 +528,7 @@ async fn abort_acknowledgment_does_not_replace_settlement() {
             &task_handle,
             &identity,
             "p",
-            BrowserAction::Prompt {
-                text: "late-settlement".into(),
-            },
+            BrowserAction::Prompt { text: "late-settlement".into(), images: vec![] },
         );
         assert!(result(&mut connection, "p").await.ok);
         send(&task_handle, &identity, "stop", BrowserAction::Cancel);
@@ -545,9 +542,7 @@ async fn abort_acknowledgment_does_not_replace_settlement() {
             &task_handle,
             &identity,
             "too-early",
-            BrowserAction::Prompt {
-                text: "must not run".into(),
-            },
+            BrowserAction::Prompt { text: "must not run".into(), images: vec![] },
         );
         assert_eq!(result(&mut connection, "too-early").await.code, "busy");
         assert!(result(&mut connection, "stop").await.ok);
@@ -555,11 +550,9 @@ async fn abort_acknowledgment_does_not_replace_settlement() {
             &task_handle,
             &identity,
             "after",
-            BrowserAction::Prompt {
-                text: "/handled".into(),
-            },
+            BrowserAction::Prompt { text: "/handled".into(), images: vec![] },
         );
-        assert!(result(&mut connection, "after").await.ok);
+        let after = result(&mut connection, "after").await; assert!(after.ok, "{after:?}");
     })
     .await;
     handle.shutdown().await;
@@ -579,9 +572,7 @@ async fn missing_settlement_keeps_admission_closed_and_enables_recovery() {
             &task_handle,
             &identity,
             "p",
-            BrowserAction::Prompt {
-                text: "missing-settlement".into(),
-            },
+            BrowserAction::Prompt { text: "missing-settlement".into(), images: vec![] },
         );
         assert!(result(&mut connection, "p").await.ok);
         send(&task_handle, &identity, "stop", BrowserAction::Cancel);
@@ -593,9 +584,7 @@ async fn missing_settlement_keeps_admission_closed_and_enables_recovery() {
             &task_handle,
             &identity,
             "too-early",
-            BrowserAction::Prompt {
-                text: "must not run".into(),
-            },
+            BrowserAction::Prompt { text: "must not run".into(), images: vec![] },
         );
         assert_eq!(result(&mut connection, "too-early").await.code, "busy");
         send(
@@ -619,13 +608,13 @@ async fn identity_reconciliation_does_not_advertise_prompt_readiness() {
     let task = handle.clone();
     let outcome = tokio::spawn(async move {
         let mut connection = task.connect("client".into()).await.unwrap(); let identity = ready(&mut connection).await;
-        send(&task, &identity, "complete", BrowserAction::Prompt { text: "complete".into() });
+        send(&task, &identity, "complete", BrowserAction::Prompt { text: "complete".into(), images: vec![] });
         let settled = until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.last_outcome.as_deref() == Some("success"))).await;
         let ServerBody::Event { status, .. } = settled.body else { unreachable!() };
         assert_eq!(serde_json::to_value(status.activity).unwrap(), "reconciling", "the prompt gate is closed until identity reconciliation finishes");
         fs::write(fixture.0.join("allow-settled-state"), "").unwrap();
         until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.activity == pi_web::view::Activity::Idle)).await;
-        send(&task, &identity, "next", BrowserAction::Prompt { text: "/handled".into() });
+        send(&task, &identity, "next", BrowserAction::Prompt { text: "/handled".into(), images: vec![] });
         assert!(result(&mut connection, "next").await.ok);
     }).await;
     handle.shutdown().await;
@@ -640,18 +629,18 @@ async fn unexpected_idle_session_replacement_rebuilds_under_a_new_epoch() {
     let outcome = tokio::spawn(async move {
         let mut connection = task_handle.connect("client".into()).await.unwrap();
         let identity = ready(&mut connection).await;
-        send(&task_handle, &identity, "complete", BrowserAction::Prompt { text: "complete".into() });
+        send(&task_handle, &identity, "complete", BrowserAction::Prompt { text: "complete".into(), images: vec![] });
         until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.last_outcome.as_deref() == Some("success") && status.activity == pi_web::view::Activity::Idle)).await;
-        send(&task_handle, &identity, "switch", BrowserAction::Prompt { text: "/switch-session".into() });
+        send(&task_handle, &identity, "switch", BrowserAction::Prompt { text: "/switch-session".into(), images: vec![] });
         let replacement = until(&mut connection, |m| matches!(&m.body, ServerBody::Hello { .. }) || matches!(&m.body, ServerBody::Event { status, .. } if status.process != pi_web::protocol::ProcessStatus::Ready)).await;
         assert!(matches!(replacement.body, ServerBody::Hello { .. }), "valid idle replacement must rebuild, not kill Pi");
         assert_eq!(replacement.session_id, identity.session_id);
         assert_ne!(replacement.epoch, identity.epoch);
         let snapshot = until(&mut connection, |m| matches!(&m.body, ServerBody::Snapshot { status, .. } if status.history_warning.is_none())).await;
         if let ServerBody::Snapshot { messages, .. } = snapshot.body { assert!(messages.is_empty()); }
-        send(&task_handle, &identity, "old", BrowserAction::Prompt { text: "must not run".into() });
+        send(&task_handle, &identity, "old", BrowserAction::Prompt { text: "must not run".into(), images: vec![] });
         assert!(!result(&mut connection, "old").await.ok);
-        send(&task_handle, &replacement, "new", BrowserAction::Prompt { text: "/handled".into() });
+        send(&task_handle, &replacement, "new", BrowserAction::Prompt { text: "/handled".into(), images: vec![] });
         assert!(result(&mut connection, "new").await.ok);
     }).await;
     handle.shutdown().await;
@@ -666,7 +655,7 @@ async fn replacement_preserves_events_after_the_state_response() {
     let outcome = tokio::spawn(async move {
         let mut connection = task_handle.connect("client".into()).await.unwrap();
         let identity = ready(&mut connection).await;
-        send(&task_handle, &identity, "switch", BrowserAction::Prompt { text: "/switch-start".into() });
+        send(&task_handle, &identity, "switch", BrowserAction::Prompt { text: "/switch-start".into(), images: vec![] });
         let replacement = until(&mut connection, |m| matches!(m.body, ServerBody::Hello { .. })).await;
         until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.activity == pi_web::view::Activity::Running)).await;
         send(&task_handle, &replacement, "snapshot", BrowserAction::Attach);
@@ -674,7 +663,7 @@ async fn replacement_preserves_events_after_the_state_response() {
         if let ServerBody::Snapshot { messages, .. } = snapshot.body {
             assert!(messages.iter().any(|message| message.blocks.iter().any(|block| block.text == "NEW_SESSION_LIVE")));
         }
-        send(&task_handle, &replacement, "busy", BrowserAction::Prompt { text: "must not run".into() });
+        send(&task_handle, &replacement, "busy", BrowserAction::Prompt { text: "must not run".into(), images: vec![] });
         assert_eq!(result(&mut connection, "busy").await.code, "busy");
     }).await;
     handle.shutdown().await;
@@ -694,7 +683,7 @@ async fn invalid_or_active_identity_replacement_fails_closed() {
                 &task_handle,
                 &identity,
                 "switch",
-                BrowserAction::Prompt { text: text.into() },
+                BrowserAction::Prompt { text: text.into(), images: vec![] },
             );
             assert_eq!(
                 result(&mut connection, "switch").await.code,
@@ -752,9 +741,7 @@ async fn failed_abort_requires_separately_confirmed_termination() {
             &task_handle,
             &identity,
             "p",
-            BrowserAction::Prompt {
-                text: "ignore-abort".into(),
-            },
+            BrowserAction::Prompt { text: "ignore-abort".into(), images: vec![] },
         );
         assert!(result(&mut connection, "p").await.ok);
         send(&task_handle, &identity, "stop", BrowserAction::Cancel);
@@ -766,9 +753,7 @@ async fn failed_abort_requires_separately_confirmed_termination() {
             &task_handle,
             &identity,
             "busy",
-            BrowserAction::Prompt {
-                text: "must not run".into(),
-            },
+            BrowserAction::Prompt { text: "must not run".into(), images: vec![] },
         );
         assert_eq!(result(&mut connection, "busy").await.code, "busy");
         send(
@@ -823,9 +808,7 @@ async fn failed_handled_reconciliation_resolves_pending_request_on_exit() {
             &task_handle,
             &identity,
             "handled",
-            BrowserAction::Prompt {
-                text: "/handled-fail".into(),
-            },
+            BrowserAction::Prompt { text: "/handled-fail".into(), images: vec![] },
         );
         let failed =
             tokio::time::timeout(Duration::from_secs(3), result(&mut connection, "handled"))
@@ -837,9 +820,7 @@ async fn failed_handled_reconciliation_resolves_pending_request_on_exit() {
             &task_handle,
             &identity,
             "handled",
-            BrowserAction::Prompt {
-                text: "/handled-fail".into(),
-            },
+            BrowserAction::Prompt { text: "/handled-fail".into(), images: vec![] },
         );
         assert_eq!(result(&mut connection, "handled").await, failed);
     })
@@ -860,22 +841,15 @@ async fn slow_controller_detaches_without_blocking_runtime_and_resnapshots_bound
             &task_handle,
             &identity,
             "flood",
-            BrowserAction::Prompt {
-                text: "flood".into(),
-            },
+            BrowserAction::Prompt { text: "flood".into(), images: vec![] },
         );
-        let mut replacement = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                match task_handle.connect("replacement".into()).await {
-                    Ok(connection) => break connection,
-                    Err("already_attached") => tokio::time::sleep(Duration::from_millis(20)).await,
-                    Err(error) => panic!("unexpected connect error: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("slow client was never evicted");
-        drop(slow);
+        // A healthy peer drains throughout the flood while the first receiver stalls.
+        let mut replacement = task_handle.connect("replacement".into()).await.unwrap();
+        until(&mut replacement, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.activity == pi_web::view::Activity::Idle)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slow.frames.recv().await.is_some() {}
+        }).await.expect("slow subscriber was not detached");
+        send_from(&task_handle, "replacement", &identity, "snapshot", BrowserAction::Attach);
         let snapshot = until(&mut replacement, |m| {
             matches!(&m.body, ServerBody::Snapshot { .. })
         })
@@ -902,7 +876,7 @@ async fn crash_invalidates_dialogs_and_restart_recovers_unpersisted_identity() {
     let task_handle = handle.clone();
     let outcome = tokio::spawn(async move {
         let mut connection = task_handle.connect("client".into()).await.unwrap(); let identity = ready(&mut connection).await;
-        send(&task_handle, &identity, "p", BrowserAction::Prompt { text: "crash-dialog".into() });
+        send(&task_handle, &identity, "p", BrowserAction::Prompt { text: "crash-dialog".into(), images: vec![] });
         let exit = until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.process == pi_web::protocol::ProcessStatus::Exited)).await;
         if let ServerBody::Event { dialogs, .. } = exit.body { assert!(dialogs.is_empty(), "dead child left a modal"); }
         send(&task_handle, &identity, "old-dialog", BrowserAction::UiReply { dialog_id: "approval-1".into(), answer: pi_web::protocol::DialogAnswer::Confirmed { confirmed: true } });
@@ -940,7 +914,7 @@ async fn slash_commands_follow_runtime_lifecycle() {
         assert!(matches!(next(&mut connection).await.body, ServerBody::Hello { .. }));
         assert!(matches!(next(&mut connection).await.body, ServerBody::Snapshot { .. }));
         command_catalog(&mut connection, "first").await;
-        send(&child, &identity, "crash", BrowserAction::Prompt { text: "crash-dialog".into() });
+        send(&child, &identity, "crash", BrowserAction::Prompt { text: "crash-dialog".into(), images: vec![] });
         until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.process == pi_web::protocol::ProcessStatus::Exited)).await;
         fs::write(root.join("slash-commands.json"), r#"[{"name":"second","source":"skill"}]"#).unwrap();
         send(&child, &identity, "restart", BrowserAction::Restart { confirmed: true });
@@ -948,7 +922,7 @@ async fn slash_commands_follow_runtime_lifecycle() {
         assert_ne!(hello.epoch, identity.epoch);
         assert_eq!(command_catalog(&mut connection, "second").await.epoch, hello.epoch);
         let identity = ready(&mut connection).await;
-        send(&child, &identity, "switch", BrowserAction::Prompt { text: "/switch-session".into() });
+        send(&child, &identity, "switch", BrowserAction::Prompt { text: "/switch-session".into(), images: vec![] });
         let replacement = until(&mut connection, |m| matches!(m.body, ServerBody::Hello { .. })).await;
         assert_ne!(replacement.epoch, identity.epoch);
         assert_eq!(command_catalog(&mut connection, "second").await.epoch, replacement.epoch);
@@ -994,7 +968,7 @@ async fn tool_execution_payloads_never_reach_browser_frames() {
     let outcome = tokio::spawn(async move {
         let mut connection = child.connect("client".into()).await.unwrap();
         let identity = ready(&mut connection).await;
-        send(&child, &identity, "complete", BrowserAction::Prompt { text: "complete".into() });
+        send(&child, &identity, "complete", BrowserAction::Prompt { text: "complete".into(), images: vec![] });
         let mut completed = false;
         loop {
             let frame = next(&mut connection).await;
@@ -1030,9 +1004,7 @@ async fn context_usage_refreshes_and_replays_without_private_stats() {
         &handle,
         &identity,
         "context-run",
-        BrowserAction::Prompt {
-            text: "complete".into(),
-        },
+        BrowserAction::Prompt { text: "complete".into(), images: vec![] },
     );
     until(&mut connection, |m| matches!(&m.body, ServerBody::ContextUsage { usage: Some(u) } if u.tokens == Some(25000))).await;
     handle.disconnect("client".into()).await;
@@ -1149,9 +1121,7 @@ async fn settings_mutations_validate_and_serialize_with_prompts() {
         &handle,
         &identity,
         "blocked-prompt",
-        BrowserAction::Prompt {
-            text: "must not execute".into(),
-        },
+        BrowserAction::Prompt { text: "must not execute".into(), images: vec![] },
     );
     assert_eq!(result(&mut connection, "blocked-prompt").await.code, "busy");
     assert!(result(&mut connection, "model").await.ok);
@@ -1180,9 +1150,7 @@ async fn settings_mutations_validate_and_serialize_with_prompts() {
         &handle,
         &identity,
         "running",
-        BrowserAction::Prompt {
-            text: "running".into(),
-        },
+        BrowserAction::Prompt { text: "running".into(), images: vec![] },
     );
     assert!(result(&mut connection, "running").await.ok);
     send(
@@ -1229,9 +1197,7 @@ async fn run_completion_is_live_only_and_once_per_settlement() {
         &handle,
         &identity,
         "complete",
-        BrowserAction::Prompt {
-            text: "complete".into(),
-        },
+        BrowserAction::Prompt { text: "complete".into(), images: vec![] },
     );
     let completed = until(&mut connection, |m| {
         matches!(m.body, ServerBody::RunCompleted { .. })
@@ -1309,6 +1275,41 @@ async fn rejected_settings_preserve_confirmed_state_and_optional_apis_do_not_fai
 }
 
 #[tokio::test]
+async fn lsp_status_updates_clears_and_replays_to_other_devices() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("lsp-status"), "").unwrap();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    assert_eq!(
+        serde_json::to_value(&identity).unwrap()["body"]["status"]["lspStatus"],
+        "LSP: 1/2 servers"
+    );
+    for (index, (command, expected)) in [
+        ("/lsp-update", Some("LSP: 2/2 servers, 1 warning(s)")),
+        ("/lsp-clear", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("lsp-{index}");
+        send(
+            &handle,
+            &identity,
+            &id,
+            BrowserAction::Prompt { text: command.into(), images: vec![] },
+        );
+        assert!(result(&mut connection, &id).await.ok);
+        let mut peer = handle.connect(format!("peer-{index}")).await.unwrap();
+        let replay = ready(&mut peer).await;
+        let status = serde_json::to_value(replay).unwrap()["body"]["status"].clone();
+        assert_eq!(status["lspStatus"], serde_json::json!(expected));
+        assert!(!status.to_string().contains("PRIVATE"));
+    }
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
 async fn handled_commands_refresh_settings_and_sanitize_only_codex_status() {
     let fixture = Fixture::new();
     let handle = session::start(fixture.config()).unwrap();
@@ -1318,9 +1319,7 @@ async fn handled_commands_refresh_settings_and_sanitize_only_codex_status() {
         &handle,
         &identity,
         "slash-settings",
-        BrowserAction::Prompt {
-            text: "/settings".into(),
-        },
+        BrowserAction::Prompt { text: "/settings".into(), images: vec![] },
     );
     assert!(result(&mut connection, "slash-settings").await.ok);
     send(&handle, &identity, "replay-settings", BrowserAction::Attach);
@@ -1330,4 +1329,410 @@ async fn handled_commands_refresh_settings_and_sanitize_only_codex_status() {
     };
     assert_eq!(settings.codex_fast.unwrap(), "é".repeat(256));
     assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
+async fn shared_clients_route_results_and_stop_with_independent_request_ids() {
+    let fixture = Fixture::new();
+    let handle = session::start(fixture.config()).unwrap();
+    let child = handle.clone();
+    let outcome = tokio::spawn(async move {
+        let mut first = child.connect("client".into()).await.unwrap();
+        let identity = ready(&mut first).await;
+        let mut second = child.connect("second".into()).await.unwrap();
+        ready(&mut second).await;
+        send(&child, &identity, "connected", BrowserAction::UiReply {
+            dialog_id: "missing".into(), answer: pi_web::protocol::DialogAnswer::Cancelled,
+        });
+        until(&mut first, |m| {
+            assert!(!matches!(m.body, ServerBody::Hello { .. } | ServerBody::Snapshot { .. }), "peer connect reset existing subscriber");
+            matches!(&m.body, ServerBody::Result { result } if result.request_id == "connected")
+        }).await;
+
+        send(&child, &identity, "same", BrowserAction::Prompt { text: "retry".into(), images: vec![] });
+        send_from(&child, "second", &identity, "same", BrowserAction::Prompt { text: "retry".into(), images: vec![] });
+        let accepted = result(&mut first, "same").await;
+        assert!(accepted.ok);
+        assert_eq!(result(&mut second, "same").await.code, "busy");
+        for connection in [&mut first, &mut second] {
+            until(connection, |m| {
+                assert!(!matches!(m.body, ServerBody::Hello { .. }), "peer attachment reset an existing subscriber");
+                assert!(!matches!(m.body, ServerBody::Result { .. }), "peer result leaked");
+                matches!(&m.body, ServerBody::Event { status, .. } if status.activity == pi_web::view::Activity::Retrying)
+            }).await;
+        }
+        // Exact retries stay scoped to their sender, including rejected commands.
+        send(&child, &identity, "same", BrowserAction::Prompt { text: "retry".into(), images: vec![] });
+        send_from(&child, "second", &identity, "same", BrowserAction::Prompt { text: "retry".into(), images: vec![] });
+        assert_eq!(result(&mut first, "same").await, accepted);
+        assert_eq!(result(&mut second, "same").await.code, "busy");
+        send_from(&child, "second", &identity, "stop", BrowserAction::Cancel);
+        assert!(result(&mut second, "stop").await.ok);
+        // Attach is a requester-only replay; use a result as a barrier on the peer.
+        send_from(&child, "second", &identity, "attach", BrowserAction::Attach);
+        assert!(result(&mut second, "attach").await.ok);
+        send(&child, &identity, "barrier", BrowserAction::UiReply {
+            dialog_id: "missing".into(), answer: pi_web::protocol::DialogAnswer::Cancelled,
+        });
+        until(&mut first, |m| {
+            assert!(!matches!(m.body, ServerBody::Hello { .. } | ServerBody::Snapshot { .. }));
+            if let ServerBody::Result { result } = &m.body { assert_eq!(result.request_id, "barrier"); return true; }
+            false
+        }).await;
+    }).await;
+    handle.shutdown().await;
+    outcome.unwrap();
+    assert_eq!(
+        fixture
+            .log()
+            .iter()
+            .filter(|v| v["type"] == "prompt" && v["message"] == "retry")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn shared_dialog_first_reply_wins_and_only_last_disconnect_cancels() {
+    let fixture = Fixture::new();
+    let handle = session::start(fixture.config()).unwrap();
+    let child = handle.clone();
+    let outcome = tokio::spawn(async move {
+        let mut first = child.connect("client".into()).await.unwrap();
+        let identity = ready(&mut first).await;
+        let mut second = child.connect("second".into()).await.unwrap();
+        ready(&mut second).await;
+        send(&child, &identity, "prompt", BrowserAction::Prompt { text: "dialog".into(), images: vec![] });
+        for connection in [&mut first, &mut second] {
+            until(connection, |m| matches!(&m.body, ServerBody::Event { dialogs, .. } if !dialogs.is_empty())).await;
+        }
+        let answer = || BrowserAction::UiReply { dialog_id: "approval-1".into(), answer: pi_web::protocol::DialogAnswer::Confirmed { confirmed: true } };
+        send(&child, &identity, "answer", answer());
+        send_from(&child, "second", &identity, "answer", answer());
+        assert!(result(&mut first, "answer").await.ok);
+        assert_eq!(result(&mut second, "answer").await.code, "stale_dialog");
+        send_from(&child, "second", &identity, "stop", BrowserAction::Cancel);
+        assert!(result(&mut second, "stop").await.ok);
+        // Wait for idle reconciliation before the next run.
+        for attempt in 0..100 {
+            assert!(attempt < 99, "idle reconciliation did not finish");
+            send_from(&child, "second", &identity, &format!("state-{attempt}"), BrowserAction::Attach);
+            let state = until(&mut second, |m| matches!(m.body, ServerBody::Snapshot { .. })).await;
+            if matches!(state.body, ServerBody::Snapshot { status, .. } if status.activity == pi_web::view::Activity::Idle) { break; }
+            tokio::task::yield_now().await;
+        }
+        send_from(&child, "second", &identity, "prompt2", BrowserAction::Prompt { text: "dialog".into(), images: vec![] });
+        until(&mut second, |m| matches!(&m.body, ServerBody::Event { dialogs, .. } if !dialogs.is_empty())).await;
+        child.disconnect("client".into()).await;
+        send_from(&child, "second", &identity, "state2", BrowserAction::Attach);
+        let snapshot = until(&mut second, |m| matches!(m.body, ServerBody::Snapshot { .. })).await;
+        assert!(matches!(snapshot.body, ServerBody::Snapshot { dialogs, .. } if dialogs.len() == 1));
+        child.disconnect("second".into()).await;
+        let mut third = child.connect("third".into()).await.unwrap();
+        until(&mut third, |m| matches!(&m.body, ServerBody::Snapshot { dialogs, .. } | ServerBody::Event { dialogs, .. } if dialogs.is_empty())).await;
+        until(&mut third, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.notice.as_deref() == Some("dialog-cancelled"))).await;
+    }).await;
+    handle.shutdown().await;
+    outcome.unwrap();
+    let replies: Vec<_> = fixture
+        .log()
+        .into_iter()
+        .filter(|v| v["type"] == "extension_ui_response" && v["id"] == "approval-1")
+        .collect();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["confirmed"], true);
+    assert_eq!(replies[1]["cancelled"], true);
+}
+
+#[tokio::test]
+async fn shared_attachment_limit_is_released_by_disconnect() {
+    let fixture = Fixture::new();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut connections = Vec::new();
+    for i in 0..8 {
+        connections.push(handle.connect(i.to_string()).await.unwrap());
+    }
+    assert!(matches!(
+        handle.connect("ninth".into()).await,
+        Err("too_many_clients")
+    ));
+    handle.disconnect("0".into()).await;
+    assert!(handle.connect("ninth".into()).await.is_ok());
+    handle.shutdown().await;
+}
+
+/// Two subscribers share one server-side refresh, including focus bursts while the agent works.
+#[tokio::test]
+async fn codex_usage_is_private_shared_and_independent_of_agent_activity() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("codex-usage"), "").unwrap();
+    let mut config = fixture.config();
+    config.isolated = false;
+    let handle = session::start(config).unwrap();
+    let mut client = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut client).await;
+    let mut phone = handle.connect("phone".into()).await.unwrap();
+    ready(&mut phone).await;
+    send(
+        &handle,
+        &identity,
+        "working",
+        BrowserAction::Prompt { text: "hold".into(), images: vec![] },
+    );
+    assert!(result(&mut client, "working").await.ok);
+    send(
+        &handle,
+        &identity,
+        "quota-desktop",
+        BrowserAction::RefreshCodexUsage,
+    );
+    send_from(
+        &handle,
+        "phone",
+        &identity,
+        "quota-phone",
+        BrowserAction::RefreshCodexUsage,
+    );
+    let desktop = until(
+        &mut client,
+        |m| matches!(&m.body, ServerBody::CodexUsage { usage } if !usage.windows.is_empty()),
+    )
+    .await;
+    let mobile = until(
+        &mut phone,
+        |m| matches!(&m.body, ServerBody::CodexUsage { usage } if !usage.windows.is_empty()),
+    )
+    .await;
+    assert_eq!(desktop.body, mobile.body);
+    send(
+        &handle,
+        &identity,
+        "quota-burst",
+        BrowserAction::RefreshCodexUsage,
+    );
+    assert!(result(&mut client, "quota-burst").await.ok);
+    let log = fixture.log();
+    assert_eq!(
+        log.iter()
+            .filter(|c| c["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("/pi-web-codex-usage ")))
+            .count(),
+        1
+    );
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
+async fn codex_usage_never_prompts_without_verified_extension_or_in_isolated_mode() {
+    for isolated in [false, true] {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("codex-usage"), "").unwrap();
+        fs::write(fixture.0.join("wrong-quota-path"), "").unwrap();
+        let mut config = fixture.config();
+        config.isolated = isolated;
+        let handle = session::start(config).unwrap();
+        let mut client = handle.connect("client".into()).await.unwrap();
+        let identity = ready(&mut client).await;
+        send(
+            &handle,
+            &identity,
+            "quota",
+            BrowserAction::RefreshCodexUsage,
+        );
+        assert!(result(&mut client, "quota").await.ok);
+        assert!(!fixture.log().iter().any(|c| {
+            c["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("/pi-web-codex-usage "))
+        }));
+        assert!(handle.shutdown().await);
+    }
+}
+
+#[tokio::test]
+async fn codex_usage_model_change_clears_cached_account_data() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("codex-usage"), "").unwrap();
+    let mut config = fixture.config();
+    config.isolated = false;
+    let handle = session::start(config).unwrap();
+    let mut client = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut client).await;
+    send(
+        &handle,
+        &identity,
+        "quota",
+        BrowserAction::RefreshCodexUsage,
+    );
+    until(
+        &mut client,
+        |m| matches!(&m.body, ServerBody::CodexUsage { usage } if !usage.windows.is_empty()),
+    )
+    .await;
+    send(
+        &handle,
+        &identity,
+        "model",
+        BrowserAction::SetModel {
+            provider: "fixture".into(),
+            model_id: "second".into(),
+        },
+    );
+    until(&mut client, |m| matches!(&m.body, ServerBody::CodexUsage { usage } if usage.windows.is_empty() && usage.unavailable)).await;
+    assert!(result(&mut client, "model").await.ok);
+    send(
+        &handle,
+        &identity,
+        "non-codex",
+        BrowserAction::RefreshCodexUsage,
+    );
+    assert!(result(&mut client, "non-codex").await.ok);
+    assert_eq!(
+        fixture
+            .log()
+            .iter()
+            .filter(|c| c["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("/pi-web-codex-usage ")))
+            .count(),
+        1
+    );
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
+async fn workflows_survive_idle_and_reconnect_and_show_notification_preview() {
+    use pi_web::protocol::{BackgroundKind, BackgroundStatus};
+    let fixture = Fixture::new();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut client = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut client).await;
+    send(
+        &handle,
+        &identity,
+        "workflow",
+        BrowserAction::Prompt { text: "/workflow-launch".into(), images: vec![] },
+    );
+    let launch = until(
+        &mut client,
+        |m| matches!(&m.body, ServerBody::BackgroundTasks { tasks } if tasks.len() == 1),
+    )
+    .await;
+    assert!(
+        matches!(launch.body, ServerBody::BackgroundTasks { tasks } if tasks[0].kind == BackgroundKind::Workflow && tasks[0].status == BackgroundStatus::Active)
+    );
+    assert!(result(&mut client, "workflow").await.ok);
+    ready(&mut client).await;
+    let mut observer = handle.connect("observer".into()).await.unwrap();
+    let replay = until(
+        &mut observer,
+        |m| matches!(&m.body, ServerBody::BackgroundTasks { tasks } if tasks.len() == 1),
+    )
+    .await;
+    assert!(
+        matches!(replay.body, ServerBody::BackgroundTasks { tasks } if tasks[0].status == BackgroundStatus::Active)
+    );
+    send(
+        &handle,
+        &identity,
+        "workflow-done",
+        BrowserAction::Prompt { text: "/workflow-complete".into(), images: vec![] },
+    );
+    let done = until(&mut client, |m| matches!(&m.body, ServerBody::BackgroundTasks { tasks } if tasks.first().is_some_and(|t| t.status == BackgroundStatus::Completed))).await;
+    assert!(
+        matches!(done.body, ServerBody::BackgroundTasks { tasks } if tasks[0].result.as_deref() == Some("Workflow verified") && !serde_json::to_string(&tasks).unwrap().contains("PRIVATE"))
+    );
+    assert!(result(&mut client, "workflow-done").await.ok);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_tasks_survive_idle_and_reconnect_then_interrupt_and_reset() {
+    use pi_web::protocol::{BackgroundStatus, ProcessStatus};
+    let fixture = Fixture::new();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    send(
+        &handle,
+        &identity,
+        "bg",
+        BrowserAction::Prompt { text: "/background-launch".into(), images: vec![] },
+    );
+    let launched = until(
+        &mut connection,
+        |m| matches!(&m.body, ServerBody::BackgroundTasks { tasks } if tasks.len() == 1),
+    )
+    .await;
+    let ServerBody::BackgroundTasks { tasks } = launched.body else {
+        unreachable!()
+    };
+    assert_eq!(tasks[0].status, BackgroundStatus::Active);
+    assert!(!serde_json::to_string(&tasks).unwrap().contains("PRIVATE"));
+    assert!(result(&mut connection, "bg").await.ok);
+    ready(&mut connection).await;
+    let mut observer = handle.connect("observer".into()).await.unwrap();
+    let replay = until(
+        &mut observer,
+        |m| matches!(&m.body, ServerBody::BackgroundTasks { tasks } if tasks.len() == 1),
+    )
+    .await;
+    assert!(
+        matches!(replay.body, ServerBody::BackgroundTasks { tasks } if tasks[0].status == BackgroundStatus::Active)
+    );
+    send(
+        &handle,
+        &identity,
+        "done-bg",
+        BrowserAction::Prompt { text: "/background-complete".into(), images: vec![] },
+    );
+    let done = until(&mut connection, |m| matches!(&m.body, ServerBody::BackgroundTasks { tasks } if tasks[0].status == BackgroundStatus::Completed)).await;
+    assert!(
+        matches!(done.body, ServerBody::BackgroundTasks { tasks } if tasks[0].result.as_deref() == Some("Verified result"))
+    );
+    assert!(result(&mut connection, "done-bg").await.ok);
+    ready(&mut connection).await;
+    send(
+        &handle,
+        &identity,
+        "stop-bg",
+        BrowserAction::Prompt { text: "/background-crash".into(), images: vec![] },
+    );
+    until(&mut connection, |m| matches!(&m.body, ServerBody::BackgroundTasks { tasks } if tasks.iter().any(|t| t.status == BackgroundStatus::Unknown))).await;
+    until(&mut connection, |m| matches!(&m.body, ServerBody::Event { status, .. } if status.process == ProcessStatus::Exited)).await;
+    send(
+        &handle,
+        &identity,
+        "restart-bg",
+        BrowserAction::Restart { confirmed: true },
+    );
+    until(&mut connection, |m| {
+        matches!(&m.body, ServerBody::Hello { .. }) && m.epoch != identity.epoch
+    })
+    .await;
+    let reset = until(&mut connection, |m| {
+        matches!(&m.body, ServerBody::BackgroundTasks { .. })
+    })
+    .await;
+    assert!(matches!(reset.body, ServerBody::BackgroundTasks { tasks } if tasks.is_empty()));
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn unsupported_model_rejects_image_prompts_without_rpc_or_consuming_draft() {
+    let fixture = Fixture::new();
+    let handle = session::start(fixture.config()).unwrap();
+    let task_handle = handle.clone();
+    let outcome = tokio::spawn(async move {
+        let mut connection = task_handle.connect("client".into()).await.unwrap();
+        let identity = ready(&mut connection).await;
+        send(&task_handle, &identity, "image-only", BrowserAction::Prompt { text: String::new(), images: vec!["a".repeat(64)] });
+        let rejected = result(&mut connection, "image-only").await;
+        assert!(!rejected.ok); assert_eq!(rejected.code, "model_does_not_support_images");
+        send(&task_handle, &identity, "malformed", BrowserAction::Prompt { text: "describe".into(), images: vec!["../../file".into()] });
+        assert_eq!(result(&mut connection, "malformed").await.code, "invalid_prompt");
+    }).await;
+    handle.shutdown().await; outcome.unwrap();
+    assert!(!fixture.log().iter().any(|command| command.get("images").is_some()));
 }

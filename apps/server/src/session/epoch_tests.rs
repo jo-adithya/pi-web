@@ -52,7 +52,7 @@ async fn pending_old_prompt_cannot_consume_new_epoch_activity() {
             let message = message(&mut connection).await;
             if matches!(&message.body, ServerBody::Snapshot { status, .. } | ServerBody::Event { status, .. } if status.process == ProcessStatus::Ready && status.history_warning.is_none()) { break message; }
         };
-        let request = |id: &str, text: &str| BrowserMessage { v: 1, session_id: identity.session_id.clone(), epoch: identity.epoch.clone(), request_id: id.into(), action: BrowserAction::Prompt { text: text.into() } };
+        let request = |id: &str, text: &str| BrowserMessage { v: 1, session_id: identity.session_id.clone(), epoch: identity.epoch.clone(), request_id: id.into(), action: BrowserAction::Prompt { text: text.into(), images: vec![] } };
         child.dispatch("client".into(), request("switch", "/switch-start")).unwrap();
         wait_file(&test_root.join("state-waiting")).await;
         let (entered, waiting) = oneshot::channel();
@@ -76,7 +76,7 @@ async fn pending_old_prompt_cannot_consume_new_epoch_activity() {
             }
         }
         assert!(live, "new-session output was erased by the old prompt");
-        child.dispatch("client".into(), BrowserMessage { v: 1, session_id: new_identity.session_id, epoch: new_identity.epoch, request_id: "new-prompt".into(), action: BrowserAction::Prompt { text: "must remain busy".into() } }).unwrap();
+        child.dispatch("client".into(), BrowserMessage { v: 1, session_id: new_identity.session_id, epoch: new_identity.epoch, request_id: "new-prompt".into(), action: BrowserAction::Prompt { text: "must remain busy".into(), images: vec![] } }).unwrap();
         loop {
             if let ServerBody::Result { result } = message(&mut connection).await.body
                 && result.request_id == "new-prompt" {

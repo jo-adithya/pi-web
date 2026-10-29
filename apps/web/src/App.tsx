@@ -1,7 +1,11 @@
 import { Show, createEffect, createMemo, createSignal, onSettled } from "solid-js";
+import { ActionDialog, ConfirmationDialog, dialogReturnFocus } from "./components/ActionDialog";
+import { TextField } from "@kobalte/core/text-field";
 import { Dialog } from "@kobalte/core/dialog";
 import { Button } from "@kobalte/core/button";
+import { DropdownMenu } from "@kobalte/core/dropdown-menu";
 import { SessionSidebar } from "./components/SessionSidebar";
+import { DismissibleAlert } from "./components/DismissibleAlert";
 import { Icon } from "./components/Icon";
 import { createMediaQuery, createTheme } from "./theme";
 import type { BrowserMessage, CatalogItem, WorkspaceAction, WorkspaceCommand, WorkspaceItem } from "./generated/protocol";
@@ -10,6 +14,8 @@ import { decodeWorkspace } from "./workspace-state";
 import { createSessionModel, type SessionModel } from "./session-model";
 import { SessionView } from "./SessionView";
 import { createCompletionNotifications } from "./notifications";
+import { createPhonePush } from "./phone-push";
+import { listenForSidebarSwipes } from "./sidebar-swipe";
 import { isCapability, loadCapability, saveCapability, SOCKET_PROTOCOL } from "./browser-auth";
 import "./style.css";
 
@@ -31,18 +37,20 @@ export default function App() {
   const models = new Map<string, SessionModel>(); const subscriptions = new Set<string>(); const blocked = new Set<string>();
   const pending = new Map<string, WorkspaceAction>(); let selectionRequest: string | undefined;
   let capability: string | null = null;
+  const phonePush = createPhonePush(() => capability);
   let socket: WebSocket | undefined; let timer: ReturnType<typeof setTimeout> | undefined; let disposed = false; let retry = 250;
   const transport = (message: BrowserMessage) => { if (socket?.readyState !== WebSocket.OPEN) return false; socket.send(JSON.stringify(message)); return true; };
   function modelFor(id: string) {
     let model = models.get(id);
-    if (!model) { model = createSessionModel(id, transport, () => connection() === "Connected", notifications.completed); models.set(id, model); }
+    if (!model) { model = createSessionModel(id, transport, () => connection() === "Connected", notifications.completed, () => capability); models.set(id, model); }
     return model;
   }
   const entry = createMemo(() => catalog().find(item => item.sessionId === selected()));
   const current = createMemo(() => entry() ? modelFor(entry()!.sessionId) : undefined);
   const canShowSidebar = () => mobile() && !current()?.state.dialogs.length;
-  // A native extension modal takes priority over the navigation drawer.
-  createEffect(canShowSidebar, () => { setSidebarOpen(false); });
+  onSettled(() => listenForSidebarSwipes(canShowSidebar, sidebarOpen, setSidebarOpen));
+  // Close for extension modals or desktop layout; ordinary stream updates preserve the drawer.
+  createEffect(canShowSidebar, enabled => { if (!enabled) setSidebarOpen(false); });
   function command(action: WorkspaceAction) {
     if (socket?.readyState !== WebSocket.OPEN || pending.size >= 8) { setNotice("Workspace request unavailable; reconnect or wait for the current operation."); return; }
     const requestId = crypto.randomUUID(); const message: WorkspaceCommand = { v: 2, requestId, action };
@@ -76,7 +84,7 @@ export default function App() {
           setManagementPending(pending.size);
           const remaining = new Set(reply.sessions.map(item => item.sessionId));
           for (const [id, model] of models) if (!remaining.has(id)) {
-            model.stopped(); models.delete(id); subscriptions.delete(id); blocked.delete(id); notifications.forget(id);
+            model.stopped(); model.dispose(); models.delete(id); subscriptions.delete(id); blocked.delete(id); notifications.forget(id);
           }
           for (const item of reply.sessions) {
             const model = modelFor(item.sessionId);
@@ -91,7 +99,7 @@ export default function App() {
           if (!reply.ok) {
             if (action?.type === "subscribe") {
               subscriptions.delete(action.sessionId); blocked.add(action.sessionId);
-              modelFor(action.sessionId).setNotice(reply.code === "already_attached" ? "This session is controlled by another tab. Release it there, then Reattach here." : `Attachment failed: ${reply.code.replaceAll("_", " ")}.`);
+              modelFor(action.sessionId).setNotice(reply.code === "too_many_clients" ? "This session has reached its connected-device limit. Close another tab, then Reattach here." : `Attachment failed: ${reply.code.replaceAll("_", " ")}.`);
             } else setNotice(reply.code === "catalog_write_failed_after_transcript_deleted"
               ? "The saved transcript was deleted, but the sidebar entry could not be removed. Retry deletion to finish."
               : `Workspace command not completed: ${reply.code.replaceAll("_", " ")}.`);
@@ -135,7 +143,7 @@ export default function App() {
     };
     const changed = () => { if (new URLSearchParams(location.hash.slice(1)).has("cap")) void start(); };
     window.addEventListener("hashchange", changed); void start();
-    return () => { disposed = true; notifications.dispose(); window.removeEventListener("hashchange", changed); clearTimeout(timer); socket?.close(); };
+    return () => { disposed = true; for (const model of models.values()) model.dispose(); notifications.dispose(); window.removeEventListener("hashchange", changed); clearTimeout(timer); socket?.close(); };
   });
   /** Remember the chosen folder without launching a stopped conversation. */
   function choose(item: CatalogItem) {
@@ -147,26 +155,45 @@ export default function App() {
       selectionRequest = undefined;
     }
   }
-  /** Renames the sidebar entry without switching conversations or changing its transcript. */
+  const [action, setAction] = createSignal<{ kind: "rename" | "delete" | "stop"; item: CatalogItem; returnFocus: Element | null; description: string } | null>(null);
+  const [renameValue, setRenameValue] = createSignal("");
+  const [renameError, setRenameError] = createSignal("");
+  /** Capture the target and runtime; later catalog updates cannot redirect approval. */
   function renameConversation(item: CatalogItem) {
     if (!canManage()) return;
-    const value = prompt("Rename conversation", item.title);
-    if (value === null) return;
-    const title = value.trim();
-    if (!title || new TextEncoder().encode(title).length > 64 || /[\u0000-\u001f\u007f-\u009f]/u.test(title)) {
-      setNotice("Use a name of 1–64 UTF-8 bytes without control characters."); return;
-    }
-    if (title === item.title) return;
-    setNotice("");
-    command({ type: "rename", sessionId: item.sessionId, title });
+    setRenameValue(item.title); setRenameError("");
+    setAction({ kind: "rename", item, returnFocus: dialogReturnFocus(), description: "Rename this conversation without changing its transcript." });
   }
-  /** Confirms permanent transcript deletion and runtime cleanup before removing the entry. */
   function deleteConversation(item: CatalogItem) {
     if (!canManage() || !["open", "stopped"].includes(item.lifecycle)) return;
     const last = catalog().filter(other => other.workspaceId === item.workspaceId).length === 1;
-    if (!confirm(`Delete this conversation? Its saved Pi transcript will be permanently deleted. Its active task will be stopped and its unsent draft discarded. Project files will not be deleted. This cannot be undone.${last ? " A new empty conversation will replace it." : ""}`)) return;
-    setNotice("");
-    command({ type: "delete", sessionId: item.sessionId, epoch: item.runtime?.epoch ?? null, confirmed: true });
+    setAction({ kind: "delete", item, returnFocus: dialogReturnFocus(), description: `Delete this conversation? Its saved Pi transcript will be permanently deleted. Its active task will be stopped and its unsent draft discarded. Project files will not be deleted. This cannot be undone.${last ? " A new empty conversation will replace it." : ""}` });
+  }
+  function stopConversation(item: CatalogItem) {
+    if (!canManage() || item.lifecycle !== "open" || !item.runtime) return;
+    setAction({ kind: "stop", item, returnFocus: dialogReturnFocus(), description: "Stop this session? Its active task will be cancelled. Saved history is retained; partial output may be lost." });
+  }
+  const eligible = () => {
+    const target = action();
+    const live = catalog().find(item => item.sessionId === target?.item.sessionId);
+    return canManage() && Boolean(target && live && live.lifecycle === target.item.lifecycle && (live.runtime?.epoch ?? null) === (target.item.runtime?.epoch ?? null));
+  };
+  /** Revalidate immediately before sending; stale or disabled dialogs never authorize a command. */
+  function submitAction() {
+    const target = action();
+    if (!target || !eligible()) return;
+    if (target.kind === "rename") {
+      const title = renameValue().trim();
+      if (!title || new TextEncoder().encode(title).length > 64 || /[\u0000-\u001f\u007f-\u009f]/u.test(title)) {
+        setRenameError("Use a name of 1–64 UTF-8 bytes without control characters."); return;
+      }
+      if (title !== target.item.title) { setNotice(""); command({ type: "rename", sessionId: target.item.sessionId, title }); }
+    } else {
+      setNotice("");
+      if (target.kind === "stop" && target.item.runtime) command({ type: "stop", sessionId: target.item.sessionId, epoch: target.item.runtime.epoch, confirmed: true });
+      else if (target.kind === "delete") command({ type: "delete", sessionId: target.item.sessionId, epoch: target.item.runtime?.epoch ?? null, confirmed: true });
+    }
+    setAction(null);
   }
   const canManage = () => connection() === "Connected" && managementPending() === 0;
   const canCreate = () => canManage() && Boolean(entry()) && catalog().filter(item => item.lifecycle !== "stopped").length < 4 && catalog().filter(item => item.workspaceId === entry()?.workspaceId).length < 32;
@@ -192,31 +219,44 @@ export default function App() {
           <div class="session-controls">
             <div class="statuses" aria-live="polite"><span class={["connection", { connected: connection() === "Connected" }]}>{connection()}</span>
             </div>
-            <Show when={entry()}>{item => <details class="session-options">
-              <summary class="icon-button" aria-label="Session options" title="Session options"><Icon name="more" /></summary>
-              <div class="session-actions">
-                <Button class="danger" disabled={!canManage() || !["open", "stopped"].includes(item().lifecycle)} onClick={() => deleteConversation(item())}>Delete conversation…</Button>
-                <Button disabled={!notifications.supported} aria-pressed={notifications.enabled() ? "true" : "false"} title="Notify when an agent finishes while this app is open" onClick={() => void notifications.toggle()}>{notifications.enabled() ? "Disable notifications" : "Enable notifications"}</Button>
-                <Show when={item().lifecycle === "stopped"}><Button disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => command({ type: "open", sessionId: item().sessionId })}>Reopen session</Button></Show>
-                <Show when={item().lifecycle === "open"}><Button disabled={connection() !== "Connected"} onClick={() => { blocked.delete(item().sessionId); subscriptions.delete(item().sessionId); subscribe(item().sessionId); }}>Reattach</Button>
-                  <Button class="danger" disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => { if (confirm("Stop this session? Its active task will be cancelled. Saved history is retained; partial output may be lost.")) command({ type: "stop", sessionId: item().sessionId, epoch: item().runtime!.epoch, confirmed: true }); }}>Stop session…</Button></Show>
-              </div>
-            </details>}</Show>
+            <Show when={entry()}>{item => <DropdownMenu placement="bottom-end" gutter={8} modal={false}>
+              <DropdownMenu.Trigger class="icon-button session-options-trigger" aria-label="Session options" title="Session options"><Icon name="more" /></DropdownMenu.Trigger>
+              <DropdownMenu.Portal><DropdownMenu.Content class="session-menu session-actions">
+                <DropdownMenu.Item class="danger" disabled={!canManage() || !["open", "stopped"].includes(item().lifecycle)} onSelect={() => deleteConversation(item())}>Delete conversation…</DropdownMenu.Item>
+                <DropdownMenu.Item disabled={!notifications.supported} title="Notify when an agent finishes while this app is open" onSelect={() => void notifications.toggle()}>{notifications.enabled() ? "Disable notifications" : "Enable notifications"}</DropdownMenu.Item>
+                <DropdownMenu.Item disabled={phonePush.busy() || !phonePush.supported} onSelect={() => void phonePush.enable()}>{phonePush.enabled() ? "Renew phone push" : "Enable phone push"}</DropdownMenu.Item>
+                <DropdownMenu.Item disabled={phonePush.busy()} onSelect={() => void phonePush.disable()}>Disable phone push</DropdownMenu.Item><Show when={phonePush.enabled()}><DropdownMenu.Item disabled={phonePush.busy()} onSelect={() => void phonePush.test()}>Test phone push</DropdownMenu.Item></Show>
+                <span class="phone-push-scope">Phone push: all folders and conversations on this server. This device only; expires after 30 days. Requires HTTPS and Brave/Chromium on Android.</span>
+                <Show when={item().lifecycle === "stopped"}><DropdownMenu.Item disabled={connection() !== "Connected" || managementPending() > 0} onSelect={() => command({ type: "open", sessionId: item().sessionId })}>Reopen session</DropdownMenu.Item></Show>
+                <Show when={item().lifecycle === "open"}><DropdownMenu.Item disabled={connection() !== "Connected"} onSelect={() => { blocked.delete(item().sessionId); subscriptions.delete(item().sessionId); subscribe(item().sessionId); }}>Reattach</DropdownMenu.Item>
+                  <DropdownMenu.Item class="danger" disabled={connection() !== "Connected" || managementPending() > 0} onSelect={() => { stopConversation(item()); }}>Stop session…</DropdownMenu.Item></Show>
+              </DropdownMenu.Content></DropdownMenu.Portal>
+            </DropdownMenu>}</Show>
           </div>
         </div>
-        <Show when={notice()}><p class="workspace-notice" role="status">{notice()}</p></Show>
-        <Show when={notifications.message()}><p class="workspace-notice" role="status">{notifications.message()}</p></Show>
+        <DismissibleAlert class="workspace-notice" message={notice()} />
+        <DismissibleAlert class="workspace-notice" message={phonePush.message()} />
+        <DismissibleAlert class="workspace-notice" message={notifications.message()} />
         <Show when={current()} keyed>{model => <Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
           <Show when={entry()?.lifecycle === "stopped"}><Button disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => command({ type: "open", sessionId: model.id })}>Reopen conversation</Button></Show>
           <Show when={model.draft()}><p class="preserve">Unsent draft: {model.draft()}</p></Show></section>}><SessionView model={model} /></Show>}</Show>
         <Show when={!catalog().length}><section class="empty workspace-empty"><span class="empty-mark">π</span><h2>Connecting to your workspace</h2><p>Open the current terminal URL if authentication is required.</p></section></Show>
       </main>
     </div>
+    <Show when={action()} keyed>{target => <Show when={target.kind === "rename"} fallback={<ConfirmationDialog returnFocus={target.returnFocus} title={target.kind === "delete" ? "Delete conversation" : "Stop session"} description={target.description} action={target.kind === "delete" ? "Delete conversation" : "Stop session"} disabled={!eligible()} close={() => setAction(null)} confirm={submitAction} />}>
+      <ActionDialog returnFocus={target.returnFocus} title="Rename conversation" description={target.description} close={() => setAction(null)}>
+        <form onSubmit={event => { event.preventDefault(); submitAction(); }}>
+          <TextField value={renameValue()} onChange={setRenameValue}><TextField.Label>Conversation name</TextField.Label><TextField.TextArea rows={1} /></TextField>
+          <Show when={renameError()}><p role="alert">{renameError()}</p></Show>
+          <div class="dialog-actions"><Button type="button" onClick={() => setAction(null)}>Cancel</Button><Button type="submit" disabled={!eligible()}>Rename</Button></div>
+        </form>
+      </ActionDialog>
+    </Show>}</Show>
     <Dialog.Portal>
       {/* Explicit dismissal also covers Kobalte alpha’s unregistered dismissable layer. */}
       <Dialog.Overlay class="sidebar-overlay" onClick={() => setSidebarOpen(false)} />
       <Dialog.Content class="sidebar sidebar-drawer" onKeyDown={event => {
-        if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) { event.preventDefault(); setSidebarOpen(false); }
+        if (event.key === "Escape" && !event.isComposing) { event.preventDefault(); setSidebarOpen(false); }
       }}>
         <div class="sidebar-brand"><span class="brand">π</span><Dialog.Title>Sessions</Dialog.Title><Dialog.CloseButton class="icon-button" aria-label="Close sessions"><Icon name="close" /></Dialog.CloseButton></div>
         <Dialog.Description class="sr-only">Choose a workspace and conversation, or add a trusted project folder.</Dialog.Description>

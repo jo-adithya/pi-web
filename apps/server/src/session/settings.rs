@@ -16,6 +16,7 @@ pub(super) fn model(value: &Value) -> Option<ModelOption> {
         id: id.into(),
         provider: provider.into(),
         name: name.into(),
+        images: value["input"].as_array().is_some_and(|input| input.iter().any(|kind| kind == "image")),
     })
 }
 
@@ -68,10 +69,45 @@ pub(super) fn context_usage(value: &Value) -> Option<crate::protocol::ContextUsa
     })
 }
 
+/// Projects LSP footer text, removing theme CSI escapes and controls, capped at 512 UTF-8 bytes.
+/// Missing, non-string, and empty values clear the extension's status.
+pub(super) fn lsp_status(value: &Value) -> Option<String> {
+    let mut chars = value.as_str()?.chars().peekable();
+    let mut text = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+        } else if !ch.is_control() {
+            if text.len() + ch.len_utf8() > 512 {
+                break;
+            }
+            text.push(ch);
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lsp_status_removes_theme_escapes_and_bounds_utf8() {
+        assert_eq!(
+            lsp_status(&json!("\u{1b}[38;2;1;2;3mLSP: 1/2 servers\u{1b}[39m\n")),
+            Some("LSP: 1/2 servers".into())
+        );
+        assert_eq!(lsp_status(&json!("é".repeat(300))), Some("é".repeat(256)));
+        for value in [Value::Null, json!(false), json!(""), json!("\u{1b}[0m\n")] {
+            assert_eq!(lsp_status(&value), None);
+        }
+    }
 
     #[test]
     fn context_usage_preserves_unknown_and_zero_and_rejects_invalid_numbers() {
@@ -110,8 +146,11 @@ mod tests {
         let value = json!({"id":"model", "provider":"provider", "name":"Name", "baseURL":"private", "cost":{"input": 42}});
         assert_eq!(
             serde_json::to_value(model(&value).unwrap()).unwrap(),
-            json!({"id":"model", "provider":"provider", "name":"Name"})
+            json!({"id":"model", "provider":"provider", "name":"Name", "images":false})
         );
+        let mut image_model = value.clone();
+        image_model["input"] = json!(["text", "image"]);
+        assert!(model(&image_model).unwrap().images);
         for field in ["id", "provider", "name"] {
             for invalid in [String::new(), "\ncontrol".into(), "é".repeat(129)] {
                 let mut invalid_model = value.clone();

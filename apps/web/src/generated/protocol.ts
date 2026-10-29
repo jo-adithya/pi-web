@@ -67,7 +67,7 @@ export type Activity = "idle" | "submitting" | "reconciling" | "running" | "retr
  * Text kinds have distinct rendering rules.
  */
 
-export type BlockKind = "text" | "thinking" | "notice";
+export type BlockKind = "text" | "thinking" | "notice" | "image";
 
 /**
  * One safe display block, without provider signatures, binary images or schemas.
@@ -106,7 +106,7 @@ export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhi
  * Public model identity, excluding credentials, endpoints and pricing configuration.
  */
 
-export type ModelOption = { id: string, provider: string, name: string, };
+export type ModelOption = { id: string, provider: string, name: string, images: boolean, };
 
 /**
  * Confirmed settings and advertised capabilities. Null means unavailable.
@@ -124,6 +124,38 @@ codexFast: string | null, };
 
 export type ContextUsage = { tokens: number | null, contextWindow: number, };
 
+export type CodexWindowIdentity = "primary" | "secondary";
+
+/**
+ * One provider limit window. Times are Unix seconds; duration is seconds, usage is 0–100.
+ */
+
+export type CodexWindow = { identity: CodexWindowIdentity, durationSeconds: number, usedPercent: number, resetsAt: number, };
+
+/**
+ * Per-conversation runtime cache. Stale values remain visible after a failed refresh.
+ */
+
+export type CodexUsage = { windows: Array<CodexWindow>, observedAt: number | null, loading: boolean, stale: boolean, unavailable: boolean, };
+
+/**
+ * Source of an observed background task.
+ */
+
+export type BackgroundKind = "agent" | "workflow";
+
+/**
+ * Active includes queued and running: the producer does not distinguish them here.
+ */
+
+export type BackgroundStatus = "active" | "completed" | "steered" | "error" | "aborted" | "stopped" | "unknown";
+
+/**
+ * Bounded runtime-only projection of an observed background invocation.
+ */
+
+export type BackgroundTask = { id: string, kind: BackgroundKind, name: string, description: string, status: BackgroundStatus, result: string | null, error: string | null, truncated: boolean, };
+
 /**
  * Outcome of one actual agent settlement in the current epoch.
  */
@@ -134,10 +166,10 @@ export type RunOutcome = "success" | "error" | "aborted";
  * Only the controlling browser may issue these bounded, session-scoped actions.
  */
 
-export type BrowserAction = { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
+export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, images: Array<string>, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
 
 /**
- * Browser envelope. Shape decoding precedes bounds, version, controller and epoch checks.
+ * Browser envelope. Shape decoding precedes bounds, version, subscription and epoch checks.
  */
 
 export type BrowserMessage = { v: number, sessionId: string, epoch: string, requestId: string, action: BrowserAction, };
@@ -146,7 +178,11 @@ export type BrowserMessage = { v: number, sessionId: string, epoch: string, requ
  * Independent process/activity/outcome states; a lost browser is not a stopped agent.
  */
 
-export type RuntimeStatus = { process: ProcessStatus, activity: Activity, lastOutcome: string | null, error: string | null, historyWarning: string | null, persistence: boolean, cancelUnconfirmed: boolean, notice: string | null, };
+export type RuntimeStatus = { process: ProcessStatus, activity: Activity, lastOutcome: string | null, error: string | null, historyWarning: string | null, persistence: boolean, cancelUnconfirmed: boolean, notice: string | null, 
+/**
+ * Latest plain-text LSP extension status, at most 512 UTF-8 bytes; null when unavailable.
+ */
+lspStatus: string | null, };
 
 export type CommandResult = { requestId: string, ok: boolean, code: string, disposition: string | null, recoveredDraft: string | null, };
 
@@ -166,12 +202,12 @@ export type SlashCommand = { name: string, description: string | null, source: S
  * Ordered application messages. Snapshots supersede earlier events through their sequence.
  */
 
-export type ServerBody = { "type": "context_usage", usage: ContextUsage | null, } | { "type": "settings", settings: AgentSettings, } | { "type": "run_completed", runId: string, outcome: RunOutcome, } | { "type": "commands", commands: Array<SlashCommand>, } | { "type": "hello", project: string, process: ProcessStatus, } | { "type": "snapshot", throughSeq: number, status: RuntimeStatus, messages: Array<DisplayMessage>, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "event", seq: number, patches: Array<ViewPatch>, status: RuntimeStatus, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "result", result: CommandResult, } | { "type": "error", code: string, };
+export type ServerBody = { "type": "background_tasks", tasks: Array<BackgroundTask>, } | { "type": "codex_usage", usage: CodexUsage, } | { "type": "context_usage", usage: ContextUsage | null, } | { "type": "settings", settings: AgentSettings, } | { "type": "run_completed", runId: string, outcome: RunOutcome, } | { "type": "commands", commands: Array<SlashCommand>, } | { "type": "hello", project: string, process: ProcessStatus, } | { "type": "snapshot", throughSeq: number, status: RuntimeStatus, messages: Array<DisplayMessage>, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "event", seq: number, patches: Array<ViewPatch>, status: RuntimeStatus, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "result", result: CommandResult, } | { "type": "error", code: string, };
 
 export type ServerMessage = { v: number, sessionId: string, epoch: string, body: ServerBody, };
 
 /**
- * Small lifecycle view available without acquiring a conversation controller.
+ * Small lifecycle view available without subscribing to a conversation.
  */
 
 export type RuntimeSummary = { epoch: string, process: ProcessStatus, activity: Activity, };

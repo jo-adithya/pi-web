@@ -4,6 +4,8 @@
 use serde::Serialize;
 
 mod metadata;
+mod bounded_value;
+use serde::de::DeserializeSeed;
 use metadata::{MAX_METADATA_BYTES, read_metadata};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
@@ -132,7 +134,18 @@ fn truncated_entry(metadata: &Metadata) -> serde_json::Value {
 /// # Errors
 /// Returns an error on I/O failures, malformed scanned JSON, missing ancestry,
 /// unsupported headers, selected metadata/depth limits, or scan exhaustion.
-pub fn project<R: Read + Seek>(mut reader: R, leaf: &str) -> Result<Projection> {
+pub fn project<R: Read + Seek>(reader: R, leaf: &str) -> Result<Projection> {
+    project_inner(reader, leaf, MAX_RECORD_BYTES, false, |_| {})
+}
+
+/// Reconstructs image references from bounded persisted records before retention.
+/// One record may be up to 8 MiB, with 16,384 allocation nodes enforced during
+/// decoding; projected records still obey the existing 64 KiB preview limit.
+pub fn project_images<R: Read + Seek>(reader: R, leaf: &str, project: impl FnMut(&mut serde_json::Value)) -> Result<Projection> {
+    project_inner(reader, leaf, 8 * 1024 * 1024, true, project)
+}
+
+fn project_inner<R: Read + Seek>(mut reader: R, leaf: &str, record_limit: u64, images: bool, mut project: impl FnMut(&mut serde_json::Value)) -> Result<Projection> {
     if leaf.len() > MAX_METADATA_BYTES {
         return Err("history leaf exceeds metadata limit".into());
     }
@@ -168,7 +181,7 @@ pub fn project<R: Read + Seek>(mut reader: R, leaf: &str) -> Result<Projection> 
             "message" => metadata
                 .message
                 .as_ref()
-                .is_some_and(|m| !matches!(m.role.as_str(), "system" | "toolResult")),
+                .is_some_and(|m| m.role != "system" && (images || m.role != "toolResult")),
             "custom_message" => metadata.display != Some(false) && !metadata.internal_notification,
             "compaction" | "branch_summary" => true,
             _ => false,
@@ -176,25 +189,35 @@ pub fn project<R: Read + Seek>(mut reader: R, leaf: &str) -> Result<Projection> 
         if !visible {
             continue;
         }
-        let mut value = if length > MAX_RECORD_BYTES {
+        let mut value = if length > record_limit {
             truncated_entry(&metadata)
         } else {
             lines.reader.seek(SeekFrom::Start(offset))?;
-            let mut value: serde_json::Value =
-                serde_json::from_reader(BufReader::new(lines.reader.by_ref().take(length)))?;
+            let mut budget = MAX_RETAINED_NODES;
+            let mut decoder = serde_json::Deserializer::from_reader(BufReader::new(lines.reader.by_ref().take(length)));
+            let mut value = bounded_value::BoundedValue(&mut budget).deserialize(&mut decoder).unwrap_or_else(|_| truncated_entry(&metadata));
+            if value["message"]["role"] == "custom" && (value["message"]["display"] == false || value["message"]["customType"] == "subagent-notification") { continue; }
+            project(&mut value);
             // Only bounded presentation fields survive; omit signatures, images and details.
             if let Some(message) = value.get_mut("message").and_then(|m| m.as_object_mut()) {
                 message.retain(|k, _| matches!(k.as_str(), "role" | "content" | "errorMessage"));
                 if let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
                     blocks.retain(|block| {
-                        matches!(block["type"].as_str(), Some("text" | "thinking"))
+                        matches!(block["type"].as_str(), Some("text" | "thinking" | "image_ref" | "image_unavailable"))
                     });
                     for block in blocks {
                         if let Some(block) = block.as_object_mut() {
-                            block.retain(|k, _| matches!(k.as_str(), "type" | "text" | "thinking"));
+                            block.retain(|k, _| matches!(k.as_str(), "type" | "text" | "thinking" | "ref"));
                         }
                     }
                 }
+            }
+            if value["message"]["role"] == "toolResult" {
+                if let Some(blocks) = value["message"]["content"].as_array_mut() {
+                    blocks.retain(|block| matches!(block["type"].as_str(), Some("image_ref" | "image_unavailable")));
+                }
+                if value["message"]["content"].as_array().is_none_or(Vec::is_empty) { continue; }
+                if let Some(message) = value["message"].as_object_mut() { message.remove("errorMessage"); }
             }
             if value["message"]["role"] == "assistant"
                 && value["message"]["content"]
@@ -208,14 +231,15 @@ pub fn project<R: Read + Seek>(mut reader: R, leaf: &str) -> Result<Projection> 
                 entry.retain(|k, _| {
                     matches!(
                         k.as_str(),
-                        "id" | "type" | "message" | "summary" | "content" | "display"
+                        "id" | "type" | "message" | "summary" | "content" | "display" | "truncated" | "notice"
                     )
                 });
             }
             value
         };
+        if images && metadata.message.as_ref().is_some_and(|m| m.role == "toolResult") && value["truncated"] == true { continue; }
         let mut nodes = preview_nodes(&value);
-        if nodes > MAX_RETAINED_NODES {
+        if nodes > MAX_RETAINED_NODES || serde_json::to_vec(&value)?.len() > MAX_RECORD_BYTES as usize {
             value = truncated_entry(&metadata);
             nodes = preview_nodes(&value);
         }

@@ -17,9 +17,7 @@ async fn fragmented_event_and_ack_are_independent() {
     let (handle, mut events) = Transport::spawn(spec("echo"), Limits::default()).unwrap();
     let data = handle
         .request(
-            RpcCommand::Prompt {
-                message: "hello".into(),
-            },
+            RpcCommand::Prompt { message: "hello".into(), images: vec![] },
             Duration::from_secs(2),
         )
         .await
@@ -249,9 +247,7 @@ async fn control_admission_survives_normal_outstanding_pressure() {
         requests.push(tokio::spawn(async move {
             clone
                 .request(
-                    RpcCommand::Prompt {
-                        message: "wait".into(),
-                    },
+                    RpcCommand::Prompt { message: "wait".into(), images: vec![] },
                     Duration::from_secs(2),
                 )
                 .await
@@ -294,9 +290,7 @@ async fn limits_and_outbound_byte_budget_are_checked() {
     .unwrap();
     assert_eq!(
         h.request(
-            RpcCommand::Prompt {
-                message: "x".repeat(200)
-            },
+            RpcCommand::Prompt { message: "x".repeat(200), images: vec![] },
             Duration::from_secs(1)
         )
         .await
@@ -316,9 +310,7 @@ async fn stalled_writer_has_deadline_and_shutdown_fails_pending() {
     events.recv().await.unwrap();
     let result = h
         .request(
-            RpcCommand::Prompt {
-                message: "x".repeat(900_000),
-            },
+            RpcCommand::Prompt { message: "x".repeat(900_000), images: vec![] },
             Duration::from_secs(2),
         )
         .await;

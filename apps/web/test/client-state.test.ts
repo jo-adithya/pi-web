@@ -7,6 +7,18 @@ const snapshot = (seq = 1, epoch = "e1") => frame({ type: "snapshot", throughSeq
 const delta = (seq: number, text: string, epoch = "e1") => frame({ type: "event", seq, patches: [{ kind: "delta", id: "m", index: 0, thinking: false, text, truncated: false }], status: initialState().status, dialogs: [], olderHistory: false }, epoch);
 
 describe("snapshot and delta consistency", () => {
+  it("validates LSP status text and its UTF-8 byte limit", () => {
+    const message = snapshot();
+    if (message.body.type !== "snapshot") throw new Error("Expected snapshot");
+    for (const lspStatus of [null, "", "LSP 1/2", "é".repeat(256)]) {
+      const value = { ...message, body: { ...message.body, status: { ...message.body.status, lspStatus } } };
+      expect(() => decodeServer(JSON.stringify(value))).not.toThrow();
+    }
+    for (const lspStatus of [42, {}, "é".repeat(257)]) {
+      const value = { ...message, body: { ...message.body, status: { ...message.body.status, lspStatus } } };
+      expect(() => decodeServer(JSON.stringify(value))).toThrow("Invalid server message");
+    }
+  });
   it("validates context measurements and rejects stale epochs", () => {
     const message = frame({ type: "context_usage", usage: { tokens: 12500, contextWindow: 100000 } });
     expect(decodeServer(JSON.stringify(message))).toEqual(message);

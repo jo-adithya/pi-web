@@ -38,6 +38,66 @@ fn rejects_conflicts_unknown_flags_missing_paths_and_invalid_ports() {
     }
 }
 #[test]
+fn accepts_explicit_private_https_origin() {
+    assert!(parse(&[]).unwrap().unwrap().remote_origin.is_none());
+    let config = parse(&["--remote-origin", "https://desktop.tail123.ts.net"])
+        .unwrap()
+        .unwrap();
+    let origin = config.remote_origin.unwrap();
+    assert_eq!(origin.as_str(), "https://desktop.tail123.ts.net");
+    assert_eq!(origin.authority(), "desktop.tail123.ts.net");
+}
+
+#[test]
+fn rejects_noncanonical_or_unsafe_remote_origins() {
+    for value in [
+        "",
+        "http://desktop.tail123.ts.net",
+        "https://",
+        "https://localhost",
+        "https://127.0.0.1",
+        "https://127.1",
+        "https://0x7f.0.0.1",
+        "https://0177.0.0.1",
+        "https://127.0x1",
+        "https://127.0x",
+        "https://desktop.123",
+        "https://[::1]",
+        "https://DESKTOP.tail123.ts.net",
+        "https://desktop.tail123.ts.net/",
+        "https://desktop.tail123.ts.net/path",
+        "https://desktop.tail123.ts.net?x=1",
+        "https://desktop.tail123.ts.net#cap=x",
+        "https://user@desktop.tail123.ts.net",
+        "https://desktop.tail123.ts.net:443",
+        "https://desktop.tail123.ts.net:8443",
+        "https://*.tail123.ts.net",
+        "https://desktop..ts.net",
+        "https://-desktop.ts.net",
+        "https://desktop-.ts.net",
+        "https://desktop.ts.net.",
+        "https://desktop_ts.net",
+        "https://desktop.ts.net\r\nx: y",
+        "https://desktop.ts.net; script-src *",
+        "https://dé sktop.ts.net",
+    ] {
+        assert!(parse(&["--remote-origin", value]).is_err(), "{value:?}");
+    }
+    assert!(parse(&["--remote-origin"]).is_err());
+    assert!(
+        parse(&[
+            "--remote-origin",
+            "https://a.ts.net",
+            "--remote-origin",
+            "https://b.ts.net"
+        ])
+        .is_err()
+    );
+    let long_label = format!("https://{}.ts.net", "a".repeat(64));
+    assert!(parse(&["--remote-origin", &long_label]).is_err());
+}
+
+#[test]
 fn identity_and_capability_have_separate_random_formats() {
     let first = identity().unwrap();
     let second = identity().unwrap();
@@ -64,4 +124,11 @@ fn registry_location_and_explicit_flags_preserve_legacy_state_defaults() {
     assert!(custom.explicit_cwd);
     assert!(custom.custom_state);
     assert_eq!(custom.registry_dir, custom.state_dir.join("workspaces"));
+}
+
+#[test]
+fn explicit_push_revocation_is_an_operator_flag() {
+    let config = Config::parse(["--revoke-push".into()]).unwrap().unwrap();
+    assert!(config.revoke_push);
+    assert!(!Config::parse(Vec::<String>::new()).unwrap().unwrap().revoke_push);
 }

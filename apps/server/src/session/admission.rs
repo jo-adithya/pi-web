@@ -6,63 +6,84 @@ const MAX_CACHE_BYTES: usize = 512 * 1024;
 const MAX_RESULTS: usize = 128;
 
 pub(super) enum Admission {
-    Fresh,
+    Fresh(String),
     Duplicate(Option<CommandResult>),
 }
-#[derive(Default)]
-pub(super) struct Requests {
-    entries: VecDeque<(BrowserMessage, Option<CommandResult>, usize)>,
+struct Entry {
+    client: String,
+    token: String,
+    message: BrowserMessage,
+    result: Option<CommandResult>,
     bytes: usize,
 }
+/// Bounded per-epoch retries keyed by connection and browser request identity.
+#[derive(Default)]
+pub(super) struct Requests {
+    entries: VecDeque<Entry>,
+    bytes: usize,
+    next: u64,
+}
 impl Requests {
-    /// Remembers exact typed requests, retaining pending entries until resolved.
-    /// Identical retries return their result; changed payloads never execute again.
-    pub(super) fn begin(&mut self, message: &BrowserMessage) -> Result<Admission, &'static str> {
+    /// Retains validated requests and returns an internal token for async completions.
+    /// Identical retries share a result only within the same connection.
+    pub(super) fn begin(
+        &mut self,
+        client: &str,
+        message: &BrowserMessage,
+    ) -> Result<Admission, &'static str> {
         validate(message)?;
-        if let Some((old, result, _)) = self
+        if let Some(entry) = self
             .entries
             .iter()
-            .find(|(old, _, _)| old.request_id == message.request_id)
+            .find(|entry| entry.client == client && entry.message.request_id == message.request_id)
         {
-            return if old == message {
-                Ok(Admission::Duplicate(result.clone()))
+            return if &entry.message == message {
+                Ok(Admission::Duplicate(entry.result.clone()))
             } else {
                 Err("request_id_conflict")
             };
         }
+        let next = self.next.checked_add(1).ok_or("overloaded")?;
+        let token = next.to_string();
         let size = serde_json::to_vec(message)
             .map_err(|_| "invalid_command")?
-            .len();
+            .len()
+            + client.len()
+            + token.len();
         while self.entries.len() >= MAX_RESULTS || self.bytes + size > MAX_CACHE_BYTES {
-            let Some(index) = self
-                .entries
-                .iter()
-                .position(|(_, result, _)| result.is_some())
-            else {
+            let Some(index) = self.entries.iter().position(|entry| entry.result.is_some()) else {
                 return Err("overloaded");
             };
-            self.bytes -= self.entries.remove(index).unwrap().2;
+            self.bytes -= self.entries.remove(index).unwrap().bytes;
         }
+        self.next = next;
         self.bytes += size;
-        self.entries.push_back((message.clone(), None, size));
-        Ok(Admission::Fresh)
+        self.entries.push_back(Entry {
+            client: client.into(),
+            token: token.clone(),
+            message: message.clone(),
+            result: None,
+            bytes: size,
+        });
+        Ok(Admission::Fresh(token))
     }
-    /// Outstanding IDs are finalized on process exit, without changing completed results.
+    /// Internal tokens still awaiting completion, including disconnected requesters.
     pub(super) fn pending_ids(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|(_, result, _)| result.is_none())
-            .map(|(request, _, _)| request.request_id.clone())
+            .filter(|entry| entry.result.is_none())
+            .map(|entry| entry.token.clone())
             .collect()
     }
-    pub(super) fn finish(&mut self, result: CommandResult) {
-        if let Some((_, saved, _)) = self
+    /// Restores the browser identity and returns the owning connection for delivery.
+    pub(super) fn finish(&mut self, mut result: CommandResult) -> Option<(String, CommandResult)> {
+        let entry = self
             .entries
             .iter_mut()
-            .find(|(request, _, _)| request.request_id == result.request_id)
-        {
-            *saved = Some(result);
-        }
+            .find(|entry| entry.token == result.request_id)?;
+        result.request_id = entry.message.request_id.clone();
+        entry.result = Some(result.clone());
+        Some((entry.client.clone(), result))
     }
 }
 
@@ -80,7 +101,7 @@ pub(super) fn validate(message: &BrowserMessage) -> Result<(), &'static str> {
         {
             Err("invalid_model")
         }
-        BrowserAction::Prompt { text } if text.trim().is_empty() || text.len() > 32 * 1024 => {
+        BrowserAction::Prompt { text, images } if (text.trim().is_empty() && images.is_empty()) || text.len() > 32 * 1024 || images.len() > 4 || images.iter().any(|id| !crate::images::valid_ref(id)) => {
             Err("invalid_prompt")
         }
         BrowserAction::UiReply { dialog_id, answer } => {
@@ -112,20 +133,22 @@ mod tests {
             session_id: "session".into(),
             epoch: "epoch".into(),
             request_id: "request".into(),
-            action: BrowserAction::Prompt { text: text.into() },
+            action: BrowserAction::Prompt { text: text.into(), images: vec![] },
         }
     }
     #[test]
     fn identical_retries_are_deduplicated_but_conflicting_payloads_fail() {
         let mut requests = Requests::default();
         let message = request("hello");
-        assert!(matches!(requests.begin(&message), Ok(Admission::Fresh)));
+        let Ok(Admission::Fresh(token)) = requests.begin("client", &message) else {
+            panic!("fresh request")
+        };
         assert!(matches!(
-            requests.begin(&message),
+            requests.begin("client", &message),
             Ok(Admission::Duplicate(None))
         ));
         assert!(matches!(
-            requests.begin(&request("changed")),
+            requests.begin("client", &request("changed")),
             Err("request_id_conflict")
         ));
         let result = CommandResult {
@@ -135,16 +158,50 @@ mod tests {
             disposition: Some("started".into()),
             recovered_draft: None,
         };
-        requests.finish(result.clone());
+        let mut completion = result.clone();
+        completion.request_id = token;
+        requests.finish(completion);
         assert!(
-            matches!(requests.begin(&message), Ok(Admission::Duplicate(Some(saved))) if saved == result)
+            matches!(requests.begin("client", &message), Ok(Admission::Duplicate(Some(saved))) if saved == result)
         );
+    }
+    #[test]
+    fn clients_with_identical_request_ids_keep_independent_pending_results() {
+        let mut requests = Requests::default();
+        let message = request("hello");
+        let Ok(Admission::Fresh(first)) = requests.begin("first", &message) else {
+            panic!("fresh request")
+        };
+        let Ok(Admission::Fresh(second)) = requests.begin("second", &message) else {
+            panic!("fresh request")
+        };
+        assert_ne!(first, second);
+        assert_eq!(requests.pending_ids(), vec![first.clone(), second.clone()]);
+        let (owner, saved) = requests
+            .finish(CommandResult {
+                request_id: second,
+                ok: false,
+                code: "busy".into(),
+                disposition: None,
+                recovered_draft: None,
+            })
+            .unwrap();
+        assert_eq!(owner, "second");
+        assert_eq!(saved.request_id, "request");
+        assert!(matches!(
+            requests.begin("first", &message),
+            Ok(Admission::Duplicate(None))
+        ));
+        assert!(
+            matches!(requests.begin("second", &message), Ok(Admission::Duplicate(Some(result))) if result == saved)
+        );
+        assert_eq!(requests.pending_ids(), vec![first]);
     }
     #[test]
     fn invalid_bounds_rejected_before_retention() {
         let mut requests = Requests::default();
         for text in [String::new(), " ".into(), "x".repeat(32 * 1024 + 1)] {
-            assert!(requests.begin(&request(&text)).is_err());
+            assert!(requests.begin("client", &request(&text)).is_err());
         }
         assert_eq!(requests.bytes, 0);
         let mut message = request("x");
@@ -160,10 +217,10 @@ mod tests {
         for index in 0..128 {
             let mut message = request("x");
             message.request_id = index.to_string();
-            assert!(requests.begin(&message).is_ok());
+            assert!(requests.begin("client", &message).is_ok());
         }
         assert!(matches!(
-            requests.begin(&request("last")),
+            requests.begin("client", &request("last")),
             Err("overloaded")
         ));
         assert_eq!(requests.entries.len(), 128);

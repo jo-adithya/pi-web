@@ -41,6 +41,7 @@ pub(super) fn scan(
     revision: u64,
     roots: Vec<PathBuf>,
     cwd: PathBuf,
+    images: crate::images::Images,
 ) -> Result<Scan, String> {
     let mut result = Scan {
         head,
@@ -59,7 +60,10 @@ pub(super) fn scan(
         .map_err(|_| "History path/header validation failed")?;
     let before = fingerprint(&path)?;
     let file = File::open(&path).map_err(|_| "History file could not be opened")?;
-    let projection = history::project(file, leaf)
+    let projection = history::project_images(file, leaf, |entry| {
+        if entry["type"] == "message" { images.project_message(&mut entry["message"]); }
+        else if entry["type"] == "custom_message" { images.project_message(entry); }
+    })
         .map_err(|_| "History could not be projected within safe limits")?;
     if fingerprint(&path)? != before {
         return Err("History changed while loading".into());

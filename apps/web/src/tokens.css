@@ -1,5 +1,6 @@
 /* Palette and radius tokens shared with ../budget-tracker/apps/web/src/styles.css. */
 :root {
+  background: var(--background);
   color-scheme: light;
   --background: oklch(0.982 0.006 250);
   --foreground: oklch(0.24 0.022 250);

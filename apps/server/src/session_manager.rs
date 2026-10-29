@@ -24,6 +24,7 @@ const CACHE_BYTES: usize = 512 * 1024;
 pub struct SessionManager(Arc<Inner>);
 struct Inner {
     config: Config,
+    push: Option<crate::push::PushService>,
     registry_store: MetadataStore,
     owners: Ownership,
     state: Mutex<State>,
@@ -52,6 +53,13 @@ struct State {
 impl SessionManager {
     /// Adopts legacy metadata in place and opens only the selected record. No Pi file is rewritten.
     pub fn start(config: Config) -> io::Result<Self> {
+        Self::start_with_push(config, None)
+    }
+    /// Starts catalog runtimes with one optional workspace-wide completion mailbox.
+    pub fn start_with_push(
+        config: Config,
+        push: Option<crate::push::PushService>,
+    ) -> io::Result<Self> {
         let registry_store = MetadataStore::open(&config.registry_dir)?;
         let mut registry = Registry::load(&registry_store)?;
         if config.explicit_cwd || registry.entries.is_empty() {
@@ -103,7 +111,7 @@ impl SessionManager {
             .find(|entry| entry.id == project.catalog.selected)
             .unwrap();
         let owners = Ownership::default();
-        let handle = Self::launch(&project.config, &project.store, entry, owners.clone())?;
+        let handle = Self::launch(&project.config, &project.store, entry, owners.clone(), push.clone())?;
         let active = BTreeMap::from([(
             entry.id.clone(),
             Active {
@@ -113,6 +121,7 @@ impl SessionManager {
         )]);
         Ok(Self(Arc::new(Inner {
             config,
+            push,
             registry_store,
             owners,
             state: Mutex::new(State {
@@ -199,6 +208,7 @@ impl SessionManager {
         root: &Arc<MetadataStore>,
         entry: &CatalogEntry,
         owners: Ownership,
+        push: Option<crate::push::PushService>,
     ) -> io::Result<SessionHandle> {
         require_available_folder(&config.cwd)?;
         let store = Self::record_store(config, root, entry)?;
@@ -216,7 +226,7 @@ impl SessionManager {
         options
             .session_roots
             .push(config.state_dir.join("sessions"));
-        session::start_owned(options, store, metadata, owners)
+        session::start_owned(options, store, metadata, owners, push)
     }
     fn add_record(
         config: &Config,
@@ -497,6 +507,7 @@ impl SessionManager {
                         &project.store,
                         entry,
                         self.0.owners.clone(),
+                        self.0.push.clone(),
                     ) {
                         Ok(handle) => {
                             state.active.insert(
@@ -570,6 +581,7 @@ impl SessionManager {
                     &project.store,
                     entry,
                     self.0.owners.clone(),
+                    self.0.push.clone(),
                 ) {
                     Ok(handle) => {
                         state.active.insert(
@@ -628,6 +640,7 @@ impl SessionManager {
                         &project.store,
                         entry,
                         self.0.owners.clone(),
+                        self.0.push.clone(),
                     ) {
                         Ok(handle) => {
                             state.active.insert(

@@ -27,7 +27,7 @@ function activity(model: SessionModel, activity: Activity) {
 }
 afterEach(cleanup);
 
-it("shows context usage beside persistence, updates it, and clears unavailable or stale usage", () => {
+it("shows context usage beside LSP status, updates it, and clears unavailable or stale usage", () => {
   const model = session();
   const view = render(() => <SessionView model={model} />); flush();
   model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: 1, patches: [], dialogs: [], olderHistory: false,
@@ -39,7 +39,9 @@ it("shows context usage beside persistence, updates it, and clears unavailable o
     flush();
   };
   update(12500, 100000);
-  expect(footnote.textContent).toContain("Saved by Pi");
+  expect(footnote.textContent).not.toContain("Saved by Pi");
+  expect(footnote.textContent).not.toContain("Closing this tab");
+  expect(footnote.textContent).toContain("LSP —");
   expect(footnote.textContent).toContain("Context 12.5%");
   update(0, 100000);
   expect(footnote.textContent).toContain("Context 0%");
@@ -48,6 +50,27 @@ it("shows context usage beside persistence, updates it, and clears unavailable o
   update(50000, 100000);
   model.receive({ v: 1, sessionId, epoch: "new-epoch", body: { type: "hello", project: "fixture", process: "ready" } }); flush();
   expect(footnote.textContent).toContain("Context —");
+});
+
+it("shows live LSP status and hides stale status while disconnected or stopped", () => {
+  const model = session();
+  const view = render(() => <SessionView model={model} />); flush();
+  const update = (lspStatus: string | null) => {
+    model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [], dialogs: [], olderHistory: false,
+      status: { ...model.state.status, lspStatus } } }); flush();
+  };
+  const footnote = view.container.querySelector(".composer-footnote")!;
+  update("LSP 1/2");
+  expect(footnote.textContent).toContain("LSP 1/2");
+  update("LSP 2/2");
+  expect(footnote.textContent).toContain("LSP 2/2");
+  update(null);
+  expect(footnote.textContent).toContain("LSP —");
+  update("LSP 2/2");
+  model.disconnected(); flush();
+  expect(footnote.textContent).not.toContain("LSP 2/2");
+  model.stopped(); flush();
+  expect(footnote.textContent).toContain("LSP —");
 });
 
 it.each([
@@ -65,6 +88,23 @@ it.each([
   expect(view.getByRole("status", { name: "Agent activity" }).textContent).toBe(label);
   activity(model, "idle");
   expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
+});
+
+it.each(["submitting", "running", "retrying", "compacting", "reconciling", "awaiting_input", "cancelling"] as const)("replaces Send with Stop during %s and restores Send afterwards", phase => {
+  const model = session();
+  const view = render(() => <SessionView model={model} />); flush();
+  expect(view.getByRole("button", { name: "Send" })).toBeTruthy();
+  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
+  activity(model, phase);
+  const stop = view.getByRole("button", { name: "Stop" }) as HTMLButtonElement;
+  expect(view.queryByRole("button", { name: "Send" })).toBeNull();
+  expect(stop.type).toBe("button");
+  expect(stop.disabled).toBe(phase === "cancelling");
+  activity(model, "idle");
+  expect(view.getByRole("button", { name: "Send" })).toBeTruthy();
+  expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
+  activity(model, "failed");
+  expect(view.getByRole("button", { name: "Send" })).toBeTruthy();
 });
 
 it("shows prompt submission immediately and hides stale activity after disconnection", () => {
@@ -88,6 +128,26 @@ it("hides the working indicator on failure or process exit", () => {
   activity(model, "running");
   model.stopped(); flush();
   expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
+});
+
+it("dismisses warnings and errors independently without changing server status", () => {
+  const model = session(); flush();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: 1, patches: [], dialogs: [], olderHistory: false,
+    status: { ...model.state.status, historyWarning: "History incomplete" } } });
+  const view = render(() => <SessionView model={model} />); flush();
+  fireEvent.click(view.getAllByRole("button", { name: "Dismiss warning" })[0]); flush();
+  expect(view.queryByText("History incomplete")).toBeNull();
+  expect(view.getByRole("alert").textContent).toBe("Keep this error");
+  fireEvent.click(view.getByRole("button", { name: "Dismiss warning" })); flush();
+  expect(view.queryByRole("alert")).toBeNull();
+  expect(model.state.status.error).toBe("Keep this error");
+  statusNotice(model, "Another notice");
+  expect(view.queryByRole("alert")).toBeNull();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [], dialogs: [], olderHistory: false,
+    status: { ...model.state.status, error: null } } }); flush();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [], dialogs: [], olderHistory: false,
+    status: { ...model.state.status, error: "Keep this error" } } }); flush();
+  expect(view.getByRole("alert").textContent).toBe("Keep this error");
 });
 
 it("dismisses status notices per session without hiding errors or later notices", () => {
@@ -131,4 +191,23 @@ it("jumps to the latest transcript content and hides the jump button", () => {
   expect(transcript.scrollTop).toBe(2000);
   expect(model.stick()).toBe(true);
   expect(view.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+});
+
+it("keeps background agents visible after main activity settles", () => {
+  const model = session();
+  const view = render(() => <SessionView model={model} />); flush();
+  activity(model, "running");
+  model.receive({ v: 1, sessionId, epoch, body: { type: "background_tasks", tasks: [
+    { id: "agent", kind: "agent", name: "Scout", description: "Inspect", status: "active", result: null, error: null, truncated: false },
+  ] } }); flush();
+  const working = view.getByRole("status", { name: "Agent activity" });
+  const tasks = view.getByRole("button", { name: /Background agents & workflows/ });
+  expect(working.parentElement?.classList.contains("composer-activity")).toBe(true);
+  expect(tasks.closest(".composer-activity")).toBe(working.parentElement);
+  expect(tasks.compareDocumentPosition(working) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  activity(model, "idle");
+  expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
+  const background = view.getByRole("button", { name: /Background agents & workflows/ });
+  expect(background.textContent).toContain("1 queued / running");
+  expect(background.getAttribute("aria-expanded")).toBe("false");
 });

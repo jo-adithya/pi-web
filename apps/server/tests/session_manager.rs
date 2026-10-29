@@ -76,7 +76,7 @@ async fn independent_generation_stop_and_reopen_preserve_other_runtime() {
         let mut ca = a.connect("client".into()).await.unwrap(); let mut cb = b.connect("client".into()).await.unwrap();
         let ia = ready(&mut ca).await; let ib = ready(&mut cb).await;
         for (handle, identity) in [(&a, &ia), (&b, &ib)] {
-            handle.dispatch("client".into(), BrowserMessage { v: 1, session_id: identity.session_id.clone(), epoch: identity.epoch.clone(), request_id: "prompt".into(), action: BrowserAction::Prompt { text: "retry".into() } }).unwrap();
+            handle.dispatch("client".into(), BrowserMessage { v: 1, session_id: identity.session_id.clone(), epoch: identity.epoch.clone(), request_id: "prompt".into(), action: BrowserAction::Prompt { text: "retry".into(), images: vec![] } }).unwrap();
         }
         for connection in [&mut ca, &mut cb] { until(connection, |message| matches!(&message.body, ServerBody::Result { result } if result.request_id == "prompt" && result.ok)).await; }
         a.dispatch("client".into(), BrowserMessage { v: 1, session_id: first.clone(), epoch: ia.epoch.clone(), request_id: "cancel".into(), action: BrowserAction::Cancel }).unwrap();

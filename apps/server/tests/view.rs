@@ -260,3 +260,12 @@ fn truncated_initial_snapshots_do_not_leave_invalid_visible_indices() {
         serde_json::to_vec(&state.messages()[0]).unwrap().len()
     );
 }
+
+#[test]
+fn tool_images_are_visible_without_tool_text_or_metadata() {
+    let reference = "a".repeat(64);
+    let message = normalize_message("tool".into(), &json!({"role":"toolResult", "details":{"secret":true}, "content":[{"type":"text","text":"private tool output"},{"type":"image_ref","ref":reference}]}), true).expect("tool image preview");
+    let value = serde_json::to_value(message).unwrap();
+    assert_eq!(value["blocks"], json!([{"kind":"image","text":reference}]));
+    assert!(!value.to_string().contains("private"));
+}
