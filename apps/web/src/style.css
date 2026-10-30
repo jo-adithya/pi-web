@@ -21,7 +21,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 button.primary { background: var(--primary); color: var(--primary-foreground); border-color: transparent; }
 button.primary:hover:not(:disabled) { filter: brightness(.93); }
 button.danger { color: var(--error); }
-:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 0; }
 textarea, select { display: block; width: 100%; border: 1px solid var(--input); border-radius: calc(var(--radius) * .8); background: var(--card); padding: .65rem; }
 textarea { resize: vertical; }
 label { display: block; font-weight: 600; }
@@ -235,9 +235,27 @@ a:hover { color: var(--foreground); }
   .working-dot { animation: none; }
 }
 
-.codex-usage { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; text-align: center; }
-.codex-usage:hover:not(:disabled) { color: var(--foreground); text-decoration: underline; }
+.codex-usage { padding: .15rem .35rem; margin: -.15rem -.35rem; gap: .25rem; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; text-align: center; }
+.codex-usage:hover:not(:disabled), .codex-usage[data-expanded] { color: var(--foreground); background: var(--secondary); }
 .codex-usage:disabled { cursor: default; opacity: 1; }
+.codex-usage-popover { z-index: 20; width: min(320px, calc(100vw - 1.5rem)); max-height: var(--kb-popper-content-available-height); overflow-y: auto; overscroll-behavior: contain; padding: 1rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--popover); color: var(--popover-foreground); box-shadow: var(--shadow-popover); font-size: .82rem; }
+.codex-usage-heading, .codex-usage-window-heading, .codex-usage-actions { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.codex-usage-heading { margin-bottom: .75rem; }
+.codex-usage-heading h2 { margin: 0; font-size: 1rem; }
+.codex-usage-heading > .icon-button { width: 1.8rem; height: 1.8rem; margin: -.35rem -.35rem -.35rem 0; }
+.codex-usage-windows { display: grid; gap: 1rem; }
+.codex-usage-window-heading > span, .codex-usage-window-detail, .codex-usage-reset, .codex-usage-actions > span { color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.codex-usage-window progress { display: block; appearance: none; width: 100%; height: .45rem; margin: .5rem 0 .35rem; border: 0; border-radius: 1rem; overflow: hidden; background: var(--secondary); color: var(--primary); }
+.codex-usage-window progress::-webkit-progress-bar { background: var(--secondary); border-radius: 1rem; }
+.codex-usage-window progress::-webkit-progress-value { background: var(--primary); border-radius: 1rem; }
+.codex-usage-window progress::-moz-progress-bar { background: var(--primary); border-radius: 1rem; }
+.codex-usage-window-detail { display: flex; align-items: baseline; justify-content: space-between; gap: .5rem; font-size: .75rem; }
+.codex-usage-window-detail > :first-child { white-space: nowrap; }
+.codex-usage-reset { text-align: right; }
+.codex-usage-empty { margin: 0; color: var(--muted-foreground); }
+.codex-usage-stale { margin: .75rem 0 0; color: var(--error); font-size: .75rem; }
+.codex-usage-actions { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: .75rem; font-size: .72rem; }
+.codex-usage-actions > button { padding: .3rem .6rem; }
 
 /* A single disclosure reveals a status ledger, without nested result viewers. */
 .background-tasks { font-size: .82rem; color: var(--muted-foreground); margin-bottom: .4rem; }
@@ -298,4 +316,4 @@ a:hover { color: var(--foreground); }
 .select-option[data-disabled] { opacity: .45; cursor: not-allowed; }
 .checkbox-control { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; width: 1.15rem; height: 1.15rem; border: 1px solid var(--input); border-radius: .25rem; }
 .checkbox-control[data-checked] { background: var(--primary); color: var(--primary-foreground); }
-.workspace-trust:focus-within .checkbox-control { outline: 2px solid var(--ring); outline-offset: 2px; }
+.workspace-trust:focus-within .checkbox-control { outline: 2px solid var(--ring); outline-offset: 0; }
