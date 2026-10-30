@@ -6,9 +6,11 @@ import { createLocalReview, fetchReview } from "./local-review";
 import { fetchStructuralReview } from "./structural-review";
 import { fetchContextReview } from "./context-review";
 import { fetchCommits } from "./commit-review";
+import { fetchBranches } from "./branch-review";
 import { fetchReviewGroups } from "./review-groups";
 import { loadCapability } from "./browser-auth";
 import { applyServer, initialState } from "./client-state";
+import { formatReply, type ReplyQuote } from "./reply-quote";
 
 /** Session-local presentation and unsent draft. Connection loss never replays a command. */
 export function createSessionModel(id: string, transport: (message: BrowserMessage) => boolean, connected: () => boolean, completed?: (sessionId: string, outcome: RunOutcome) => void, capability: () => string | null = loadCapability) {
@@ -18,9 +20,24 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     (request, signal) => fetchContextReview(id, request, signal, capability()),
     signal => fetchCommits(id, signal, capability()),
     (request, signal) => fetchReviewGroups(id, request, signal, capability()),
+    signal => fetchBranches(id, signal, capability()),
+    { model: () => state.settings.model ? { provider: state.settings.model.provider, id: state.settings.model.id } : null, cacheNamespace: id },
   );
   const [state, setState] = createStore(initialState());
   const [draft, setDraft] = createSignal(""); const [notice, setNotice] = createSignal("");
+  const [quote, setQuote] = createSignal<ReplyQuote | undefined>(undefined);
+  /** Retains a trimmed snapshot; empty or over-budget selections leave the draft and quote intact. */
+  function quoteReply(selected: ReplyQuote): boolean {
+    const next = { author: selected.author, text: selected.text.trim() };
+    if (!next.text) return false;
+    if (new TextEncoder().encode(formatReply(draft(), next)).length > 32_768) {
+      setNotice("Reply is too long. Select a shorter quote or shorten your draft to fit within 32 KiB.");
+      return false;
+    }
+    setQuote(next);
+    return true;
+  }
+  function clearQuote(): void { setQuote(undefined); }
   const [settingsPending, setSettingsPending] = createSignal(false);
   let settingsRequest: string | undefined; let completedRun = 0n;
   const [pending, setPending] = createSignal(false); const [stick, setStick] = createSignal(true);
@@ -34,7 +51,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
   let disposed = false;
   const [uploading, setUploading] = createSignal(false);
-  let prompt: { id: string; text: string; images: string[] } | undefined; let epoch = ""; let attachmentNotice = false;
+  let prompt: { id: string; text: string; quote: ReplyQuote | undefined; images: string[] } | undefined; let epoch = ""; let attachmentNotice = false;
   function send(action: BrowserAction): string | undefined {
     if (!connected() || !epoch || (!state.synced && action.type !== "attach")) return;
     const requestId = crypto.randomUUID();
@@ -78,13 +95,13 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     setAttachments(previous => previous.filter(image => { if (image.id !== imageId) return true; URL.revokeObjectURL(image.preview); return false; }));
   }
   /** Releases previews when the workspace permanently discards this draft. */
-  function dispose() { disposed = true; review.cancel(); for (const image of attachments()) removeImage(image.id); }
+  function dispose() { disposed = true; clearQuote(); review.cancel(); for (const image of attachments()) removeImage(image.id); }
   async function loadImage(imageId: string): Promise<Blob> { return (await imageRequest(id, imageId, undefined, capability())).blob(); }
-  const canSend = () => canConfigure() && !settingsRequest && (!!draft().trim() || attachments().length > 0) && !uploading() && (!attachments().length || !!state.settings.model?.images) && new TextEncoder().encode(draft()).length <= 32_768;
+  const canSend = () => canConfigure() && !settingsRequest && (!!draft().trim() || attachments().length > 0) && !uploading() && (!attachments().length || !!state.settings.model?.images) && new TextEncoder().encode(formatReply(draft(), quote())).length <= 32_768;
   function submit() {
     if (!canSend()) return;
-    const text = draft(); const images = attachments().map(image => image.id); const requestId = send({ type: "prompt", text, images });
-    if (requestId) { prompt = { id: requestId, text, images }; setPending(true); setNotice(""); setStick(true); }
+    const text = draft(); const submittedQuote = quote(); const images = attachments().map(image => image.id); const requestId = send({ type: "prompt", text: formatReply(text, submittedQuote), images });
+    if (requestId) { prompt = { id: requestId, text, quote: submittedQuote, images }; setPending(true); setNotice(""); setStick(true); }
   }
   function disconnected() {
     setState(value => { value.synced = false; value.dialogs = []; });
@@ -130,6 +147,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
       if (prompt?.id === result.requestId && result.code !== "pending") {
         if (result.ok) {
           if (draft() === prompt.text) setDraft("");
+          if (quote() === prompt.quote) clearQuote();
           for (const image of prompt.images) removeImage(image);
         }
         setPending(false); prompt = undefined;
@@ -139,6 +157,6 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     }
     return true;
   }
-  return { id, dispose, review, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, receive, disconnected, stopped, scroll: 0 };
+  return { id, dispose, review, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, receive, disconnected, stopped, scroll: 0 };
 }
 export type SessionModel = ReturnType<typeof createSessionModel>;

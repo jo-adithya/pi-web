@@ -185,12 +185,14 @@ it("dismisses a local notice without losing the underlying extension status", ()
 it("jumps to the latest transcript content and hides the jump button", () => {
   const model = session(); model.setStick(false);
   const view = render(() => <SessionView model={model} />); flush();
-  const transcript = view.container.querySelector<HTMLDivElement>(".transcript")!;
-  Object.defineProperty(transcript, "scrollHeight", { value: 2000 });
+  const transcript = document.documentElement;
+  Object.defineProperty(transcript, "scrollHeight", { configurable: true, value: 2000 });
   fireEvent.click(view.getByRole("button", { name: "Jump to latest" })); flush();
   expect(transcript.scrollTop).toBe(2000);
   expect(model.stick()).toBe(true);
   expect(view.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+  Reflect.deleteProperty(transcript, "scrollHeight");
+  transcript.scrollTop = 0;
 });
 
 it("keeps background agents visible after main activity settles", () => {
@@ -201,13 +203,13 @@ it("keeps background agents visible after main activity settles", () => {
     { id: "agent", kind: "agent", name: "Scout", description: "Inspect", status: "active", result: null, error: null, truncated: false },
   ] } }); flush();
   const working = view.getByRole("status", { name: "Agent activity" });
-  const tasks = view.getByRole("button", { name: /Background agents & workflows/ });
+  const tasks = view.getByRole("button", { name: "Agents" });
   expect(working.parentElement?.classList.contains("composer-activity")).toBe(true);
   expect(tasks.closest(".composer-activity")).toBe(working.parentElement);
   expect(tasks.compareDocumentPosition(working) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   activity(model, "idle");
   expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
-  const background = view.getByRole("button", { name: /Background agents & workflows/ });
-  expect(background.textContent).toContain("1 queued / running");
+  const background = view.getByRole("button", { name: "Agents" });
+  expect(background.title).toContain("1 queued / running");
   expect(background.getAttribute("aria-expanded")).toBe("false");
 });

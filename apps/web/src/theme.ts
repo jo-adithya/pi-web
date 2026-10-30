@@ -16,7 +16,7 @@ export function createMediaQuery(query: string) {
   return matches;
 }
 
-/** Applies a saved light/dark preference, or follows the OS while set to system.
+/** Applies a saved light/dark preference to the page and browser chrome, or follows the OS while set to system.
  * Storage failures leave the choice usable for the lifetime of this page.
  */
 export function createTheme() {
@@ -28,7 +28,11 @@ export function createTheme() {
   const [preference, setPreference] = createSignal<ThemePreference>(saved);
   const systemDark = createMediaQuery("(prefers-color-scheme: dark)");
   createEffect(() => preference() === "dark" || (preference() === "system" && systemDark()),
-    dark => { document.documentElement.classList.toggle("dark", dark); });
+    dark => {
+      document.documentElement.classList.toggle("dark", dark);
+      const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+      if (themeColor) themeColor.content = themeColor.dataset[dark ? "dark" : "light"]!;
+    });
   return {
     preference,
     setPreference(value: ThemePreference) {

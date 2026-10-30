@@ -1,5 +1,5 @@
 import { ConfirmationDialog } from "./components/ActionDialog";
-import { For, Show, createEffect, createSignal, onSettled } from "solid-js";
+import { For, Show, createEffect, createSignal, flush, onSettled } from "solid-js";
 import type { SessionModel } from "./session-model";
 import { MessageList } from "./Conversation";
 import { ExtensionDialog } from "./components/ExtensionDialog";
@@ -41,7 +41,11 @@ export function SessionView(props: { model: SessionModel }) {
     const usage = state.contextUsage;
     return usage?.tokens != null ? `${Math.round(usage.tokens / usage.contextWindow * 1000) / 10}%` : "—";
   };
-  let scroller!: HTMLDivElement; let reading!: HTMLDivElement;
+  const [replyTarget, setReplyTarget] = createSignal<HTMLDivElement>();
+  let scroller!: HTMLDivElement; let reading!: HTMLDivElement; let composer!: HTMLFormElement;
+  const scrollRoot = document.documentElement;
+  const scrollToLatest = () => { scrollRoot.scrollTop = scrollRoot.scrollHeight; };
+  const trackScroll = () => setStick(scrollRoot.scrollHeight - scrollRoot.scrollTop - scrollRoot.clientHeight < 80);
   let disposed = false;
   let scrollFrame: number | undefined;
   /** Coalesces layout changes into one scroll, respecting pauses made before the frame runs. */
@@ -49,13 +53,16 @@ export function SessionView(props: { model: SessionModel }) {
     if (disposed || !stick() || scrollFrame !== undefined) return;
     scrollFrame = requestAnimationFrame(() => {
       scrollFrame = undefined;
-      if (!disposed && stick()) scroller.scrollTop = scroller.scrollHeight;
+      if (!disposed && stick()) scrollToLatest();
     });
   };
   // Sending resumes following immediately, even before transcript content grows.
   createEffect(() => pending(), sending => { if (sending) scheduleScroll(); });
   onSettled(() => {
-    scroller.scrollTop = model.scroll;
+    // The document owns conversation scrolling at every screen size.
+    scrollRoot.scrollTop = model.scroll;
+    window.addEventListener("scroll", trackScroll, { passive: true });
+    window.addEventListener("resize", scheduleScroll);
     const observer = new ResizeObserver(scheduleScroll);
     observer.observe(reading, { box: "border-box" });
     observer.observe(scroller);
@@ -64,7 +71,9 @@ export function SessionView(props: { model: SessionModel }) {
       disposed = true;
       observer.disconnect();
       if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
-      model.scroll = scroller.scrollTop;
+      model.scroll = scrollRoot.scrollTop;
+      window.removeEventListener("scroll", trackScroll);
+      window.removeEventListener("resize", scheduleScroll);
     };
   });
   return <>
@@ -75,18 +84,23 @@ export function SessionView(props: { model: SessionModel }) {
     <div class="workspace-body">
       <section class="conversation" aria-label="Conversation">
         <div class="transcript-area">
-          <div class="transcript" ref={scroller} onScroll={() => setStick(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80)}>
+          <div class="transcript" ref={scroller}>
             <div class="reading" ref={reading}>
               <Show when={state.older}><p class="history-marker">Earlier history is not displayed. Pi still owns the full session.</p></Show>
               <DismissibleAlert class="warning" message={state.status.historyWarning} />
               <Show when={!state.order.length}><div class="empty conversation-empty"><span class="empty-mark">π</span><h2>What are we working on?</h2><p>Explore your code, work through an idea, or build something new.</p></div></Show>
-              <MessageList state={state} loadImage={model.loadImage} />
+              <MessageList state={state} mobileReplyTarget={replyTarget()} loadImage={model.loadImage} onReply={quote => {
+                if (!model.quoteReply(quote)) return;
+                window.getSelection()?.removeAllRanges(); flush();
+                composer.querySelector("textarea")?.focus();
+              }} />
               <Show when={state.status.lastOutcome}><p class="outcome">Last run: {state.status.lastOutcome}</p></Show>
             </div>
           </div>
-          <Show when={!stick()}><Button class="latest" onClick={() => { scroller.scrollTop = scroller.scrollHeight; setStick(true); }}>Jump to latest</Button></Show>
         </div>
         <div class="composer">
+          <Show when={!stick()}><Button class="latest" aria-label="Jump to latest" title="Jump to latest" onClick={() => { scrollToLatest(); setStick(true); }}><Icon name="chevronDown" /></Button></Show>
+          <div ref={setReplyTarget} class="mobile-reply-slot" />
           <div class="composer-activity">
             <BackgroundTasks tasks={state.backgroundTasks} />
             <Show when={activityLabel()}><div class="working-indicator" role="status" aria-label="Agent activity" aria-atomic="true">
@@ -105,7 +119,12 @@ export function SessionView(props: { model: SessionModel }) {
             </div>}</For></div>
           </Show>
           <Show when={model.uploading()}><span class="image-upload-status" role="status">Uploading image…</span></Show>
-          <form onSubmit={event => { event.preventDefault(); submit(); }}>
+          <form ref={composer} onSubmit={event => { event.preventDefault(); submit(); }}>
+            <Show when={model.quote()}>{quote => <section class="reply-quote" aria-label="Quoted message">
+              <Icon name="reply" />
+              <blockquote>{quote().text}</blockquote>
+              <Button class="reply-quote-remove" type="button" aria-label="Remove quote" title="Remove quote" onClick={() => { model.clearQuote(); composer.querySelector("textarea")?.focus({ preventScroll: true }); }}><Icon name="close" /></Button>
+            </section>}</Show>
             <PromptInput id={`prompt-${model.id}`} value={draft()} onInput={setDraft} commands={state.commands}
               completionEnabled={online() && state.synced && state.status.process === "ready" && state.status.activity === "idle" && !pending()}
               searchFiles={model.searchFiles} onImages={model.addImages} onSubmit={submit} />

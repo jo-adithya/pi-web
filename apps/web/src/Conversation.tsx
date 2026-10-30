@@ -1,24 +1,26 @@
 import { Button } from "@kobalte/core/button";
-import { ActionDialog } from "./components/ActionDialog";
+import { ImageLightbox } from "./components/ImageLightbox";
 import { For, Show, createSignal, onSettled } from "solid-js";
 import type { DisplayMessage } from "./generated/protocol";
 import type { ClientState } from "./client-state";
 import { Markdown } from "./components/Markdown";
 import { Icon } from "./components/Icon";
+import { ChatSelectionReply } from "./components/ChatSelectionReply";
+import type { ReplyQuote } from "./reply-quote";
 
 /** Starts with the latest 100 messages; explicitly revealed history stays expanded while mounted. */
-export function MessageList(props: { state: Pick<ClientState, "order" | "messages">; loadImage?: (id: string) => Promise<Blob> }) {
+export function MessageList(props: { state: Pick<ClientState, "order" | "messages">; loadImage?: (id: string) => Promise<Blob>; onReply?: (quote: ReplyQuote) => void; mobileReplyTarget?: HTMLDivElement }) {
   const [count, setCount] = createSignal(100);
-  return <><Show when={props.state.order.length > count()}><Button class="history-marker" onClick={() => setCount(value => value + 100)}>Show earlier retained messages</Button></Show>
-    <For each={props.state.order.slice(-count())}>{id => <Message message={props.state.messages[id]} loadImage={props.loadImage} />}</For></>;
+  return <ChatSelectionReply onReply={props.onReply} mobileReplyTarget={props.mobileReplyTarget}><Show when={props.state.order.length > count()}><Button class="history-marker" onClick={() => setCount(value => value + 100)}>Show earlier retained messages</Button></Show>
+    <For each={props.state.order.slice(-count())}>{id => <Message message={props.state.messages[id]} loadImage={props.loadImage} />}</For></ChatSelectionReply>;
 }
 
 /** Renders response content and warnings, omitting thinking-only assistant entries. */
 function Message(props: { message: DisplayMessage; loadImage?: (id: string) => Promise<Blob> }) {
   const visible = () => props.message.role === "user" || props.message.blocks.some(block => block.kind !== "thinking") || props.message.error || props.message.truncated;
-  return <Show when={visible()}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`}><h2>{props.message.role === "assistant" ? "Pi" : props.message.role}</h2>
+  return <Show when={visible()}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`} data-reply-author={props.message.role === "assistant" ? "Pi" : "You"}><h2>{props.message.role === "assistant" ? "Pi" : props.message.role}</h2>
     <For each={props.message.blocks}>{block => <Show when={block.kind !== "thinking"}>
-      <Show when={block.kind === "text"} fallback={<Show when={block.kind === "image"} fallback={<pre class="block-notice">{block.text}</pre>}><ImagePreview id={block.text} load={props.loadImage} /></Show>}><Markdown text={block.text} complete={props.message.complete} /></Show>
+      <Show when={block.kind === "text"} fallback={<Show when={block.kind === "image"} fallback={<pre class="block-notice">{block.text}</pre>}><ImagePreview id={block.text} load={props.loadImage} /></Show>}><div class="message-text"><Markdown text={block.text} complete={props.message.complete} /></div></Show>
     </Show>}</For>
     <Show when={props.message.error}><p class="warning">{props.message.error}</p></Show><Show when={props.message.truncated}><p class="truncated">Preview truncated. The full content remains with Pi.</p></Show>
   </article></Show>;
@@ -57,10 +59,3 @@ function ImagePreview(props: { id: string; load?: (id: string) => Promise<Blob> 
   </Show><Show when={error()}><p role="status">{error()}</p></Show></div>;
 }
 
-/** Focus-contained preview reuses the already loaded image and restores its trigger. */
-function ImageLightbox(props: { url: string; close: () => void }) {
-  return <ActionDialog title="Image preview" description="Expanded conversation image" close={props.close} class="image-lightbox">
-    <Button class="image-lightbox-close" type="button" aria-label="Close image preview" onClick={props.close}><Icon name="close" /></Button>
-    <img src={props.url} alt="Expanded conversation image" />
-  </ActionDialog>;
-}

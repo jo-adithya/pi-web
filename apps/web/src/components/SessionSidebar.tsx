@@ -30,6 +30,8 @@ interface SessionSidebarProps {
   activity: (id: string) => Activity | undefined;
   theme: ThemePreference;
   setTheme: (value: ThemePreference) => void;
+  settingsOpen: boolean;
+  openSettings: () => void;
 }
 
 /** Project navigation shared by the desktop rail and the mobile modal drawer. */
@@ -71,6 +73,7 @@ export function SessionSidebar(props: SessionSidebarProps) {
       <div class="theme-picker"><span>Color scheme</span><SelectField label="Color scheme" value={props.theme} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} change={value => {
         if (value === "system" || value === "light" || value === "dark") props.setTheme(value);
       }} /></div>
+      <Button class="sidebar-settings" aria-pressed={props.settingsOpen ? "true" : "false"} onClick={props.openSettings}><Icon name="settings" />Settings</Button>
     </footer>
   </>;
 }

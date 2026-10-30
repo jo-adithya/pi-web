@@ -2,14 +2,18 @@ import { createSignal } from "solid-js";
 import { createStructuralReview, type StructuralLoader } from "./structural-review";
 import { createContextReview, type ContextLoader } from "./context-review";
 import { commitId, createCommitHistory, type CommitLoader } from "./commit-review";
+import { createBranchList, type BranchLoader } from "./branch-review";
 import { createReviewGroups, type GroupInput, type GroupLoader } from "./review-groups";
+import type { GroupModel } from "./review-costs";
 
 export type ReviewScope = "unstaged" | "staged" | "branch" | "commit";
 export interface ReviewRequest { scope: ReviewScope; base?: string; commit?: string }
-export interface ReviewLoadRequest extends ReviewRequest { path?: string }
+export interface ReviewLoadRequest extends ReviewRequest { path?: string; cursor?: string }
 export interface ReviewEntry { path: string; previousPath: string | null; status: string; patch: string | null; fingerprint: string | null }
 export interface ReviewFile extends ReviewEntry { patch: string; fingerprint: string }
-export interface ReviewSnapshot { files: ReviewEntry[]; truncated: boolean; note: string | null }
+/** Scope-wide Git counts, including files omitted by display limits; unavailable files have no numeric count. */
+export interface ReviewLineStats { added: number; removed: number; unavailableFiles: number }
+export interface ReviewSnapshot { files: ReviewEntry[]; truncated: boolean; note: string | null; lineStats?: ReviewLineStats; nextCursor?: string; snapshotKey?: string }
 /** Only loaded patches can be used by context, structural review and Ask Pi. */
 export const hasPatch = (file: ReviewEntry): file is ReviewFile => file.patch !== null && file.fingerprint !== null;
 const statuses = new Set(["added", "deleted", "renamed", "copied", "typechanged", "unmerged", "modified", "untracked"]);
@@ -29,6 +33,17 @@ export async function fetchReview(id: string, request: ReviewLoadRequest, signal
   const value: unknown = await response.json();
   if (!value || typeof value !== "object" || !("files" in value) || !Array.isArray(value.files) || value.files.length > 100 ||
       !("truncated" in value) || typeof value.truncated !== "boolean" || !("note" in value) || (value.note !== null && typeof value.note !== "string")) throw new Error("Invalid local review response.");
+  if ("nextCursor" in value && (typeof value.nextCursor !== "string" || !value.nextCursor || value.nextCursor.length > 256 || request.path !== undefined || !value.files.length)) throw new Error("Invalid review continuation.");
+  if ("snapshotKey" in value && (typeof value.snapshotKey !== "string" || !/^[a-f0-9]{64}$/.test(value.snapshotKey))) throw new Error("Invalid review snapshot identity.");
+  let lineStats: ReviewLineStats | undefined;
+  if ("lineStats" in value) {
+    const stats = value.lineStats;
+    const count = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+    if (!stats || typeof stats !== "object" || !("added" in stats) || !count(stats.added) ||
+        !("removed" in stats) || !count(stats.removed) || !("unavailableFiles" in stats) || !count(stats.unavailableFiles) ||
+        !Number.isSafeInteger(stats.added + stats.removed)) throw new Error("Invalid review line totals.");
+    lineStats = { added: stats.added, removed: stats.removed, unavailableFiles: stats.unavailableFiles };
+  }
   let bytes = 0;
   const files: ReviewEntry[] = value.files.map((file: unknown) => {
     if (!file || typeof file !== "object" || !("path" in file) || typeof file.path !== "string" || !file.path ||
@@ -41,20 +56,26 @@ export async function fetchReview(id: string, request: ReviewLoadRequest, signal
     return { path: file.path, previousPath: file.previousPath, status: file.status, patch: file.patch, fingerprint: file.fingerprint };
   });
   if (request.path !== undefined && (files.length !== 1 || files[0].path !== request.path || !hasPatch(files[0]))) throw new Error("Invalid selected-file response.");
-  return { files, truncated: value.truncated, note: value.note };
+  if (new Set(files.map(file => file.path)).size !== files.length) throw new Error("Duplicate review files.");
+  return { files, truncated: value.truncated, note: value.note, ...("snapshotKey" in value ? { snapshotKey: value.snapshotKey as string } : {}), ...(lineStats ? { lineStats } : {}), ...("nextCursor" in value ? { nextCursor: value.nextCursor as string } : {}) };
 }
 
 /** Session-local lazy patches with a 1 MiB LRU budget. Refresh discards loaded content;
  * reviewed fingerprints are revalidated as files load. Cancellation ignores late replies.
  */
-export function createLocalReview(load: (request: ReviewLoadRequest, signal: AbortSignal) => Promise<ReviewSnapshot>, loadStructural: StructuralLoader = async () => ({ mode: "text", reason: "Structural comparison is unavailable." }), loadContext: ContextLoader = async () => { throw new Error("Diff context is unavailable."); }, loadCommits: CommitLoader = async () => { throw new Error("Commit history is unavailable."); }, loadGroups: GroupLoader = async () => { throw new Error("AI grouping is unavailable."); }) {
-  const grouping = createReviewGroups(loadGroups);
+export function createLocalReview(load: (request: ReviewLoadRequest, signal: AbortSignal) => Promise<ReviewSnapshot>, loadStructural: StructuralLoader = async () => ({ mode: "text", reason: "Structural comparison is unavailable." }), loadContext: ContextLoader = async () => { throw new Error("Diff context is unavailable."); }, loadCommits: CommitLoader = async () => { throw new Error("Commit history is unavailable."); }, loadGroups: GroupLoader = async () => { throw new Error("AI grouping is unavailable."); }, loadBranches: BranchLoader = async () => { throw new Error("Branch list is unavailable."); }, groupingConfig: { model?: () => GroupModel | null; cacheNamespace?: string } = {}) {
+  const grouping = createReviewGroups(loadGroups, groupingConfig.cacheNamespace);
+  const groupingModel = () => grouping.options().model ?? groupingConfig.model?.();
+  // Budget changes affect work allowed, not the identity of already completed suggestions.
+  const cacheKey = (source: ReviewSnapshot, request: ReviewRequest) => source.snapshotKey && groupingModel()
+    ? JSON.stringify(["group-v3", request, source.snapshotKey, groupingModel(), grouping.options().includeGenerated]) : undefined;
   const structural = createStructuralReview(loadStructural);
   const context = createContextReview(loadContext);
   const [scope, setScope] = createSignal<ReviewScope>("unstaged");
   const [base, setBase] = createSignal("");
   const [commit, setCommit] = createSignal("");
   const history = createCommitHistory(loadCommits);
+  const branches = createBranchList(loadBranches);
   const [snapshot, setSnapshot] = createSignal<ReviewSnapshot>();
   const [target, setTarget] = createSignal<ReviewRequest>();
   const [selected, updateSelected] = createSignal("");
@@ -69,7 +90,7 @@ export function createLocalReview(load: (request: ReviewLoadRequest, signal: Abo
     setReviewed(previous => { const next = new Map(previous); if (checked) next.set(file.path, file.fingerprint); else next.delete(file.path); return next; });
   }
   function cancelPatch() { patchController?.abort(); patchController = undefined; setPatchBusy(false); }
-  function cancel() { controller?.abort(); controller = undefined; history.cancel(); cancelPatch(); grouping.cancel(); setBusy(false); structural.reset(); context.reset(); }
+  function cancel() { controller?.abort(); controller = undefined; history.cancel(); branches.cancel(); cancelPatch(); grouping.cancel(); setBusy(false); structural.reset(); context.reset(); }
   function setSelected(path: string) {
     cancelPatch(); structural.reset(); context.reset(); updateSelected(path); setPatchError("");
     if (!busy()) void loadPatch(path);
@@ -104,7 +125,10 @@ export function createLocalReview(load: (request: ReviewLoadRequest, signal: Abo
   }
   /** Pins commit reviews to a full object ID, independent of subsequent HEAD/history changes. */
   async function refresh(nextScope: ReviewScope = scope(), nextCommit = commit()) {
-    cancel(); grouping.reset(); setError(""); setPatchError("");
+    const previousTarget = target();
+    cancel();
+    if (snapshot()) grouping.reconcile(undefined, snapshot()!.files, true); else grouping.reset();
+    setError(""); setPatchError("");
     const current = new AbortController(); controller = current; setBusy(true);
     try {
       if (nextScope === "commit" && !nextCommit) {
@@ -119,11 +143,28 @@ export function createLocalReview(load: (request: ReviewLoadRequest, signal: Abo
       if (request.scope === "commit" && !commitId(nextCommit)) { setError("Choose a local commit."); return; }
       if (JSON.stringify(request) !== JSON.stringify(target())) { setSnapshot(undefined); setReviewed(new Map()); updateSelected(""); }
       setTarget(request);
-      const result = await load(request, current.signal);
+      // Admit a complete metadata list atomically. A stale continuation leaves the old review intact.
+      let result = await load(request, current.signal);
       if (controller !== current) return;
+      const paths = new Set(result.files.map(file => file.path)), cursors = new Set<string>();
+      while (result.nextCursor) {
+        const cursor = result.nextCursor;
+        if (cursors.has(cursor)) throw new Error("Repeated review continuation. Refresh and try again.");
+        if (result.files.length >= 10000) throw new Error("Review exceeds 10,000 files. Choose a smaller scope.");
+        cursors.add(cursor);
+        const page = await load({ ...request, cursor }, current.signal);
+        if (controller !== current) return;
+        if (result.files.length + page.files.length > 10000) throw new Error("Review exceeds 10,000 files. Choose a smaller scope.");
+        for (const file of page.files) {
+          if (paths.has(file.path)) throw new Error("File listing changed. Refresh and try again.");
+          paths.add(file.path);
+        }
+        result = { ...result, files: [...result.files, ...page.files], nextCursor: page.nextCursor, truncated: result.truncated || page.truncated, note: result.note ?? page.note };
+      }
       recent.clear();
       setReviewed(previous => new Map([...previous].filter(([path]) => result.files.some(file => file.path === path))));
       setSnapshot(result);
+      grouping.reconcile(cacheKey(result, request), result.files, JSON.stringify(request) === JSON.stringify(previousTarget));
       const path = result.files.some(file => file.path === selected()) ? selected() : result.files[0]?.path ?? "";
       updateSelected(path);
       // List admission and patch admission have independent lifetimes; navigation can cancel a patch.
@@ -138,27 +179,29 @@ export function createLocalReview(load: (request: ReviewLoadRequest, signal: Abo
       }
     } finally { if (controller === current) { controller = undefined; setBusy(false); } }
   }
-  /** Explicit analysis may fetch at most 20 patches; it never changes selected files or conversation state. */
-  async function groupWithAI() {
+  /** Groups the full metadata snapshot, capturing only model-selected diffs.
+   * Selection and the UI cache stay unchanged. Mutable content is captured best-effort on demand.
+   */
+  async function groupWithAI(force = false) {
     const source = snapshot(), request = target();
     if (!source || !request || busy()) return;
-    await grouping.run(async signal => {
-      const files: GroupInput[] = [];
-      for (const entry of source.files) {
-        if (signal.aborted) throw new Error("AI grouping cancelled.");
-        let file = entry;
-        if (files.length < 20 && !hasPatch(file)) {
-          const result = await load({ ...request, path: file.path }, signal);
-          const loaded = result.files[0];
-          if (result.files.length !== 1 || !loaded || loaded.path !== file.path || !hasPatch(loaded)) throw new Error("Invalid selected-file response.");
-          file = loaded;
-        }
-        files.push({ path: file.path, patch: files.length < 20 ? file.patch : null, fingerprint: file.fingerprint });
-      }
-      return files;
-    });
+    // local_review.rs uses these notices for admitted files without readable diffs.
+    const omitted = new Set([
+      "Untracked content omitted; file has not been read.\n", "Binary content omitted.\n",
+      "Non-UTF-8 patch omitted.\n", "Patch exceeds 64 KiB; content omitted.\n",
+    ]);
+    const input = (file: ReviewEntry): GroupInput => ({ path: file.path, status: file.status,
+      patch: omitted.has(file.patch ?? "") ? null : file.patch, fingerprint: file.fingerprint, uncaptured: !hasPatch(file) });
+    const metadata = source.files.map(input);
+    await grouping.run(async () => metadata, async (path, signal) => {
+      const result = await load({ ...request, path }, signal), file = result.files[0];
+      if (result.files.length !== 1 || !file || file.path !== path) throw new Error("Invalid selected-file response.");
+      return { ...input(file), uncaptured: false };
+    }, { cacheKey: cacheKey(source, request), force, model: groupingModel() ?? undefined,
+      verify: source.snapshotKey ? async signal => (await load(request, signal)).snapshotKey === source.snapshotKey : undefined });
   }
-  return { scope, setScope, base, setBase, commit, setCommit, history, snapshot, target, selected, setSelected, busy, error, patchBusy, patchError, loadPatch, refresh, cancel, isReviewed, mark, structural, context, grouping, groupWithAI };
+
+  return { scope, setScope, base, setBase, commit, setCommit, history, branches, snapshot, target, selected, setSelected, busy, error, patchBusy, patchError, loadPatch, refresh, cancel, isReviewed, mark, structural, context, grouping, groupWithAI };
 }
 export type LocalReviewModel = ReturnType<typeof createLocalReview>;
 
@@ -177,11 +220,14 @@ export function diffLines(patch: string): DiffLine[] {
   });
 }
 
-/** Appends explicit snapshot context to an unsent draft, rejecting the prompt byte limit without losing existing text. */
-export function reviewDraft(draft: string, file: ReviewFile, target: ReviewRequest): string {
+/** Appends a full patch or selected source rows to an unsent draft. Excerpts retain
+ * old/new coordinates and diff prefixes; the 32 KiB limit rejects without losing text.
+ */
+export function reviewDraft(draft: string, file: ReviewFile, target: ReviewRequest, lines?: readonly DiffLine[]): string {
   const scope = target.scope === "commit" ? `commit ${target.commit} against its first parent (empty tree for a root commit)` : target.scope === "branch" ? `branch changes against merge-base with ${JSON.stringify(target.base)}` : target.scope;
-  const context = `Review the local ${scope} changes for ${JSON.stringify(file.path)}. This is a snapshot; verify the current file before proposing changes.\n\n${file.patch}`;
+  const excerpt = lines ? `Selected lines only (not a complete diff). Old/new are source line numbers; — means absent on that side.\n${lines.map(line => `old ${line.old ?? "—"} | new ${line.next ?? "—"} | ${line.text}`).join("\n")}` : file.patch;
+  const context = `Review the local ${scope} changes for ${JSON.stringify(file.path)}. This is a snapshot; verify the current file before proposing changes.\n\n${excerpt}`;
   const result = draft ? `${draft}\n\n${context}` : context;
-  if (new TextEncoder().encode(result).length > 32768) throw new Error("This patch and your draft exceed the message limit. Ask Pi about a smaller file or shorten your draft.");
+  if (new TextEncoder().encode(result).length > 32768) throw new Error("This patch and your draft exceed the message limit. Select fewer lines or shorten your draft.");
   return result;
 }

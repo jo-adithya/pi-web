@@ -148,6 +148,7 @@ pub fn router(state: WebState) -> Router {
         .route("/review/{session}/structural", post(structural_review))
         .route("/review/{session}/context", post(context_review))
         .route("/review/{session}/commits", post(commit_review))
+        .route("/review/{session}/branches", post(branch_review))
         .route("/review/{session}/groups", post(group_review))
         .route("/images/{session}", post(upload_image))
         .route("/images/{session}/{id}", post(load_image))
@@ -204,7 +205,7 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
         next.run(request).await
     };
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self' {}; img-src 'self' blob:; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", state.socket_origin)).unwrap());
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; worker-src 'self'; manifest-src 'self'; style-src 'self'; connect-src 'self' {}; img-src 'self' blob:; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", state.socket_origin)).unwrap());
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -325,6 +326,8 @@ async fn static_file(state: &WebState, relative: String) -> Response {
         "js" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "webmanifest" => "application/manifest+json; charset=utf-8",
         "woff2" => "font/woff2",
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -721,6 +724,65 @@ async fn commit_review(
         // The task retains admission through child kill/reap even if the HTTP future is dropped.
         let _permit = permit;
         crate::commit_review::review(&root, input, cancelled).await
+    });
+    let result = worker.await;
+    drop(cancel);
+    match result {
+        Ok(Ok(review)) => axum::Json(review).into_response(),
+        Ok(Err(message)) => error(StatusCode::UNPROCESSABLE_ENTITY, message),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Review worker failed"),
+    }
+}
+
+/// Lists branch choices from the registered workspace under shared review admission.
+async fn branch_review(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    fn error(status: StatusCode, message: &str) -> Response {
+        (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+    }
+    if !image_proof(&state, request.headers()) {
+        return error(StatusCode::UNAUTHORIZED, "Capability required");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_none_or(|v| v != "application/json")
+    {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        );
+    }
+    let Ok(permit) = state.review_slots.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Review workers are busy");
+    };
+    let body =
+        match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 2048))
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Review request exceeds 2 KiB",
+                );
+            }
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Review request timed out"),
+        };
+    let Ok(input) = serde_json::from_slice::<crate::branch_review::Request>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid review request");
+    };
+    let Some(root) = state.runtime.workspace_directory(&session).await else {
+        return error(StatusCode::NOT_FOUND, "Session workspace not found");
+    };
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        // The task retains admission through child kill/reap even if the HTTP future is dropped.
+        let _permit = permit;
+        crate::branch_review::review(&root, input, cancelled).await
     });
     let result = worker.await;
     drop(cancel);

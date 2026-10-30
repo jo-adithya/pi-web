@@ -26,4 +26,6 @@ mod context_review;
 
 mod commit_review;
 
+mod branch_review;
+
 mod group_review;

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { LocalReview } from "../src/LocalReview";
 import { createSessionModel } from "../src/session-model";
@@ -8,6 +8,11 @@ import { createLocalReview } from "../src/local-review";
 
 const latest = "a".repeat(40), older = "b".repeat(40);
 const history = { commits: [{ id: latest, subject: "Latest change" }, { id: older, subject: "<script>Older change</script>" }], truncated: false };
+/** Exercise the touch click path used by Kobalte's select trigger. */
+function openPicker(trigger: HTMLElement) {
+  fireEvent(trigger, Object.assign(new Event("pointerdown", { bubbles: true }), { pointerType: "touch", button: 0 }));
+  fireEvent.click(trigger); flush();
+}
 const snapshot = { files: [{ path: "main.ts", previousPath: null, status: "modified", patch: "@@ -1 +1 @@\n-old\n+new\n", fingerprint: "file" }], truncated: false, note: null };
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -21,15 +26,45 @@ it("loads commits only on demand and pins selection and unsent review context to
   await page.findByRole("article", { name: "Diff for main.ts" });
   expect(request.mock.calls.some(([url]) => url.endsWith("/commits"))).toBe(false);
   fireEvent.click(page.getByRole("button", { name: "Commit" }));
-  const picker = await page.findByRole("combobox", { name: "Commit" });
+  const picker = await page.findByRole("button", { name: /^Commit / });
   await waitFor(() => { flush(); expect(model.review.target()).toEqual({ scope: "commit", commit: latest }); });
-  expect((picker as HTMLSelectElement).value).toBe(latest);
-  fireEvent.change(picker, { target: { value: older } });
+  expect(picker.textContent).toContain("Latest change");
+  openPicker(picker);
+  fireEvent.click(screen.getByRole("option", { name: /Older change/ }));
   await waitFor(() => { flush(); expect(model.review.target()).toEqual({ scope: "commit", commit: older }); });
   expect(page.container.querySelector("script")).toBeNull();
-  fireEvent.click(await page.findByRole("button", { name: "Ask Pi" })); flush();
+  fireEvent.click(await page.findByRole("button", { name: "Ask Pi about file" })); flush();
   expect(model.draft()).toContain(older); expect(model.draft()).toContain("first parent");
   expect(transport).not.toHaveBeenCalled();
+});
+
+it("filters commits by message or hash while keeping the reviewed commit pinned", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/commits") ? history : snapshot))));
+  const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("article"); fireEvent.click(page.getByRole("button", { name: "Commit" }));
+  await waitFor(() => { flush(); expect(model.review.target()?.commit).toBe(latest); });
+  const search = page.getByRole("searchbox", { name: "Find a commit" }) as HTMLInputElement;
+  fireEvent.input(search, { target: { value: "older CHANGE" } });
+  expect(search.value).toBe("older CHANGE"); flush();
+  openPicker(page.getByRole("button", { name: /^Commit / }));
+  expect(screen.getByRole("option", { name: /Older change/ })).toBeTruthy();
+  expect(page.getByRole("button", { name: /^Commit / }).textContent).toContain("Latest change");
+  expect(model.review.target()?.commit).toBe(latest);
+  fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" }); flush();
+  await waitFor(() => { flush(); expect(screen.queryByRole("listbox")).toBeNull(); });
+  fireEvent.input(search, { target: { value: "no matching message" } }); flush();
+  expect(page.getByText(/No matching commits/)).toBeTruthy();
+  openPicker(page.getByRole("button", { name: /^Commit / }));
+  expect(screen.queryByRole("option", { name: /Older change/ })).toBeNull();
+  fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" }); flush();
+  fireEvent.input(search, { target: { value: older.slice(0, 8) } }); flush();
+  openPicker(page.getByRole("button", { name: /^Commit / }));
+  expect(screen.getByRole("option", { name: /Older change/ })).toBeTruthy();
+  fireEvent.click(screen.getByRole("option", { name: /Older change/ }));
+  await waitFor(() => { flush(); expect(model.review.target()?.commit).toBe(older); });
+  expect(page.queryByText(/does not stop at main or master/)).toBeNull();
+  expect(page.getByRole("button", { name: "Commit" }).title).toContain("first parent");
 });
 
 it("shows empty history and can reload commits without changing the workspace", async () => {
@@ -41,7 +76,7 @@ it("shows empty history and can reload commits without changing the workspace", 
   await page.findByText(/No commits in local HEAD history/);
   populated = true; fireEvent.click(page.getByRole("button", { name: "Reload commits" }));
   await waitFor(() => { flush(); expect(model.review.target()).toEqual({ scope: "commit", commit: latest }); });
-  expect((page.getByRole("combobox", { name: "Commit" }) as HTMLSelectElement).value).toBe(latest);
+  expect(page.getByRole("button", { name: /^Commit / }).textContent).toContain("Latest change");
 });
 
 it("shows actionable history errors and retries without hiding the previous snapshot's scope", async () => {
@@ -122,8 +157,11 @@ it("keeps the picker and snapshot pinned when reload omits the selected commit",
   await waitFor(() => { flush(); expect(model.review.target()?.commit).toBe(latest); expect(model.review.busy()).toBe(false); });
   current = { commits: [{ id: older, subject: "New HEAD" }], truncated: false };
   fireEvent.click(page.getByRole("button", { name: "Reload commits" }));
-  await page.findByRole("option", { name: /New HEAD/ });
-  expect((page.getByRole("combobox", { name: "Commit" }) as HTMLSelectElement).value).toBe(latest);
+  await waitFor(() => { flush(); expect(model.review.history.busy()).toBe(false); });
+  openPicker(page.getByRole("button", { name: /^Commit / }));
+  await screen.findByRole("option", { name: /New HEAD/ });
+  fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" }); flush();
+  expect(page.getByRole("button", { name: /^Commit / }).textContent).toContain(`Selected: ${latest.slice(0, 10)}`);
   expect(model.review.target()).toEqual({ scope: "commit", commit: latest });
   fireEvent.click(page.getByRole("button", { name: "Refresh" }));
   await waitFor(() => { flush(); expect(model.review.busy()).toBe(false); });

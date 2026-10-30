@@ -126,7 +126,10 @@ export function PromptInput(props: PromptInputProps) {
   }
   return <TextField class="prompt-input" value={props.value} onChange={props.onInput}>
     <TextField.Label class="sr-only" for={props.id}>Message Pi</TextField.Label>
-    <TextField.TextArea ref={input} id={props.id} rows={1} autoResize maxlength={32_768}
+    {/* The hidden grid cell sizes the editor without collapsing its live scroll box.
+        A trailing space preserves the height of an empty final line. */}
+    <div class="prompt-size" aria-hidden="true">{props.value + " "}</div>
+    <TextField.TextArea ref={input} id={props.id} rows={1} maxlength={32_768}
       placeholder="What would you like to work on?"
       role="combobox" aria-autocomplete="list" aria-expanded={matches().length > 0 ? "true" : "false"}
       aria-controls={matches().length ? listId : undefined}

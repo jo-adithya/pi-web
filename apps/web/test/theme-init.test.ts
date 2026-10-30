@@ -12,6 +12,7 @@ function initialize(saved: string | null, systemDark: boolean, denied = false) {
   expect(script!.type).not.toBe("module");
   expect(script!.hasAttribute("async")).toBe(false);
   expect(script!.hasAttribute("defer")).toBe(false);
+  document.head.innerHTML = page.head.innerHTML;
   const source = readFileSync("public/assets/theme-init.js", "utf8");
   runInNewContext(source, {
     document,
@@ -29,7 +30,10 @@ function initialize(saved: string | null, systemDark: boolean, denied = false) {
   });
 }
 
-afterEach(() => document.documentElement.classList.remove("dark"));
+afterEach(() => {
+  document.documentElement.classList.remove("dark");
+  document.head.innerHTML = "";
+});
 
 it.each([
   ["dark", false, true], ["dark", true, true],
@@ -39,6 +43,8 @@ it.each([
 ] as const)("applies saved %s with system dark=%s before startup", (saved, systemDark, dark) => {
   initialize(saved, systemDark);
   expect(document.documentElement.classList.contains("dark")).toBe(dark);
+  expect(document.querySelector('meta[name="theme-color"]')?.getAttribute("content"))
+    .toBe(dark ? "#171c22" : "#ffffff");
 });
 
 it.each([true, false])("uses system dark=%s when storage is unavailable", systemDark => {

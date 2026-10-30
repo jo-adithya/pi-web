@@ -1,14 +1,21 @@
 //! Bounded, read-only Git snapshots rooted at a registered workspace.
+use p256::ecdsa::{
+    Signature,
+    signature::{PrehashSignature, digest::Digest},
+};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command, sync::oneshot, time::Instant};
 
+// P-256's existing dependency exposes SHA-256 through its signature digest contract.
+type Sha256 = <Signature as PrehashSignature>::Digest;
+
 const MAX_FILES: usize = 100;
 const MAX_PATCH: usize = 64 * 1024;
 const MAX_TOTAL: usize = 1024 * 1024;
-const MAX_LIST: usize = 256 * 1024;
+const MAX_LIST: usize = 4 * 1024 * 1024;
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, std::hash::Hash)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Scope {
     Unstaged,
@@ -23,6 +30,8 @@ pub(crate) struct Request {
     pub base: Option<String>,
     pub commit: Option<String>,
     pub path: Option<String>,
+    /// Continuation token from a metadata page; mutually exclusive with path.
+    pub cursor: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,21 +42,48 @@ pub(crate) struct File {
     patch: Option<String>,
     fingerprint: Option<String>,
 }
+/// Scope-wide Git line counts, independent of the bounded file list and lazy patches.
+/// Binary and untracked files contribute to unavailable_files instead of line counts.
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LineStats {
+    added: u64,
+    removed: u64,
+    unavailable_files: usize,
+}
 #[derive(Serialize)]
 pub(crate) struct Review {
     files: Vec<File>,
     truncated: bool,
     note: Option<String>,
+    /// Absent for selected-file requests, continuation pages, or over-budget statistics.
+    #[serde(rename = "lineStats", skip_serializing_if = "Option::is_none")]
+    line_stats: Option<LineStats>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    /// SHA-256 identity of captured tracked diff bytes and scope/listing metadata.
+    /// Absent outside the first metadata page or when the full diff exceeds 4 MiB.
+    #[serde(rename = "snapshotKey", skip_serializing_if = "Option::is_none")]
+    snapshot_key: Option<String>,
 }
 
-/// Lists metadata, or loads only a requested fresh member, within ten seconds.
-/// Concurrent workspace edits may change files between listing and patch reads. Cancellation kills and reaps Git.
+/// Lists up to 100 metadata entries per page, or loads one fresh member, within ten seconds.
+/// Cursors bind the listing and resolved scope identity; changed listings require a restart.
+/// Line statistics appear only on the first page. More pages do not imply omitted content.
+/// Snapshot keys identify the captured diff, including binary changes, not an atomic workspace state.
+/// Untracked names participate in the identity; their content remains unread and omitted.
+/// Concurrent edits may change files between listing, identity, and selected patch reads;
+/// consumers must revalidate around grouping and cannot treat the key as a filesystem lock.
+/// Cancellation kills and reaps Git.
 /// Errors are fixed actionable messages suitable for the HTTP boundary.
 pub(crate) async fn review(
     root: &Path,
     request: Request,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<Review, &'static str> {
+    if request.cursor.is_some() && request.path.is_some() {
+        return Err("Cursor and path are mutually exclusive");
+    }
     if let Some(path) = &request.path {
         validate_path(path)?;
     }
@@ -56,18 +92,98 @@ pub(crate) async fn review(
         deadline: Instant::now() + Duration::from_secs(10),
         cancelled: &mut cancelled,
     };
-    let args = prepare(&mut git, &request).await?;
+    let (args, identity) = prepare_snapshot(&mut git, &request).await?;
     let mut listing = args.clone();
     listing.extend(["--name-status".into(), "-z".into(), "--".into()]);
     let bytes = git.strings(&listing, MAX_LIST).await?;
+    let untracked = if matches!(request.scope, Scope::Unstaged) {
+        git.run(
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            MAX_LIST,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    use std::hash::{Hash, Hasher};
+    let mut snapshot = std::collections::hash_map::DefaultHasher::new();
+    (root, request.scope, &args, &identity, &bytes, &untracked).hash(&mut snapshot);
+    let snapshot = snapshot.finish();
+    let offset = match request.cursor.as_deref() {
+        Some(cursor) => {
+            let offset = cursor
+                .split_once(':')
+                .and_then(|(offset, _)| offset.parse::<usize>().ok())
+                .filter(|offset| *offset > 0)
+                .ok_or("Invalid review cursor; refresh review")?;
+            if cursor != page_cursor(snapshot, offset) {
+                return Err("Invalid or stale review cursor; refresh review");
+            }
+            offset
+        }
+        None => 0,
+    };
+    let line_stats = if request.path.is_none() && request.cursor.is_none() {
+        let mut stats_args = args.clone();
+        stats_args.extend(["--numstat".into(), "-z".into(), "--".into()]);
+        match git.strings(&stats_args, MAX_LIST).await {
+            Ok(bytes) => Some(parse_line_stats(&bytes)?),
+            Err("Git output exceeds review limit") => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let snapshot_key = if request.path.is_none() && request.cursor.is_none() {
+        let mut patch_args = args.clone();
+        patch_args.extend([
+            "--patch".into(),
+            "--binary".into(),
+            "--full-index".into(),
+            "--".into(),
+        ]);
+        match git.strings(&patch_args, MAX_LIST).await {
+            Ok(patch) => {
+                let mut hash = Sha256::new();
+                // Length framing preserves field boundaries, including opaque path bytes.
+                let mut field = |value: &[u8]| {
+                    hash.update((value.len() as u64).to_be_bytes());
+                    hash.update(value);
+                };
+                field(b"pi-review-snapshot-v1");
+                field(root.as_os_str().as_encoded_bytes());
+                field(match request.scope {
+                    Scope::Unstaged => b"unstaged",
+                    Scope::Staged => b"staged",
+                    Scope::Branch => b"branch",
+                    Scope::Commit => b"commit",
+                });
+                field(&(patch_args.len() as u64).to_be_bytes());
+                for arg in &patch_args {
+                    field(arg.as_bytes());
+                }
+                field(identity.as_deref().unwrap_or("").as_bytes());
+                field(&bytes);
+                field(&untracked);
+                field(&patch);
+                Some(format!("{:x}", hash.finalize()))
+            }
+            // Partial output is never content identity. Metadata remains usable without reuse.
+            Err("Git output exceeds review limit") => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
     let mut fields = bytes.split(|b| *b == 0).filter(|b| !b.is_empty());
     let mut result = Review {
         files: Vec::new(),
         truncated: false,
         note: None,
+        line_stats,
+        next_cursor: None,
+        snapshot_key,
     };
-    // Reserve the response envelope and omission note; count escaped JSON metadata too.
-    let mut total = 1024;
     let mut seen = std::collections::HashSet::new();
     while let Some(status) = fields.next() {
         let first = fields.next().ok_or("Invalid Git file listing")?;
@@ -85,10 +201,6 @@ pub(crate) async fn review(
             .is_some_and(|selected| selected.as_bytes() != path)
         {
             continue;
-        }
-        if result.files.len() == MAX_FILES {
-            result.truncated = true;
-            break;
         }
         let Ok(path) = std::str::from_utf8(path) else {
             result.truncated = true;
@@ -120,17 +232,16 @@ pub(crate) async fn review(
             patch: None,
             fingerprint: None,
         };
-        if !append_file(&mut result, &mut total, file)? {
-            break;
-        }
+        result.files.push(file);
     }
     if matches!(request.scope, Scope::Unstaged) {
-        let bytes = git
-            .run(
-                &["ls-files", "--others", "--exclude-standard", "-z"],
-                MAX_LIST,
-            )
-            .await?;
+        let bytes = untracked;
+        if let Some(stats) = &mut result.line_stats {
+            stats.unavailable_files += bytes
+                .split(|b| *b == 0)
+                .filter(|b| !b.is_empty())
+                .count();
+        }
         for path in bytes.split(|b| *b == 0).filter(|b| !b.is_empty()) {
             if request
                 .path
@@ -140,9 +251,6 @@ pub(crate) async fn review(
                 continue;
             }
             result.truncated = true;
-            if result.files.len() == MAX_FILES {
-                break;
-            }
             if let Ok(path) = std::str::from_utf8(path) {
                 let file = File {
                     path: path.into(),
@@ -151,11 +259,12 @@ pub(crate) async fn review(
                     patch: None,
                     fingerprint: None,
                 };
-                if !append_file(&mut result, &mut total, file)? {
-                    break;
-                }
+                result.files.push(file);
             }
         }
+    }
+    if request.path.is_none() {
+        paginate(&mut result, offset, snapshot)?;
     }
     if let Some(path) = request.path {
         let index = result
@@ -202,11 +311,83 @@ pub(crate) async fn review(
         ));
         file.patch = Some(patch);
         result.files.clear();
-        total = 1024;
+        let mut total = 1024;
         append_file(&mut result, &mut total, file)?;
     }
     if result.truncated {
-        result.note = Some("Some content was omitted: review limits, non-UTF-8 paths/content, or untracked files. Limits: 100 files, 64 KiB per patch, 1 MiB JSON response.".into());
+        result.note = Some("Some content was omitted: review limits, non-UTF-8 paths/content, or untracked files. Limits: 100 files per page, 64 KiB per patch, 1 MiB JSON response.".into());
+    }
+    Ok(result)
+}
+
+/// Encodes an offset bound to a listing snapshot; this is a staleness check, not authorization.
+fn page_cursor(snapshot: u64, offset: usize) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (snapshot, offset).hash(&mut hash);
+    format!("{offset}:{:016x}", hash.finish())
+}
+
+/// Selects a byte-bounded metadata page without treating deferred entries as omissions.
+fn paginate(review: &mut Review, offset: usize, snapshot: u64) -> Result<(), &'static str> {
+    let files = std::mem::take(&mut review.files);
+    if offset > 0 && offset >= files.len() {
+        return Err("Invalid review cursor; refresh review");
+    }
+    // Reserve room for statistics, the cursor, and an omission note.
+    let mut total = 1024;
+    for (index, file) in files.into_iter().enumerate().skip(offset) {
+        let size = serde_json::to_vec(&file)
+            .map_err(|_| "Cannot encode review file")?
+            .len()
+            + 1;
+        if review.files.len() == MAX_FILES || total + size > MAX_TOTAL {
+            if review.files.is_empty() {
+                return Err("Review file metadata exceeds response limit");
+            }
+            review.next_cursor = Some(page_cursor(snapshot, index));
+            break;
+        }
+        total += size;
+        review.files.push(file);
+    }
+    Ok(())
+}
+
+/// Totals NUL-delimited numstat records, including the two-path rename form.
+/// Paths stay opaque bytes so tabs, newlines and non-UTF-8 names cannot alter counts.
+fn parse_line_stats(bytes: &[u8]) -> Result<LineStats, &'static str> {
+    let mut result = LineStats::default();
+    let mut records = bytes.split(|b| *b == 0);
+    while let Some(record) = records.next().filter(|record| !record.is_empty()) {
+        let mut fields = record.splitn(3, |b| *b == b'\t');
+        let added = fields.next().ok_or("Invalid Git line statistics")?;
+        let removed = fields.next().ok_or("Invalid Git line statistics")?;
+        let path = fields.next().ok_or("Invalid Git line statistics")?;
+        if path.is_empty() {
+            for _ in 0..2 {
+                records
+                    .next()
+                    .filter(|path| !path.is_empty())
+                    .ok_or("Invalid Git rename statistics")?;
+            }
+        }
+        if added == b"-" && removed == b"-" {
+            result.unavailable_files += 1;
+        } else {
+            let count = |bytes| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or("Invalid Git line count")
+            };
+            result.added = result.added
+                .checked_add(count(added)?)
+                .ok_or("Git line counts exceed limit")?;
+            result.removed = result.removed
+                .checked_add(count(removed)?)
+                .ok_or("Git line counts exceed limit")?;
+        }
     }
     Ok(result)
 }
@@ -233,6 +414,15 @@ pub(crate) async fn prepare(
     git: &mut Git<'_>,
     request: &Request,
 ) -> Result<Vec<String>, &'static str> {
+    Ok(prepare_snapshot(git, request).await?.0)
+}
+
+/// Resolves comparison arguments and branch tip identities for pagination and content identity.
+async fn prepare_snapshot(
+    git: &mut Git<'_>,
+    request: &Request,
+) -> Result<(Vec<String>, Option<String>), &'static str> {
+    let mut identity = None;
     if !matches!(request.scope, Scope::Branch) && request.base.is_some() {
         return Err("Base is only valid for branch review");
     }
@@ -333,8 +523,15 @@ pub(crate) async fn prepare(
             let commit = std::str::from_utf8(&resolved)
                 .map_err(|_| "Invalid Git commit")?
                 .trim();
+            let head = git
+                .run(&["rev-parse", "--verify", "HEAD^{commit}"], 1024)
+                .await?;
+            let head = std::str::from_utf8(&head)
+                .map_err(|_| "Invalid Git commit")?
+                .trim();
+            identity = Some(commit.to_owned());
             let merge = git
-                .run(&["merge-base", commit, "HEAD"], 1024)
+                .run(&["merge-base", commit, head], 1024)
                 .await
                 .map_err(|_| "Base and HEAD have no available merge base")?;
             args.push(
@@ -343,10 +540,10 @@ pub(crate) async fn prepare(
                     .trim()
                     .into(),
             );
-            args.push("HEAD".into());
+            args.push(head.into());
         }
     }
-    Ok(args)
+    Ok((args, identity))
 }
 
 /// Validates a registered working-tree root and rejects configured conversion filters.
@@ -531,11 +728,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_digest_is_sha256() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn response_budget_includes_escaped_metadata_and_untracked_notices() {
         let mut review = Review {
             files: Vec::new(),
             truncated: false,
             note: None,
+            line_stats: None,
+            next_cursor: None,
+            snapshot_key: None,
         };
         let mut total = 1024;
         for _ in 0..100 {
@@ -553,6 +761,39 @@ mod tests {
         assert!(review.truncated);
         assert!(serde_json::to_vec(&review).unwrap().len() <= MAX_TOTAL);
         assert!(review.files.len() < 100);
+    }
+
+    #[test]
+    fn metadata_pages_respect_escaped_json_budget_without_omitting_files() {
+        let make_review = || Review {
+            files: (0..100).map(|index| File {
+                path: format!("{index}{}", "\u{0001}".repeat(1020)),
+                previous_path: Some("\u{0002}".repeat(1024)),
+                status: "renamed",
+                patch: None,
+                fingerprint: None,
+            }).collect(),
+            truncated: false,
+            note: None,
+            line_stats: None,
+            next_cursor: None,
+            snapshot_key: None,
+        };
+        let mut first = make_review();
+        paginate(&mut first, 0, 42).unwrap();
+        let count = first.files.len();
+        assert!((1..100).contains(&count));
+        assert!(!first.truncated);
+        assert!(serde_json::to_vec(&first).unwrap().len() <= MAX_TOTAL);
+        assert_eq!(first.next_cursor, Some(page_cursor(42, count)));
+        let mut second = make_review();
+        paginate(&mut second, count, 42).unwrap();
+        assert_eq!(second.files.len() + count, 100);
+        assert!(second.files[0].path.starts_with(&count.to_string()));
+        assert!(!second.truncated);
+        assert!(second.next_cursor.is_none());
+        assert!(serde_json::to_vec(&second).unwrap().len() <= MAX_TOTAL);
+        assert!(paginate(&mut make_review(), 100, 42).is_err());
     }
 
     #[tokio::test]

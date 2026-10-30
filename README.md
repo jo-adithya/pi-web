@@ -102,6 +102,30 @@ See [Tailscale Serve documentation](https://tailscale.com/kb/1242/tailscale-serv
 Actual phone connectivity requires a configured tailnet and is separate from the
 application's automated proxy-boundary tests.
 
+## Install as a web app
+
+Pi Web includes a web app manifest and home-screen icons. On **Firefox for Android**,
+open your private HTTPS Pi Web address and choose **Install** (or **Add to Home screen**,
+depending on the browser version) from the browser menu. Launch the new icon for a
+standalone window. Chrome/Edge also offer installation; iPhone/iPad users can use
+Safari’s **Share → Add to Home Screen**. Installation UI and support vary by browser
+and OS; desktop Firefox does not offer the same manifest-based PWA installation.
+
+An installed window may not share the original tab’s login. Use **Terminal login link**
+to paste the complete current `https://…/#cap=…` link printed by the server. Only links
+for the current origin are accepted, and only the credential is posted to `/auth`.
+The link is cleared from the input immediately; login remains session-storage-only,
+not a saved device credential. Paste a fresh link after a server restart or when a
+new window requests authentication. If an open app is reconnecting after a restart,
+choose **Update login link** to sign in again without losing your drafts.
+The manifest and launch URL never contain the secret.
+
+This is an **online-only app**: the computer, Pi Web server, and private network must
+remain available. Installation adds no offline cache, background execution, or automatic
+notification permission. The existing phone-push worker remains opt-in. HTTPS is required
+on phones; localhost/loopback is allowed for desktop development. Rebuild the web assets
+and restart the server after upgrading so both the manifest MIME type and CSP are served.
+
 ## Local changes review
 
 Open **Changes** beside **Conversation** to review the selected conversation’s
@@ -110,21 +134,34 @@ a Git working tree (including a Git-colocated jj repository).
 
 - **Unstaged** compares tracked files with the index. Untracked filenames are listed,
   but their contents are not read. **Staged** compares the index with HEAD.
-- **Branch** accepts an existing local branch, tag, or full ref and compares its
-  merge-base with committed HEAD. It excludes staged/unstaged edits. GitHub URLs,
-  fetching, staging, committing, and publishing are not supported.
+- **Branch** lists up to 100 local and locally stored remote-tracking branches on
+  demand; choose a base and click **Compare**. **Enter a branch or tag** also accepts
+  a tag or full ref. The comparison is merge-base → committed HEAD: changes since
+  the branches diverged, not a tip-to-tip comparison. **Reload branches** only rereads
+  local refs; remote-tracking refs may be stale. It excludes staged/unstaged edits.
+  GitHub URLs, fetching, staging, committing, and publishing are not supported.
 - **Commit** shows one local commit against its first parent, or an empty tree for
   a root commit. The picker loads up to 100 recent commits reachable from local
-  HEAD on demand, including merged history. **Reload commits** updates the list;
-  the selected full commit ID stays pinned, even if HEAD moves. Staged/unstaged
+  HEAD on demand, including merged history; it does not stop at `main` or `master`.
+  Search the loaded list by message or hash. **Reload commits** updates the list;
+  searching and reloading keep the selected full commit ID pinned, even if HEAD moves. Staged/unstaged
   edits are excluded. Missing parent objects in shallow repositories produce an
   error rather than a misleading root diff. History is read-only and bounded to
   256 KiB per response with a ten-second request deadline.
+- The review summary shows total lines changed (added + deleted) for the selected
+  scope, independently of metadata pagination or patch-size limits. Binary and
+  untracked files are counted separately as having no line counts. Totals use a
+  bounded Git statistics read, not downloaded patches; if that read exceeds its
+  output budget, totals are shown as unavailable. Refresh after edits; working-tree
+  statistics and file lists are best-effort snapshots, not atomic captures.
 - Filter files by path and read unified diffs with old/new line numbers and change
   counts. **Next unreviewed** moves through remaining files. **Reviewed** marks are
   local to this conversation and page. Refresh revalidates marks as each file loads;
   only identical content stays reviewed. Reloading clears them. The file list loads
-  first; patches load only when selected, with a 1 MiB per-conversation memory cache
+  automatically in pages of up to 100 entries, supporting 1,000-file reviews (the
+  browser admits at most 10,000 files). Changed listings invalidate continuation
+  tokens: refresh rather than mixing pages from different listings. Patches load
+  only when selected, with a 1 MiB per-conversation memory cache
   cleared by Refresh. Ask Pi, Reviewed, and Structural wait for that file’s patch. Long lines wrap in both text and structural diffs,
   keeping source whitespace and line numbers. Diffs scroll with the page; the files sidebar scrolls
   independently. Top controls scroll away; file headers stay sticky. On narrow
@@ -165,27 +202,81 @@ a Git working tree (including a Git-colocated jj repository).
   snapshot requires refreshing Changes. Added/deleted files, untracked files, symlinks,
   binary content, and unsupported languages stay in text mode with an explanation;
   missing or incompatible engines also fall back to text.
+- **Overview** and **Files** are two views inside Changes; Files remains the default.
+  Overview reuses AI group titles/reasons as suggested purpose and behavior explanations,
+  with exact file links and a suggested review order. **Review [purpose]** opens the
+  first unreviewed file in that group and makes **Next unreviewed** follow group order.
+  Filename-based risk prompts and changed test files are navigation aids, not a security
+  assessment or proof of coverage. Test execution results are not available here.
+  Opening Overview never calls a model, changes the draft, or marks files reviewed.
 - **Group with AI** is optional; folder grouping remains the default. Clicking it
   sends the displayed file names and bounded diff snippets to the conversation’s
-  current Pi provider/model. Provider charges may apply. It uses a separate,
+  current Pi provider/model by default. Open **Settings → AI review** from the
+  Settings button at the bottom of the sidebar to choose a separate grouping model and run limits without
+  changing chat. These preferences belong to the selected conversation and last until
+  reload. **Settings → Appearance** saves your color scheme in this browser. Provider charges may apply. It uses a separate,
   ephemeral session with tools, extensions and MCP disabled; it does not send a
   message in your conversation or change its draft. The conversation must be open
   and idle with an available model; extension-only or project-only model configurations
   may be unavailable in this isolated analysis session. It uses your global Pi provider
   credentials/settings, but explicitly overrides system-prompt additions. This is not
   an OS sandbox.
-  At most 20 patches are fetched on demand, clipped to 8 KiB each / 48 KiB total;
-  other files supply names only. Partial coverage is shown. Suggestions are not a
-  verified assessment: unknown or duplicate paths reject the result, omitted files
-  remain under **Ungrouped**, and errors leave folders available. Switch between
-  **Folders** and **AI intent** without another model request. Refresh/scope changes
-  discard suggestions; results stay in page memory only. The server admits one
-  grouping job at a time with a 60-second analysis deadline plus supervised cleanup.
+  Grouping starts from a whole-change manifest, using already-cached diff summaries
+  where available. Uncached patches load only when the model requests an excerpt;
+  their line counts are unknown until captured. Each inference admits up to 1,000
+  manifest entries and 192 KiB of JSON, with at most 2 KiB of overview per entry /
+  24 KiB total. Larger manifests are partitioned by size, then their compact group
+  summaries are reconciled globally so related changes can span partitions. Summary
+  reconciliation is lossy: it merges earlier groups rather than rereading every file.
+  Each inference unit allows up to eight requested diff excerpts (four per round,
+  8 KiB / 120 lines each), using at most three model calls. Larger changes can require
+  additional summarization and reconciliation calls, increasing runtime and provider
+  charges. A whole run defaults to **6 calls and 512 KiB of serialized request data**,
+  counting repeated context. Settings permit up to 100 calls / 16 MiB explicitly.
+  These are work limits, not a dollar cap: output tokens, provider/system prompts and
+  pricing differ. Reconciliation also stops after five levels. Reaching any limit
+  leaves folders available; only a complete final grouping is published.
+  Model prompts use short file IDs to avoid repeating long paths in responses.
+  Usage shows calls/request bytes and reported input/output/cache tokens and cost;
+  missing provider usage or prices are shown as unavailable, not free.
+  Requests contain at most 48 KiB of diff text; earlier excerpts are resent in later
+  rounds. There is no shell or repository browsing, and content omitted by review
+  limits remains unavailable. Working-tree captures are best-effort, not atomic.
+  The grouping status summarizes the evidence used. Metadata-only grouping does not
+  mean the model read those files. Suggestions
+  are not a verified assessment and never mark files reviewed: unknown or duplicate
+  paths reject the result, omitted files remain under **Ungrouped**, and errors leave
+  folders available. Switch between **Folders** and **By purpose** without another
+  model request. Per-group counts and **Next unreviewed** follow the chosen grouping.
+  Completed suggestions are reused for the same content, scope, model and grouping
+  policy. The bounded tab-local session cache keeps up to four results / 256 KiB,
+  containing group text and paths, never patches or credentials. A bounded SHA-256
+  content identity includes tracked binary changes; when an identity cannot be
+  computed, reuse is disabled. Identity is rechecked before and after AI runs;
+  mutable working-tree capture remains best-effort, not atomic.
+  Refresh keeps exact matches; changed content keeps clearly stale groups for
+  navigation and puts new files under Ungrouped. **Update groups with AI** is manual;
+  edits never trigger paid requests. **Regenerate (ignore saved result)** forces
+  fresh analysis. Filename-only reuse is deliberately avoided.
+  Lockfiles, minified assets, source maps and dist/build/coverage files keep their
+  names in the manifest but omit contents by default. **Include generated / lockfile
+  contents** opts back in. Frequently edited source files are not automatically
+  suppressed: frequency alone does not make a change unimportant.
+  The server admits one inference at a time with a 60-second deadline plus supervised
+  cleanup; the browser limits each inference unit, including its requested captures, to 90 seconds. Cancel
+  stops further captures and inference calls; failed/cancelled runs leave folders available.
 - **Ask Pi** appends the selected file’s patch and scope to your existing draft and
   returns to Conversation. It never sends automatically. Oversized context is
   rejected without changing the draft; reopen stopped conversations before sending.
+  In Text mode, drag across line numbers to select a range, or select a line then
+  Shift-click another. **Choose end line** lets touch and keyboard users choose
+  the end of a range. A floating **Ask Pi** action appears beside the range endpoint
+  when selection finishes; × or Escape dismisses it without clearing the range.
+  It and **Ask Pi about selection** include only those source rows, with old/new
+  line numbers. Selection clears when the file, scope, snapshot, expanded context
+  or diff mode changes; code text remains selectable for copying.
 - Snapshots are best-effort, not live or atomic: refresh after edits, and coordinate
-  concurrent agents. Limits are 100 listed files, 64 KiB per selected patch, 1 MiB per JSON response,
+  concurrent agents. Limits are 100 listed files per page, 64 KiB per selected patch, 1 MiB per JSON response,
   and a ten-second deadline per list or patch request. Omitted content is explicitly marked; binary diffs show
   Git’s summary rather than file contents. Git must be installed locally and
   support `--no-lazy-fetch`; older versions fail closed. Repositories with configured
@@ -228,7 +319,12 @@ a Git working tree (including a Git-colocated jj repository).
   discarded. At least one workspace must remain, so add another before deleting
   your last workspace. Failed cleanup or saving leaves the workspace visible.
   **New conversation** creates in the currently selected workspace. The compact
-  composer grows with your message. Type **@** to search the current workspace's
+  composer grows with your message. Select text within a chat message and choose
+  **Reply** to attach it as a compact quote above your draft. Long previews are
+  truncated to two lines; sending includes the full selection without an author heading.
+  **Remove quote** keeps your typed message. Nothing sends until you choose **Send**.
+  Quotes stay with their conversation's draft and count toward its message-size limit.
+  Type **@** to search the current workspace's
   files, then use arrow keys and **Tab**/**Enter** or tap a result to insert its
   relative path; **Escape** dismisses suggestions. Paths with spaces are quoted.
   The picker inserts references, not file contents. Search skips hidden files,

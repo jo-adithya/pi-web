@@ -499,6 +499,26 @@ async fn phone_push_requires_exact_boundary_and_proof_and_bounded_json() {
     runtime.shutdown().await;
 }
 #[tokio::test]
+async fn install_assets_have_correct_types_and_same_origin_csp() {
+    let (fixture, router, runtime) = setup().await;
+    for (name, mime, body) in [
+        ("manifest.webmanifest", "application/manifest+json", b"{}".as_slice()),
+        ("icon-192.png", "image/png", b"png fixture".as_slice()),
+    ] {
+        fs::write(fixture.0.join("assets").join(name), body).unwrap();
+        let response = router.clone().oneshot(Request::builder()
+            .uri(format!("/assets/{name}")).header("host", "127.0.0.1:9876")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()["content-type"].to_str().unwrap().starts_with(mime));
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("manifest-src 'self';"));
+        assert_eq!(axum::body::to_bytes(response.into_body(), 1024).await.unwrap().as_ref(), body);
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn root_worker_is_javascript_uncached_and_allowed_by_csp() {
     let (_fixture, router, runtime) = setup().await;
     let response = router.oneshot(Request::builder().uri("/sw.js").header("host", "127.0.0.1:9876").body(Body::empty()).unwrap()).await.unwrap();

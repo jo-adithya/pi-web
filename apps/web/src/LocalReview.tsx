@@ -1,7 +1,15 @@
-import { createEffect, createMemo, createSignal, For, onSettled, Show } from "solid-js";
+import { TextField } from "@kobalte/core/text-field";
+import { SelectField } from "./components/SelectField";
+import { ProgressBar } from "./components/ProgressBar";
+import { Button } from "@kobalte/core/button";
+import { createEffect, createMemo, createSignal, flush, For, onSettled, Show } from "solid-js";
 import { Checkbox } from "@kobalte/core/checkbox";
 import { hasPatch, reviewDraft, type ReviewScope } from "./local-review";
 import { ReviewRows } from "./ReviewRows";
+import { ReviewOverview } from "./ReviewOverview";
+import { groupingUsageLabel } from "./review-costs";
+import { Icon } from "./components/Icon";
+import { ActionDialog } from "./components/ActionDialog";
 import { highlightDiff, type HighlightedLine } from "./review-highlight";
 import type { ContextGap } from "./context-review";
 import type { SessionModel } from "./session-model";
@@ -10,7 +18,7 @@ import "./local-review.css";
 const scopeHelp = {
   unstaged: "Working tree edits that aren’t staged yet. Untracked files show names only.",
   staged: "Changes in the Git index, ready for the next commit.",
-  branch: "Committed changes since this branch diverged from a local base. Uncommitted edits are excluded.",
+  branch: "Compare your current checkout with a base: committed changes since the branches diverged, not a tip-to-tip diff. Uncommitted edits are excluded.",
   commit: "The selected commit against its first parent; root commits against an empty tree. Uncommitted edits are excluded.",
 };
 
@@ -21,11 +29,16 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   const [notice, setNotice] = createSignal("");
   const [filter, setFilter] = createSignal("");
   const [filesOpen, setFilesOpen] = createSignal(false);
-  const [commitPicker, setCommitPicker] = createSignal<HTMLSelectElement>();
-  // Reapply the pinned selection after history replaces the native select's options.
-  createEffect(() => ({ element: commitPicker(), id: review.commit(), history: review.history.value() }),
-    ({ element, id }) => { if (element) element.value = id; });
-  let files: HTMLElement | undefined, detail: HTMLElement | undefined;
+  const [view, setView] = createSignal<"overview" | "files">("files");
+  const [commitQuery, setCommitQuery] = createSignal("");
+  const [manualBase, setManualBase] = createSignal(false);
+  const branchValue = createMemo(() => manualBase() ? "manual" : review.base());
+  const matchingCommits = createMemo(() => {
+    const query = commitQuery().trim().toLowerCase();
+    return (review.history.value()?.commits ?? []).filter(commit => `${commit.subject} ${commit.id}`.toLowerCase().includes(query));
+  });
+  const selectedCommit = () => review.history.value()?.commits.find(commit => commit.id === review.commit());
+  let detail: HTMLElement | undefined;
   let jumpFrame: number | undefined;
   const file = () => review.snapshot()?.files.find(file => file.path === review.selected());
   const loadedFile = () => { const selected = file(); return selected && hasPatch(selected) ? selected : undefined; };
@@ -59,6 +72,76 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     previousRows = nextRows;
     return { ...highlighted, rows: stable };
   });
+  const [range, setRange] = createSignal<{ lines: HighlightedLine[]; anchor: number; end: number }>();
+  const [extending, setExtending] = createSignal(false);
+  const [dragging, setDragging] = createSignal(false);
+  const [dismissedRange, setDismissedRange] = createSignal<ReturnType<typeof range>>();
+  let drag: { pointerId: number; anchor: number; start: number; moved: boolean } | undefined;
+  let suppressClick = false;
+  const textLines = createMemo(() => diff().rows.flatMap(row => row.kind === "line" ? [row.line] : []));
+  const lineIndices = createMemo(() => new Map(textLines().map((line, index) => [line, index])));
+  const selection = () => {
+    const value = range();
+    return value?.lines === textLines() && !structural.result() && !review.busy() ? value : undefined;
+  };
+  const selectedLines = createMemo(() => {
+    const value = selection();
+    return value ? value.lines.slice(Math.min(value.anchor, value.end), Math.max(value.anchor, value.end) + 1).filter(line => line.kind !== "header") : [];
+  });
+  const isSelected = (line: HighlightedLine) => {
+    const value = selection(), index = lineIndices().get(line)!;
+    return Boolean(value && index >= Math.min(value.anchor, value.end) && index <= Math.max(value.anchor, value.end));
+  };
+  // Anchor in the row so the action follows document scrolling without layout measurements.
+  const floatingLine = createMemo(() => {
+    const value = selection();
+    return value && !dragging() && value !== dismissedRange() ? value.lines[value.end] : undefined;
+  });
+  /** Retain the excerpt and focus; return focus to the gutter when dismissing its floating controls. */
+  function dismissFloating(event: KeyboardEvent | MouseEvent) {
+    if (("key" in event && event.key !== "Escape") || !floatingLine()) return;
+    event.preventDefault(); event.stopPropagation();
+    const target = event.target;
+    if (target instanceof Element && target.closest(".review-floating-actions")) {
+      target.closest(".diff-line")?.querySelector<HTMLButtonElement>(".diff-select")?.focus({ preventScroll: true });
+    }
+    setDismissedRange(selection());
+  }
+  function clearSelection() { setRange(undefined); setExtending(false); setDragging(false); setDismissedRange(undefined); drag = undefined; }
+  // Expanded context and refreshed snapshots must never reuse stale row coordinates.
+  createEffect(() => [textLines(), structural.mode(), structural.result(), review.busy()], clearSelection);
+  function selectLine(line: HighlightedLine, extend: boolean) {
+    const index = lineIndices().get(line)!;
+    setRange({ lines: textLines(), anchor: extend ? selection()?.anchor ?? index : index, end: index });
+    setExtending(false);
+  }
+  function startDrag(event: PointerEvent & { currentTarget: HTMLButtonElement }, line: HighlightedLine) {
+    suppressClick = false;
+    if (event.pointerType !== "mouse" || event.button !== 0 || review.busy()) return;
+    event.preventDefault(); event.currentTarget.focus({ preventScroll: true }); setDragging(true);
+    const index = lineIndices().get(line)!;
+    drag = { pointerId: event.pointerId, anchor: event.shiftKey || extending() ? selection()?.anchor ?? index : index, start: index, moved: false };
+  }
+  function dragOver(event: PointerEvent, line: HighlightedLine) {
+    if (!drag || drag.pointerId !== event.pointerId || event.buttons !== 1 || line.kind === "header") return;
+    const index = lineIndices().get(line)!;
+    if (index === drag.start && !drag.moved) return;
+    drag.moved = true;
+    setRange({ lines: textLines(), anchor: drag.anchor, end: index }); setExtending(false);
+  }
+  function finishDrag(event: PointerEvent) {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    suppressClick = drag.moved; drag = undefined; setDragging(false);
+  }
+  function cancelDrag(event: PointerEvent) {
+    // Native touch scrolling cancels its pointer without cancelling a chosen range.
+    if (drag && drag.pointerId === event.pointerId) clearSelection();
+  }
+  onSettled(() => {
+    window.addEventListener("pointerup", finishDrag);
+    window.addEventListener("pointercancel", cancelDrag);
+    return () => { window.removeEventListener("pointerup", finishDrag); window.removeEventListener("pointercancel", cancelDrag); };
+  });
   const structuralLines = createMemo(() => (structural.result()?.lines ?? []).map(line => line.segments.length <= 256 ? line : {
     ...line, segments: [{ text: line.segments.map(segment => segment.text).join(""), changed: false }],
   }));
@@ -80,19 +163,34 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     return [...groups].map(([directory, files]) => ({ title: directory === "." ? "Repository root" : directory, reason: "", files }));
   });
   const nextUnreviewed = createMemo(() => {
-    const files = review.snapshot()?.files ?? [];
+    const snapshot = review.snapshot()?.files ?? [];
+    const byPath = new Map(snapshot.map(file => [file.path, file]));
+    const files = review.grouping.mode() === "intent" && review.grouping.value()
+      ? review.grouping.value()!.flatMap(group => group.paths.flatMap(path => byPath.has(path) ? [byPath.get(path)!] : [])) : snapshot;
     const index = files.findIndex(file => file.path === review.selected());
     return [...files.slice(index + 1), ...files.slice(0, index)].find(file => !review.isReviewed(file));
   });
   onSettled(() => {
-    void review.refresh();
+    loadScope(review.scope());
     return () => {
       review.cancel();
       if (jumpFrame !== undefined) cancelAnimationFrame(jumpFrame);
       window.scrollTo({ top: 0, left: 0, behavior: "instant" });
     };
   });
-  const changeScope = (scope: ReviewScope) => { setNotice(""); setFilter(""); review.setScope(scope); void review.refresh(scope); };
+  /** Resume the selected scope without treating an unchosen base as an error. */
+  function loadScope(scope: ReviewScope) {
+    if (scope === "branch" && !review.base().trim()) review.cancel();
+    else void review.refresh(scope);
+    if (scope === "branch" && !review.branches.value()) void review.branches.refresh();
+  }
+  function changeScope(scope: ReviewScope) {
+    setNotice(""); setFilter(""); review.setScope(scope); loadScope(scope);
+  }
+  function selectBase(value: string) {
+    setManualBase(value === "manual");
+    if (value !== "manual") review.setBase(value);
+  }
   function selectCommit(id: string) { review.setCommit(id); setNotice(""); setFilter(""); void review.refresh("commit", id); }
   async function reloadCommits() {
     const list = await review.history.refresh();
@@ -107,10 +205,23 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     });
   }
   function select(path: string) {
-    review.setSelected(path); setNotice(""); setFilesOpen(false); jumpTo(() => detail);
+    setView("files"); review.setSelected(path); setNotice(""); setFilesOpen(false); jumpTo(() => detail);
   }
-  function toggleFiles() {
-    const opening = !filesOpen(); setFilesOpen(opening); jumpTo(() => opening ? files : detail);
+  /** Shared searchable file list for the desktop sidebar and mobile modal. */
+  function FilePicker() {
+    return <nav id={`review-files-${props.model.id}`} class="review-files" tabindex={-1} aria-label="Changed files">
+            <div class="review-filter"><TextField value={filter()} onChange={value => { setFilter(value); flush(); }}><TextField.Input type="search" aria-label="Filter files" placeholder="Filter files…" /></TextField><Show when={filter()}><Button type="button" onClick={() => setFilter("")} aria-label="Clear filter">×</Button></Show></div>
+            <Show when={visibleFiles().length} fallback={<p class="review-filter-empty">No files match your filter.</p>}>
+              <For each={groups()}>{group => <section>
+                <div class="review-group-heading"><h3>{group.title}</h3><span title="Reviewed / visible files in this group">{group.files.filter(review.isReviewed).length}/{group.files.length}</span></div>
+                <Show when={group.reason}><p class="review-group-reason">{group.reason}</p></Show>
+                <For each={group.files}>{item => <Button type="button" aria-label={`${item.path} — ${item.status}${review.isReviewed(item) ? " — reviewed" : ""}`} aria-pressed={review.selected() === item.path ? "true" : "false"} onClick={() => select(item.path)} title={item.path}>
+                  <span class={`review-file-status status-${item.status}`} aria-hidden="true">{review.isReviewed(item) ? "✓" : item.status === "untracked" ? "?" : item.status[0].toUpperCase()}</span>
+                  <span class="review-file-name">{review.grouping.mode() === "intent" ? item.path : item.path.slice(item.path.lastIndexOf("/") + 1)}</span>
+                </Button>}</For>
+              </section>}</For>
+            </Show>
+          </nav>;
   }
   function compareStructure() {
     const selected = loadedFile(), target = review.target();
@@ -120,36 +231,55 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     const selected = loadedFile(), target = review.target();
     if (selected && target && !review.busy()) void context.expand(selected, target, id, direction);
   }
-  function ask() {
+  function ask(onlySelection = false) {
     const selected = loadedFile(), target = review.target();
-    if (!selected || !target) return;
-    try { props.model.setDraft(reviewDraft(props.model.draft(), selected, target)); props.conversation(); }
+    if (!selected || !target || (onlySelection && !selectedLines().length)) return;
+    try { props.model.setDraft(reviewDraft(props.model.draft(), selected, target, onlySelection ? selectedLines() : undefined)); props.conversation(); }
     catch (error) { setNotice(error instanceof Error ? error.message : "Could not add review context."); }
   }
   return <section class="local-review" aria-label="Local changes" aria-busy={review.busy() ? "true" : "false"}>
     <form class="review-toolbar" onSubmit={event => { event.preventDefault(); setNotice(""); void review.refresh(); }}>
       <div class="review-scopes" role="group" aria-label="Change scope">
         <For each={[["unstaged", "Unstaged"], ["staged", "Staged"], ["branch", "Branch"], ["commit", "Commit"]] as const}>{([scope, label]) =>
-          <button type="button" aria-pressed={review.scope() === scope ? "true" : "false"} title={scopeHelp[scope]} onClick={() => changeScope(scope)}>{label}</button>
+          <Button type="button" aria-pressed={review.scope() === scope ? "true" : "false"} title={scopeHelp[scope]} onClick={() => changeScope(scope)}>{label}</Button>
         }</For>
       </div>
-      <Show when={review.scope() === "branch"}><label class="review-base">Compare against<input value={review.base()} onInput={event => review.setBase(event.currentTarget.value)} placeholder="Local branch or tag, e.g. main" maxlength={256} /></label></Show>
-      <Show when={review.scope() === "commit"}>
-        <label class="review-commit">Commit<select ref={setCommitPicker} disabled={review.history.busy()} onChange={event => selectCommit(event.currentTarget.value)}>
-          <Show when={!review.commit()}><option value="" disabled>{review.history.busy() ? "Loading commits…" : "Choose a commit"}</option></Show>
-          <Show when={review.commit() && !review.history.value()?.commits.some(commit => commit.id === review.commit())}><option value={review.commit()}>{review.commit().slice(0, 10)} — Selected commit</option></Show>
-          <For each={review.history.value()?.commits ?? []}>{commit => <option value={commit.id}>{commit.id.slice(0, 10)} — {commit.subject || "(no subject)"}</option>}</For>
-        </select></label>
-        <button type="button" disabled={review.busy() || review.history.busy()} onClick={() => void reloadCommits()}>Reload commits</button>
+      <Show when={review.scope() === "branch"}>
+        <SelectField class="review-base" label="Compare against" visibleLabel value={branchValue()} change={selectBase}
+          placeholder={review.branches.busy() ? "Loading branches…" : "Choose a base branch"}
+          options={[
+            ...(!manualBase() && review.base() && !review.branches.value()?.branches.some(branch => branch.ref === review.base()) ? [{ value: review.base(), label: `Selected: ${review.base()}` }] : []),
+            ...(review.branches.value()?.branches ?? []).map(branch => ({ value: branch.ref, label: `${branch.name} · ${branch.kind === "local" ? "Local" : "Remote (stored locally)"}` })),
+            { value: "manual", label: "Enter a branch or tag…" },
+          ]} />
+        <Show when={manualBase()}><TextField class="review-base" value={review.base()} onChange={value => { review.setBase(value); flush(); }}><TextField.Label>Branch, tag, or full ref</TextField.Label><TextField.Input placeholder="main, v1.2, refs/remotes/origin/main" maxlength={256} /></TextField></Show>
+        <Button type="button" disabled={review.branches.busy()} onClick={() => void review.branches.refresh()}>Reload branches</Button>
       </Show>
-      <button class="review-refresh" type="submit" disabled={review.busy()}>{review.busy() ? "Loading…" : review.scope() === "branch" ? "Compare" : "Refresh"}</button>
-      <Show when={review.snapshot()?.files.length}><button class="review-files-toggle" type="button" aria-expanded={filesOpen() ? "true" : "false"} aria-controls={`review-files-${props.model.id}`} onClick={toggleFiles}>Files ({review.snapshot()!.files.length})</button></Show>
+      <Show when={review.scope() === "commit"}>
+        <TextField class="review-commit-search" value={commitQuery()} onChange={value => { setCommitQuery(value); flush(); }}><TextField.Label>Find a commit</TextField.Label><TextField.Input type="search" placeholder="Search message or hash" /></TextField>
+        <SelectField class="review-commit" label="Commit" visibleLabel value={review.commit()} change={selectCommit} disabled={review.history.busy()}
+          placeholder={review.history.busy() ? "Loading commits…" : "Choose a commit"}
+          options={[
+            ...(review.commit() && !matchingCommits().some(commit => commit.id === review.commit()) ? [{ value: review.commit(), label: `Selected: ${selectedCommit()?.subject || review.commit().slice(0, 10)}` }] : []),
+            ...matchingCommits().map(commit => ({ value: commit.id, label: `${commit.subject || "(no subject)"} · ${commit.id.slice(0, 10)}` })),
+          ]} />
+        <Button type="button" disabled={review.busy() || review.history.busy()} onClick={() => void reloadCommits()}>Reload commits</Button>
+      </Show>
+      <Button class="review-refresh" type="submit" disabled={review.busy() || (review.scope() === "branch" && !review.base().trim())}>{review.busy() ? "Loading…" : review.scope() === "branch" ? "Compare" : "Refresh"}</Button>
       <span class="review-readonly">Read-only</span>
     </form>
-    <p class="review-help">{scopeHelp[review.scope()]} <span>{review.scope() === "commit" ? "Reload commits after new commits." : "Refresh after edits."}</span></p>
+    <Show when={review.scope() === "branch"}>
+      <p class="review-help">Committed changes since divergence; excludes uncommitted edits. Remote refs may be stale (no fetch).</p>
+      <Show when={review.snapshot() && (review.target()?.scope !== "branch" || review.target()?.base !== review.base().trim())}><p class="review-help" role="status">Comparison not applied. The files below still show the previous snapshot.</p></Show>
+      <Show when={review.branches.error()}><p class="review-warning" role="alert">{review.branches.error()} You can still enter a branch or tag.</p></Show>
+      <Show when={review.branches.value()?.truncated}><p class="review-help">Some branches are omitted (up to 100 shown). You can enter a supported full ref manually.</p></Show>
+      <Show when={review.branches.value()?.branches.length === 0 && !review.branches.busy()}><p class="review-help">No local or stored remote branches found. Enter a known tag or reference to compare.</p></Show>
+    </Show>
     <Show when={review.scope() === "commit"}>
       <Show when={review.history.error()}><p class="review-warning" role="alert">{review.history.error()}</p></Show>
-      <Show when={review.history.value()?.truncated}><p class="review-help">Showing the 100 most recent commits reachable from local HEAD.</p></Show>
+      <Show when={review.history.value()?.truncated}><p class="review-help">Showing the 100 most recent commits.</p></Show>
+      <Show when={commitQuery().trim() && !matchingCommits().length && !review.history.busy()}><p class="review-help" role="status">No matching commits.</p></Show>
+      <Show when={review.commit()}><p class="review-commit-context"><strong>{selectedCommit()?.subject || "Selected commit"}</strong><code>{review.commit()}</code></p></Show>
       <Show when={review.history.value()?.commits.length === 0 && !review.history.busy()}><p class="review-empty" role="status">No commits in local HEAD history. Reload commits after creating a commit.</p></Show>
     </Show>
     <Show when={review.error()}><p class="review-warning" role="alert">{review.error()}<Show when={review.snapshot()}> Showing the previous snapshot.</Show></p></Show>
@@ -158,68 +288,101 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     <Show when={review.busy() && !review.snapshot()}><p class="review-empty" role="status">Loading local changes…</p></Show>
     <Show when={review.snapshot()}>{snapshot => <>
       <div class="review-summary" role="status">
-        <span>{snapshot().files.filter(review.isReviewed).length} / {snapshot().files.length} files reviewed</span>
+        <span class="review-progress"><Show when={snapshot().files.length}><ProgressBar label="Review progress" max={snapshot().files.length} value={snapshot().files.filter(review.isReviewed).length} /></Show><span>{snapshot().files.filter(review.isReviewed).length} / {snapshot().files.length} files reviewed</span></span>
+        <Show when={snapshot().lineStats} fallback={<span>Line totals unavailable</span>}>{stats => <span class="review-line-stats" role="group" aria-label="Line changes" title="Totals for this scope, including files omitted by display limits. Refresh after edits.">
+          <span>{(stats().added + stats().removed).toLocaleString()} lines changed</span>
+          <span class="review-added">+{stats().added.toLocaleString()} added</span>
+          <span class="review-removed">−{stats().removed.toLocaleString()} deleted</span>
+          <Show when={stats().unavailableFiles}><span>{stats().unavailableFiles.toLocaleString()} files without line counts (binary or untracked)</span></Show>
+        </span>}</Show>
         <span>Snapshot: {review.target()?.scope}{review.target()?.commit ? ` ${review.target()?.commit?.slice(0, 10)} · first parent` : review.target()?.base ? ` against ${review.target()?.base}` : ""}</span>
       </div>
       <Show when={snapshot().truncated}><p class="review-warning">{snapshot().note ?? "Some changes were omitted by review limits."}</p></Show>
-      <Show when={snapshot().files.length} fallback={<p class="review-empty">No changes in this scope. Choose another scope or refresh after editing.</p>}>
-        <div class="review-layout">
-          <nav ref={files} id={`review-files-${props.model.id}`} class={`review-files${filesOpen() ? "" : " review-files-collapsed"}`} tabindex={-1} aria-label="Changed files">
-            <div class="review-filter"><input type="search" aria-label="Filter files" placeholder="Filter files…" value={filter()} onInput={event => setFilter(event.currentTarget.value)} /><Show when={filter()}><button type="button" onClick={() => setFilter("")} aria-label="Clear filter">×</button></Show></div>
+      <Show when={snapshot().files.length} fallback={<p class="review-empty">No changes in this scope.</p>}>
+        <div class="review-view-switch" role="group" aria-label="Review view">
+          <Button type="button" aria-pressed={view() === "overview" ? "true" : "false"} onClick={() => setView("overview")}>Overview</Button>
+          <Button type="button" aria-pressed={view() === "files" ? "true" : "false"} onClick={() => setView("files")}>Files</Button>
+        </div>
+        <section class="review-organize" aria-label="Organize changed files">
+          <div class="review-organize-heading">
+            <h2>Review by purpose</h2>
             <div class="review-group-controls">
-              <button type="button" disabled={review.busy() || review.grouping.busy()} title="Send file names and bounded diff snippets to your current Pi model in a separate tool-disabled session. Provider charges may apply." onClick={() => void review.groupWithAI()}>{review.grouping.busy() ? "Grouping…" : review.grouping.value() ? "Regroup with AI" : "Group with AI"}</button>
-              <Show when={review.grouping.busy()}><button type="button" onClick={review.grouping.cancel}>Cancel grouping</button></Show>
               <Show when={review.grouping.value()}><div class="review-engines" role="group" aria-label="File grouping">
-                <button type="button" aria-pressed={review.grouping.mode() === "folders" ? "true" : "false"} onClick={() => review.grouping.setMode("folders")}>Folders</button>
-                <button type="button" aria-pressed={review.grouping.mode() === "intent" ? "true" : "false"} onClick={() => review.grouping.setMode("intent")}>AI intent</button>
+                <Button type="button" aria-pressed={review.grouping.mode() === "folders" ? "true" : "false"} onClick={() => review.grouping.setMode("folders")}>Folders</Button>
+                <Button type="button" aria-pressed={review.grouping.mode() === "intent" ? "true" : "false"} onClick={() => review.grouping.setMode("intent")}>By purpose</Button>
               </div></Show>
+              <Button class="review-group-action" type="button" disabled={review.busy() || review.grouping.busy()} onClick={() => void review.groupWithAI()}>{review.grouping.busy() ? "Grouping…" : review.grouping.stale() ? "Update groups with AI" : review.grouping.value() ? "Reuse / check groups" : "Group with AI"}</Button>
+              <Show when={review.grouping.busy()}><Button type="button" onClick={review.grouping.cancel}>Cancel grouping</Button></Show>
             </div>
-            <p class="review-group-note">{review.grouping.notice() || "Optional: sends names and diff snippets to your current Pi model. Provider charges may apply."}</p>
-            <Show when={visibleFiles().length} fallback={<p class="review-filter-empty">No files match your filter.</p>}>
-              <For each={groups()}>{group => <section>
-                <h3>{group.title}</h3>
-                <Show when={group.reason}><p class="review-group-reason">{group.reason}</p></Show>
-                <For each={group.files}>{item => <button type="button" aria-label={`${item.path} — ${item.status}${review.isReviewed(item) ? " — reviewed" : ""}`} aria-pressed={review.selected() === item.path ? "true" : "false"} onClick={() => select(item.path)} title={item.path}>
-                  <span class={`review-file-status status-${item.status}`} aria-hidden="true">{review.isReviewed(item) ? "✓" : item.status === "untracked" ? "?" : item.status[0].toUpperCase()}</span>
-                  <span class="review-file-name">{review.grouping.mode() === "intent" ? item.path : item.path.slice(item.path.lastIndexOf("/") + 1)}</span>
-                </button>}</For>
-              </section>}</For>
-            </Show>
-          </nav>
+          </div>
+          <Show when={review.grouping.value()}><Button type="button" disabled={review.busy() || review.grouping.busy()} onClick={() => void review.groupWithAI(true)}>Regenerate (ignore saved result)</Button></Show>
+          <Show when={review.grouping.usage().calls || review.grouping.usage().reused}>
+            <p class="review-group-status" aria-label="Grouping usage">{groupingUsageLabel(review.grouping.usage())}</p>
+          </Show>
+          <div role="status" aria-live="polite"><Show when={review.grouping.progress() || review.grouping.notice()}><p class="review-group-status">{review.grouping.progress() || review.grouping.notice()}</p></Show></div>
+        </section>
+        <Show when={view() === "overview"}>
+          <ReviewOverview files={snapshot().files} groups={review.grouping.value()} reviewed={review.isReviewed} open={path => { setFilter(""); select(path); }} startGroup={paths => {
+            const unreviewed = new Set(snapshot().files.filter(file => !review.isReviewed(file)).map(file => file.path));
+            const first = paths.find(path => unreviewed.has(path)) ?? paths[0];
+            if (first) { review.grouping.setMode("intent"); setFilter(""); select(first); }
+          }} />
+        </Show>
+        <Show when={view() === "files"}>
+        <div class="review-layout">
+          <Show when={!filesOpen()} fallback={
+            <ActionDialog title="Changed files" description="Choose a file to review." class="review-files-modal" hideHeading close={() => setFilesOpen(false)}>
+              <div class="review-picker-header"><h2 aria-hidden="true">Changed files</h2><Button type="button" aria-label="Close file picker" onClick={() => setFilesOpen(false)}>Close</Button></div>
+              <FilePicker />
+            </ActionDialog>
+          }><div class="review-desktop-files"><FilePicker /></div></Show>
           <Show when={file()}>{selected => <article ref={detail} class="review-detail" tabindex={-1} aria-label={`Diff for ${selected().path}`}>
             <header class="review-file-header">
-              <div class="review-file-title"><h2>{selected().path}</h2><Show when={selected().previousPath}><p>Renamed from {selected().previousPath}</p></Show>
+              <div class="review-file-title"><div class="review-file-heading"><h2 aria-label={selected().path} title={selected().path}><span class="review-path-directory">{selected().path.slice(0, selected().path.lastIndexOf("/") + 1)}</span><span class="review-path-basename">{selected().path.slice(selected().path.lastIndexOf("/") + 1)}</span></h2><Checkbox disabled={!loadedFile() || review.busy()} class="review-reviewed" title={review.isReviewed(selected()) ? "Mark file as unreviewed" : "Mark file as reviewed"} checked={review.isReviewed(selected())} onChange={checked => review.mark(selected(), checked)}>
+                  <Checkbox.Input /><Checkbox.Control class="checkbox-control"><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control><Checkbox.Label class="review-action-label">Reviewed</Checkbox.Label>
+                </Checkbox></div><Show when={selected().previousPath}><p>Renamed from {selected().previousPath}</p></Show>
                 <div class="review-file-meta"><span>{selected().status}</span><span title="Syntax colors use available hunk context">{diff().label}</span><Show when={counts().added || counts().removed}><span class="review-added" aria-label={`${counts().added} added lines`}>+{counts().added}</span><span class="review-removed" aria-label={`${counts().removed} removed lines`}>−{counts().removed}</span></Show></div>
               </div>
               <div class="review-file-actions">
                 <div class="review-engines" role="group" aria-label="Diff mode">
-                  <button type="button" aria-pressed={structural.mode() === "text" ? "true" : "false"} onClick={structural.reset}>Text</button>
-                  <button type="button" aria-pressed={structural.mode() === "structural" ? "true" : "false"} disabled={!loadedFile() || review.busy() || structural.busy()} title="Compare syntax for this file on demand. Requires Difftastic 0.72.0." onClick={compareStructure}>Structural</button>
+                  <Button class="review-icon-action" type="button" title="Text diff — compare changed lines" aria-pressed={structural.mode() === "text" ? "true" : "false"} onClick={structural.reset}><Icon name="code" /><span class="review-action-label">Text</span></Button>
+                  <Button class="review-icon-action" type="button" aria-pressed={structural.mode() === "structural" ? "true" : "false"} disabled={!loadedFile() || review.busy() || structural.busy()} title="Structural diff — compare syntax. Requires Difftastic 0.72.0." onClick={compareStructure}><Icon name="structure" /><span class="review-action-label">Structural</span></Button>
                 </div>
-                <Checkbox disabled={!loadedFile() || review.busy()} class="review-reviewed" title="Kept for this page session; resets when the patch changes" checked={review.isReviewed(selected())} onChange={checked => review.mark(selected(), checked)}>
-                  <Checkbox.Input /><Checkbox.Control class="checkbox-control"><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control><Checkbox.Label>Reviewed</Checkbox.Label>
-                </Checkbox>
-                <button type="button" disabled={!nextUnreviewed()} onClick={() => { const next = nextUnreviewed(); if (next) { setFilter(""); select(next.path); } }}>Next unreviewed</button>
-                <button class="review-ask" type="button" disabled={!loadedFile() || review.busy()} title="Add this diff to your draft. Nothing is sent automatically." onClick={ask}>Ask Pi</button>
+                <Button class="review-files-toggle review-icon-action" type="button" aria-expanded={filesOpen() ? "true" : "false"} aria-controls={`review-files-${props.model.id}`} aria-haspopup="dialog" title={`Choose file (${snapshot().files.length} changed)`} onClick={() => setFilesOpen(true)}><Icon name="folder" /><span class="review-action-label">Files ({snapshot().files.length})</span></Button>
+                <Button class="review-icon-action" type="button" title="Next unreviewed" disabled={!nextUnreviewed()} onClick={() => { const next = nextUnreviewed(); if (next) { setFilter(""); select(next.path); } }}><Icon name="next" /><span class="review-action-label">Next unreviewed</span></Button>
+                <Button class="review-ask review-icon-action" type="button" disabled={!loadedFile() || review.busy()} title="Ask Pi about file — add this diff to your draft. Nothing is sent automatically." onClick={() => ask()}><Icon name="chat" /><span class="review-action-label">Ask Pi about file</span></Button>
               </div>
             </header>
             <Show when={review.patchBusy()}><p class="review-empty" role="status">Loading patch…</p></Show>
-            <Show when={review.patchError()}><p class="review-warning" role="alert">{review.patchError()} <button type="button" onClick={() => void review.loadPatch()}>Retry patch</button></p></Show>
+            <Show when={review.patchError()}><p class="review-warning" role="alert">{review.patchError()} <Button type="button" onClick={() => void review.loadPatch()}>Retry patch</Button></p></Show>
             <Show when={loadedFile()}>
             <Show when={structural.busy()}><p class="review-structural-note" role="status">Comparing syntax… Text diff remains available.</p></Show>
             <Show when={structural.reason()}><p class="review-warning" role="status">{structural.reason()} Showing text diff.</p></Show>
             <Show when={!structural.result() && context.error()}><p class="review-warning" role="alert">{context.error()}</p></Show>
-            <Show when={structural.result()} fallback={<div class="review-diff" tabindex={0} role="region" aria-label="Unified diff" aria-busy={context.busy() ? "true" : "false"}>
+            <Show when={structural.result()} fallback={<div class="review-diff" tabindex={0} role="region" aria-label="Unified diff" aria-busy={context.busy() ? "true" : "false"} onKeyDown={dismissFloating}>
               <ReviewRows rows={diff().rows} identity={`${review.target()?.scope}:${selected().path}:${selected().fingerprint}`} jump={() => jumpTo(() => detail)}>{row => row.kind === "gap" ? <div class="diff-line diff-hunk review-context">
                 <div class="review-context-gutter">
-                  <For each={(["below", "above"] as const).filter(direction => row.gap[direction])}>{direction => <button type="button" class={`review-expand review-expand-${direction}`} aria-label={`Expand ${Math.min(20, row.gap.remaining ?? 20)} lines ${direction}`} title={`Expand ${Math.min(20, row.gap.remaining ?? 20)} lines ${direction}`} disabled={context.busy() || review.busy()} onClick={() => expandContext(row.gap.id, direction)}>
+                  <For each={(["below", "above"] as const).filter(direction => row.gap[direction])}>{direction => <Button type="button" class={`review-expand review-expand-${direction}`} aria-label={`Expand ${Math.min(20, row.gap.remaining ?? 20)} lines ${direction}`} title={`Expand ${Math.min(20, row.gap.remaining ?? 20)} lines ${direction}`} disabled={context.busy() || review.busy()} onClick={() => expandContext(row.gap.id, direction)}>
                     <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 2h12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray=".1 3" /><path d="M7 5h2v5h3l-4 4-4-4h3z" fill="currentColor" /></svg>
-                  </button>}</For>
+                  </Button>}</For>
                 </div>
                 <Show when={row.header} fallback={<span class="review-context-label">More context</span>}>{header => <code>{header()}</code>}</Show>
-              </div> : <div class={`diff-line diff-${row.line.kind}${row.line.kind === "header" && row.line.text.startsWith("@@") ? " diff-hunk" : ""}`}><span class="diff-number" aria-hidden="true">{row.line.old ?? ""}</span><span class="diff-number" aria-hidden="true">{row.line.next ?? ""}</span><code><Show when={row.line.tokens} fallback={(row.line.kind === "header" ? row.line.text : row.line.text.slice(1)) || " "}>{tokens => <For each={tokens()} fallback={" "}>{token => <span class={token.className}>{token.text}</span>}</For>}</Show></code></div>}</ReviewRows>
+              </div> : <div class={`diff-line diff-${row.line.kind}${row.line.kind === "header" && row.line.text.startsWith("@@") ? " diff-hunk" : ""}${row.line.kind !== "header" && isSelected(row.line) ? " diff-selected" : ""}`} onPointerEnter={event => dragOver(event, row.line)}>
+                <Show when={row.line.kind !== "header"} fallback={<><span class="diff-number" /><span class="diff-number" /></>}>
+                  <Button type="button" class="diff-select" disabled={review.busy()} title={extending() ? "Choose the end of your selection" : "Select a line; drag or Shift-click for a range"} aria-label={`Select ${[row.line.old !== undefined ? `old line ${row.line.old}` : "", row.line.next !== undefined ? `new line ${row.line.next}` : ""].filter(Boolean).join(", ")}`} aria-pressed={isSelected(row.line) ? "true" : "false"}
+                    onPointerDown={event => startDrag(event, row.line)} onClick={event => { if (!suppressClick || event.detail === 0) selectLine(row.line, event.shiftKey || extending()); suppressClick = false; }}>
+                    <span class="diff-number" aria-hidden="true">{row.line.old ?? ""}</span><span class="diff-number" aria-hidden="true">{row.line.next ?? ""}</span>
+                  </Button>
+                </Show><code><Show when={row.line.tokens} fallback={(row.line.kind === "header" ? row.line.text : row.line.text.slice(1)) || " "}>{tokens => <For each={tokens()} fallback={" "}>{token => <span class={token.className}>{token.text}</span>}</For>}</Show></code>
+                <Show when={floatingLine() === row.line}><div class="review-floating-actions" role="group" aria-label="Selected lines actions">
+                  <Button class="review-floating-ask" type="button" aria-label="Ask Pi about selected lines" title="Add selected lines to your draft." onClick={() => ask(true)}><Icon name="reply" />Ask Pi <span aria-hidden="true">· {selectedLines().length} {selectedLines().length === 1 ? "line" : "lines"}</span></Button>
+                  <Button type="button" aria-pressed={extending() ? "true" : "false"} onClick={() => setExtending(!extending())}>Choose end line</Button>
+                  <Button type="button" onClick={clearSelection}>Clear selection</Button>
+                  <Button class="review-floating-dismiss" type="button" aria-label="Dismiss selection actions" title="Dismiss (Escape)" onClick={dismissFloating}><Icon name="close" /></Button>
+                </div></Show>
+              </div>}</ReviewRows>
             </div>}>{comparison => <>
-              <p class="review-structural-note">{comparison().engine} · {comparison().language} · Changed syntax is emphasized. Text mode includes formatting changes.</p>
+              <p class="review-structural-note">{comparison().engine} · {comparison().language}</p>
               <Show when={fragmented()}><p class="review-structural-note">Very fragmented lines are shown without syntax emphasis to keep rendering responsive.</p></Show>
               <div class="review-diff" tabindex={0} role="region" aria-label="Structural diff">
                 <Show when={comparison().lines.length} fallback={<p class="review-empty">No structural changes detected. Check Text mode for formatting or metadata changes.</p>}>
@@ -230,6 +393,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
             </Show>
           </article>}</Show>
         </div>
+        </Show>
       </Show>
     </>}</Show>
   </section>;

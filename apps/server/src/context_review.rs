@@ -87,6 +87,7 @@ pub(crate) async fn review(
         &crate::local_review::Request {
             scope: request.scope,
             path: None,
+            cursor: None,
             base: request.base.clone(),
             commit: request.commit.clone(),
         },

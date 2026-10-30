@@ -86,9 +86,9 @@ test("footer opens an accessible popover with usage bars, remaining quota and re
   const dialog = screen.getByRole("dialog", { name: "Codex usage" });
   expect(trigger.getAttribute("aria-expanded")).toBe("true");
   expect(dialog.textContent).not.toContain("Your subscription usage limits.");
-  const shortBar = within(dialog).getByRole("progressbar", { name: "5h usage" }) as HTMLProgressElement;
-  const weekBar = within(dialog).getByRole("progressbar", { name: "Weekly usage" }) as HTMLProgressElement;
-  expect(shortBar.value).toBe(72); expect(shortBar.max).toBe(100); expect(weekBar.value).toBe(84);
+  const shortBar = within(dialog).getByRole("progressbar", { name: "5h usage" });
+  const weekBar = within(dialog).getByRole("progressbar", { name: "Weekly usage" });
+  expect(shortBar.getAttribute("aria-valuenow")).toBe("72"); expect(shortBar.getAttribute("aria-valuemax")).toBe("100"); expect(weekBar.getAttribute("aria-valuenow")).toBe("84");
   expect(dialog.textContent).toContain("28% remaining"); expect(dialog.textContent).toContain("16% remaining");
   expect(dialog.textContent).toContain("Resets in 1 hour"); expect(dialog.textContent).toContain("Resets in 2 days, 3 hours");
   fireEvent.click(within(dialog).getByRole("button", { name: "Refresh usage" })); expect(sent).toHaveLength(3);
@@ -114,7 +114,7 @@ test.each([
   const view = render(() => <CodexUsageFooter model={model} />); flush();
   fireEvent.click(view.getByRole("button", { name: /View Codex usage/ })); flush();
   expect(screen.getByRole("dialog").textContent).toContain(expected);
-  expect((screen.getByRole("progressbar") as HTMLProgressElement).value).toBe(72);
+  expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("72");
 });
 test("open countdown ticks without fetching, and a passed deadline never fabricates unused quota", async () => {
   vi.useFakeTimers(); vi.setSystemTime(1800000000 * 1000);
@@ -125,7 +125,7 @@ test("open countdown ticks without fetching, and a passed deadline never fabrica
   await vi.advanceTimersByTimeAsync(60_000); flush();
   expect(screen.getByRole("dialog").textContent).toContain("Reset pending");
   expect(screen.getByRole("dialog").textContent).toContain("Refresh to confirm");
-  expect((screen.getByRole("progressbar") as HTMLProgressElement).value).toBe(72);
+  expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("72");
   expect(sent).toHaveLength(2);
   view.unmount(); expect(vi.getTimerCount()).toBe(0);
 });

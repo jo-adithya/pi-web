@@ -141,6 +141,87 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn line_totals_cover_the_scope_without_loading_patches() {
+    let f = Fixture::new().await;
+    f.init();
+    fs::write(f.root.join("binary"), b"old\0binary").unwrap();
+    f.git(&["add", "binary"]);
+    f.git(&["commit", "-qm", "binary"]);
+    fs::write(f.root.join("binary"), b"new\0binary").unwrap();
+    fs::write(f.root.join("file.txt"), "after\nextra\n").unwrap();
+    fs::write(f.root.join("untracked"), "not counted\n").unwrap();
+    let (status, body) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lineStats"], serde_json::json!({"added":2,"removed":1,"unavailableFiles":2}));
+    assert!(body["files"].as_array().unwrap().iter().all(|file| file["patch"].is_null()));
+    let (_, staged) = f.request(r#"{"scope":"staged"}"#, true, true).await;
+    assert_eq!(staged["lineStats"], serde_json::json!({"added":0,"removed":0,"unavailableFiles":0}));
+    let (_, selected) = f.request(r#"{"scope":"unstaged","path":"file.txt"}"#, true, true).await;
+    assert!(selected.get("lineStats").is_none());
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn line_totals_include_renames_large_patches_and_files_beyond_display_limits() {
+    let f = Fixture::new().await;
+    f.init();
+    f.git(&["branch", "base"]);
+    f.git(&["mv", "file.txt", "renamed\tfile\n.txt"]);
+    for index in 0..105 {
+        let name = if index == 0 { "tab\tline\n0".into() } else { format!("new-{index}") };
+        fs::write(f.root.join(name), "new\n").unwrap();
+    }
+    fs::write(f.root.join("large"), "line\n".repeat(40_000)).unwrap();
+    f.git(&["add", "."]);
+    let (status, staged) = f.request(r#"{"scope":"staged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    assert_eq!(staged["files"].as_array().unwrap().len(), 100);
+    assert_eq!(staged["truncated"], false);
+    assert!(staged["nextCursor"].is_string());
+    let expected = serde_json::json!({"added":40105,"removed":0,"unavailableFiles":0});
+    assert_eq!(staged["lineStats"], expected);
+    let (_, selected) = f.request(r#"{"scope":"staged","path":"large"}"#, true, true).await;
+    assert_eq!(selected["files"][0]["patch"], "Patch exceeds 64 KiB; content omitted.\n");
+    f.git(&["commit", "-qm", "changes"]);
+    let (_, branch) = f.request(r#"{"scope":"branch","base":"base"}"#, true, true).await;
+    assert_eq!(branch["lineStats"], expected);
+    let (_, commit) = f.request(&format!(r#"{{"scope":"commit","commit":"{}"}}"#, f.oid("HEAD")), true, true).await;
+    assert_eq!(commit["lineStats"], expected);
+    let (_, root) = f.request(&format!(r#"{{"scope":"commit","commit":"{}"}}"#, f.oid("base")), true, true).await;
+    assert_eq!(root["lineStats"], serde_json::json!({"added":2,"removed":0,"unavailableFiles":0}));
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn line_totals_support_long_thousand_file_listings() {
+    let f = Fixture::new().await;
+    f.init();
+    // Both listings and statistics can exceed the former 256 KiB budget.
+    for index in 0..1100 {
+        fs::write(f.root.join(format!("n{index:04}-{}", "x".repeat(229))), "new\n").unwrap();
+    }
+    let (status, untracked) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{untracked}");
+    assert_eq!(untracked["lineStats"], serde_json::json!({"added":0,"removed":0,"unavailableFiles":1100}));
+    let (status, next) = f.request(
+        &serde_json::json!({"scope":"unstaged","cursor":untracked["nextCursor"]}).to_string(),
+        true,
+        true,
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["files"].as_array().unwrap().len(), 100);
+    assert_eq!(next["truncated"], true);
+    assert!(next.get("lineStats").is_none());
+    assert!(next.get("snapshotKey").is_none());
+    f.git(&["add", "."]);
+    let (status, staged) = f.request(r#"{"scope":"staged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    assert_eq!(staged["files"].as_array().unwrap().len(), 100);
+    assert_eq!(staged["lineStats"], serde_json::json!({"added":1100,"removed":0,"unavailableFiles":0}));
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn reviews_stopped_session_workspace() {
     let f = Fixture::new().await;
     f.init();
@@ -435,8 +516,9 @@ async fn file_count_limit_and_untracked_symlink_are_explicit() {
     let (status, body) = f.request(r#"{"scope":"staged"}"#, true, true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["files"].as_array().unwrap().len(), 100);
-    assert_eq!(body["truncated"], true);
-    assert!(body["note"].is_string());
+    assert_eq!(body["truncated"], false);
+    assert!(body["note"].is_null());
+    assert!(body["nextCursor"].is_string());
     let (status, selected) = f
         .request(r#"{"scope":"staged","path":"new-99"}"#, true, true)
         .await;
@@ -1118,4 +1200,404 @@ async fn commit_history_bounds_pathological_messages_and_accepts_sha256() {
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(result["error"], "Git output exceeds review limit");
+}
+
+impl Fixture {
+    async fn branches(
+        &self,
+        session: &str,
+        body: &str,
+        proof: bool,
+        origin: &str,
+        content_type: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("/review/{session}/branches"))
+            .header("host", "127.0.0.1:9876")
+            .header("origin", origin)
+            .header("content-type", content_type);
+        if proof {
+            request = request.header("x-pi-capability", "a".repeat(64));
+        }
+        let response = self
+            .router
+            .clone()
+            .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+}
+
+#[tokio::test]
+async fn branches_list_local_and_remote_refs_without_symbolic_aliases_or_tags() {
+    let f = Fixture::new().await;
+    f.init();
+    f.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    f.git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    f.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/main"]);
+    f.git(&["tag", "release"]);
+    let (status, result) = f
+        .branches(
+            &f.session,
+            "{}",
+            true,
+            "http://127.0.0.1:9876",
+            "application/json",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result,
+        serde_json::json!({"branches":[
+        {"ref":"refs/heads/main", "name":"main", "kind":"local"},
+        {"ref":"refs/remotes/origin/main", "name":"origin/main", "kind":"remote"}
+    ],"truncated":false})
+    );
+    fs::write(f.root.join("file.txt"), "remote base change\n").unwrap();
+    f.git(&["commit", "-qam", "advance"]);
+    let (status, review) = f
+        .loaded(
+            &serde_json::json!({"scope":"branch", "base":result["branches"][1]["ref"]}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert!(
+        review["files"][0]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+remote base change")
+    );
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn branches_empty_unborn_and_entry_limit() {
+    let f = Fixture::new().await;
+    let origin = "http://127.0.0.1:9876";
+    let json = "application/json";
+    assert_eq!(
+        f.branches(&f.session, "{}", true, origin, json).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    f.git(&["init", "-q", "-b", "main"]);
+    let (status, empty) = f.branches(&f.session, "{}", true, origin, json).await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert_eq!(empty, serde_json::json!({"branches":[],"truncated":false}));
+    f.init();
+    for n in 0..99 {
+        f.git(&["branch", &format!("choice-{n:03}")]);
+    }
+    let (status, full) = f.branches(&f.session, "{}", true, origin, json).await;
+    assert_eq!(status, StatusCode::OK, "{full}");
+    assert_eq!(full["branches"].as_array().unwrap().len(), 100);
+    assert_eq!(full["truncated"], false);
+    f.git(&["symbolic-ref", "refs/heads/aaa-alias", "refs/heads/main"]);
+    f.git(&["branch", "extra"]);
+    let (status, limited) = f.branches(&f.session, "{}", true, origin, json).await;
+    assert_eq!(status, StatusCode::OK, "{limited}");
+    assert_eq!(limited["branches"].as_array().unwrap().len(), 100);
+    assert_eq!(limited["truncated"], true);
+    assert_eq!(limited["branches"][0]["name"], "choice-000");
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn branches_bound_json_bytes_for_escaped_names() {
+    let f = Fixture::new().await;
+    f.init();
+    for n in 0..100 {
+        f.git(&["branch", &format!("{}{:03}", "\"".repeat(242), n)]);
+    }
+    let (status, result) = f
+        .branches(&f.session, "{}", true, "http://127.0.0.1:9876", "application/json")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 64 * 1024);
+    assert_eq!(result["truncated"], true);
+    assert!((2..100).contains(&result["branches"].as_array().unwrap().len()));
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn branches_enforce_browser_and_request_boundaries() {
+    let f = Fixture::new().await;
+    f.init();
+    let origin = "http://127.0.0.1:9876";
+    let json = "application/json";
+    assert_eq!(
+        f.branches(&f.session, "{}", false, origin, json).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        f.branches(&f.session, "{}", true, "http://evil.invalid", json)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.branches(&f.session, "{}", true, origin, "text/plain")
+            .await
+            .0,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    for body in [r#"{"unknown":1}"#, "null", "[]", ""] {
+        assert_eq!(
+            f.branches(&f.session, body, true, origin, json).await.0,
+            StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    assert_eq!(
+        f.branches(&f.session, &" ".repeat(2049), true, origin, json)
+            .await
+            .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        f.branches("missing", "{}", true, origin, json).await.0,
+        StatusCode::NOT_FOUND
+    );
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn branches_only_offer_refs_accepted_by_branch_review() {
+    let f = Fixture::new().await;
+    f.init();
+    // Git accepts these names, while branch review intentionally rejects them.
+    f.git(&["branch", "name@host"]);
+    f.git(&["branch", "unicode\u{2003}space"]);
+    f.git(&["branch", &format!("{}/{}", "a".repeat(200), "b".repeat(50))]);
+    let (status, result) = f
+        .branches(
+            &f.session,
+            "{}",
+            true,
+            "http://127.0.0.1:9876",
+            "application/json",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result["branches"],
+        serde_json::json!([
+            {"ref":"refs/heads/main", "name":"main", "kind":"local"}
+        ])
+    );
+    assert_eq!(result["truncated"], true);
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn thousand_file_review_pages_each_file_once_and_loads_last_patch() {
+    let f = Fixture::new().await;
+    f.init();
+    for index in 0..1000 {
+        fs::write(f.root.join(format!("page-{index:04}")), "new\n").unwrap();
+    }
+    f.git(&["add", "."]);
+    let mut request = serde_json::json!({"scope":"staged"});
+    let mut paths = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let (status, body) = f.request(&request.to_string(), true, true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["truncated"], false);
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files.len(), 100);
+        assert!(serde_json::to_vec(&body).unwrap().len() <= 1024 * 1024);
+        for file in files {
+            assert!(file["patch"].is_null());
+            assert!(paths.insert(file["path"].as_str().unwrap().to_owned()));
+        }
+        if pages == 0 {
+            assert_eq!(body["lineStats"]["added"], 1000);
+        } else {
+            assert!(body.get("lineStats").is_none());
+        }
+        pages += 1;
+        if let Some(cursor) = body.get("nextCursor") {
+            request["cursor"] = cursor.clone();
+        } else {
+            break;
+        }
+        assert!(pages < 11);
+    }
+    assert_eq!(pages, 10);
+    assert_eq!(paths.len(), 1000);
+    let (status, selected) = f.request(r#"{"scope":"staged","path":"page-0999"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{selected}");
+    assert!(selected["files"][0]["patch"].as_str().unwrap().contains("+new"));
+    assert!(selected.get("nextCursor").is_none());
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_cursors_reject_invalid_changed_and_cross_scope_listings() {
+    let f = Fixture::new().await;
+    f.init();
+    f.git(&["branch", "base"]);
+    for index in 0..101 {
+        fs::write(f.root.join(format!("page-{index:04}")), "old\n").unwrap();
+    }
+    f.git(&["add", "."]);
+    let (_, first) = f.request(r#"{"scope":"staged"}"#, true, true).await;
+    let cursor = first["nextCursor"].as_str().unwrap();
+    for request in [
+        serde_json::json!({"scope":"staged","cursor":"garbage"}),
+        serde_json::json!({"scope":"staged","cursor":"0:0000000000000000"}),
+        serde_json::json!({"scope":"staged","cursor":format!("101:{}", cursor.split_once(':').unwrap().1)}),
+        serde_json::json!({"scope":"staged","cursor":cursor,"path":"page-0100"}),
+        serde_json::json!({"scope":"unstaged","cursor":cursor}),
+    ] {
+        let (status, _) = f.request(&request.to_string(), true, true).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{request}");
+    }
+    fs::write(f.root.join("another"), "new\n").unwrap();
+    f.git(&["add", "another"]);
+    let (status, _) = f.request(&serde_json::json!({"scope":"staged","cursor":cursor}).to_string(), true, true).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    f.git(&["commit", "-qm", "changes"]);
+    let commit = f.oid("HEAD");
+    for mut request in [
+        serde_json::json!({"scope":"branch","base":"base"}),
+        serde_json::json!({"scope":"commit","commit":commit}),
+    ] {
+        let (status, first) = f.request(&request.to_string(), true, true).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        request["cursor"] = first["nextCursor"].clone();
+        let (status, second) = f.request(&request.to_string(), true, true).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["files"].as_array().unwrap().len(), 2);
+        assert!(second.get("nextCursor").is_none());
+        if request["scope"] == "branch" {
+            // Empty commits preserve name-status output but change the resolved HEAD.
+            f.git(&["commit", "--allow-empty", "-qm", "new tip"]);
+            let (status, _) = f.request(&request.to_string(), true, true).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            request.as_object_mut().unwrap().remove("cursor");
+            let (_, first) = f.request(&request.to_string(), true, true).await;
+            request["cursor"] = first["nextCursor"].clone();
+            // Moving base on its own branch preserves the merge base and listing.
+            f.git(&["checkout", "-q", "base"]);
+            f.git(&["commit", "--allow-empty", "-qm", "new base tip"]);
+            f.git(&["checkout", "-q", "main"]);
+            let (status, _) = f.request(&request.to_string(), true, true).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+    for index in 0..101 {
+        fs::write(f.root.join(format!("page-{index:04}")), "new\n").unwrap();
+    }
+    let (_, first) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    let request = serde_json::json!({"scope":"unstaged","cursor":first["nextCursor"]});
+    let (status, second) = f.request(&request.to_string(), true, true).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["files"].as_array().unwrap().len(), 1);
+    assert_eq!(second["truncated"], false);
+    assert!(second.get("nextCursor").is_none());
+    fs::write(f.root.join("untracked"), "omitted\n").unwrap();
+    let (status, _) = f.request(&request.to_string(), true, true).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_keys_track_content_not_names_or_line_counts() {
+    let f = Fixture::new().await;
+    f.init();
+    fs::write(f.root.join("file.txt"), "first edit\n").unwrap();
+    let (status, first) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let key = first["snapshotKey"].as_str().unwrap();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+    let (_, unchanged) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(first["snapshotKey"], unchanged["snapshotKey"]);
+    fs::write(f.root.join("file.txt"), "other edit\n").unwrap();
+    let (_, changed) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(first["files"], changed["files"]);
+    assert_eq!(first["lineStats"], changed["lineStats"]);
+    assert_ne!(first["snapshotKey"], changed["snapshotKey"]);
+    let (_, selected) = f.request(r#"{"scope":"unstaged","path":"file.txt"}"#, true, true).await;
+    assert!(selected.get("snapshotKey").is_none());
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_keys_distinguish_binary_edits_and_omit_over_budget_diffs() {
+    let f = Fixture::new().await;
+    f.init();
+    fs::write(f.root.join("binary"), b"before\0binary").unwrap();
+    f.git(&["add", "binary"]);
+    f.git(&["commit", "-qm", "binary"]);
+    fs::write(f.root.join("binary"), b"first!\0binary").unwrap();
+    let (_, first) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert!(first["snapshotKey"].is_string());
+    fs::write(f.root.join("binary"), b"second\0binary").unwrap();
+    let (_, second) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(first["files"], second["files"]);
+    assert_eq!(first["lineStats"], second["lineStats"]);
+    assert_ne!(first["snapshotKey"], second["snapshotKey"]);
+    fs::write(f.root.join("file.txt"), "large line\n".repeat(450_000)).unwrap();
+    let (status, large) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{large}");
+    assert!(large.get("snapshotKey").is_none());
+    assert!(large["lineStats"].is_object());
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_keys_bind_scope_root_and_resolved_base_identity() {
+    let f = Fixture::new().await;
+    f.init();
+    let (_, unstaged) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    let (_, staged) = f.request(r#"{"scope":"staged"}"#, true, true).await;
+    assert!(unstaged["snapshotKey"].is_string());
+    assert_ne!(unstaged["snapshotKey"], staged["snapshotKey"]);
+    let other = Fixture::new().await;
+    other.init();
+    let (_, other_root) = other.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_ne!(unstaged["snapshotKey"], other_root["snapshotKey"]);
+    other.runtime.shutdown().await;
+    f.git(&["branch", "base"]);
+    let (_, first) = f.request(r#"{"scope":"branch","base":"base"}"#, true, true).await;
+    assert!(first["snapshotKey"].is_string());
+    f.git(&["checkout", "-q", "base"]);
+    f.git(&["commit", "--allow-empty", "-qm", "new base identity"]);
+    f.git(&["checkout", "-q", "main"]);
+    let (_, moved) = f.request(r#"{"scope":"branch","base":"base"}"#, true, true).await;
+    assert_eq!(first["files"], moved["files"]);
+    assert_ne!(first["snapshotKey"], moved["snapshotKey"]);
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_keys_include_untracked_names_but_never_read_their_content() {
+    let f = Fixture::new().await;
+    f.init();
+    // Reading this untracked pipe would block until the review deadline.
+    let pipe = std::ffi::CString::new(f.root.join("pipe").as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: pipe is a live NUL-terminated path for this synchronous call.
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+    fs::write(f.root.join("untracked"), "private first\n").unwrap();
+    let (status, first) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert!(first["snapshotKey"].is_string());
+    fs::write(f.root.join("untracked"), "private second\n").unwrap();
+    let (_, changed_content) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(first["snapshotKey"], changed_content["snapshotKey"]);
+    assert!(!changed_content.to_string().contains("private"));
+    fs::rename(f.root.join("untracked"), f.root.join("renamed")).unwrap();
+    let (_, changed_name) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_ne!(first["snapshotKey"], changed_name["snapshotKey"]);
+    f.runtime.shutdown().await;
 }

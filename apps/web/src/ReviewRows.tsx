@@ -1,3 +1,4 @@
+import { Button } from "@kobalte/core/button";
 import { createMemo, createSignal, For, Show, type Element } from "solid-js";
 
 const PAGE_SIZE = 500;
@@ -25,9 +26,9 @@ export function ReviewRows<T>(props: { rows: T[]; identity: string; jump: () => 
   const visible = createMemo(() => props.rows.slice(range().start, range().end));
   const move = (delta: number) => { setSelection({ identity: props.identity, page: page() + delta }); props.jump(); };
   const controls = () => <Show when={pages() > 1}><div class="review-pages" role="group" aria-label="Diff pages">
-    <button type="button" disabled={page() === 0} onClick={() => move(-1)}>Previous rows</button>
+    <Button type="button" disabled={page() === 0} onClick={() => move(-1)}>Previous rows</Button>
     <span>Rows {range().start + 1}–{range().end} of {props.rows.length}</span>
-    <button type="button" disabled={page() + 1 >= pages()} onClick={() => move(1)}>Next rows</button>
+    <Button type="button" disabled={page() + 1 >= pages()} onClick={() => move(1)}>Next rows</Button>
   </div></Show>;
   return <>{controls()}<For each={visible()}>{props.children}</For>{controls()}</>;
 }

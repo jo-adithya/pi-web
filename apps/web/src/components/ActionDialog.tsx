@@ -10,8 +10,10 @@ export function dialogReturnFocus() {
   return (triggerId ? document.getElementById(triggerId) : null) ?? active;
 }
 
-/** A task-owned modal. Dismissal cancels; only its explicit action submits. */
-export function ActionDialog(props: { title: string; description: string; close: () => void; class?: string; returnFocus?: globalThis.Element | null; children: Element }) {
+/** A task-owned modal. Dismissal cancels; only its explicit action submits.
+ * hideHeading keeps the title and description available to screen readers only.
+ */
+export function ActionDialog(props: { title: string; description: string; close: () => void; class?: string; returnFocus?: globalThis.Element | null; hideHeading?: boolean; children: Element }) {
   const previous = props.returnFocus ?? dialogReturnFocus();
   return <Dialog open onOpenChange={open => { if (!open) props.close(); }}>
     <Dialog.Portal>
@@ -32,7 +34,7 @@ export function ActionDialog(props: { title: string; description: string; close:
           }
         }
       }}>
-        <Dialog.Title>{props.title}</Dialog.Title><Dialog.Description class="preserve">{props.description}</Dialog.Description>
+        <Dialog.Title class={props.hideHeading ? "sr-only" : undefined}>{props.title}</Dialog.Title><Dialog.Description class={props.hideHeading ? "sr-only" : "preserve"}>{props.description}</Dialog.Description>
         {props.children}
       </Dialog.Content>
     </Dialog.Portal>

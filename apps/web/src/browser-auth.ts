@@ -9,6 +9,16 @@ export function isCapability(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
+/** Extracts a credential from this server's terminal link without navigating to it. */
+export function capabilityFromLink(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    const values = new URLSearchParams(url.hash.slice(1)).getAll("cap");
+    if (url.origin !== location.origin || url.username || url.password || url.pathname !== "/" || url.search || values.length !== 1) return null;
+    return isCapability(values[0]) ? values[0] : null;
+  } catch { return null; }
+}
+
 /** Returns a valid tab-local credential, or null when absent/blocked/malformed. */
 export function loadCapability(): string | null {
   try { const value = sessionStorage.getItem(CAPABILITY_KEY); return isCapability(value) ? value : null; }

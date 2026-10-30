@@ -32,6 +32,36 @@ beforeEach(() => {
   sessionStorage.setItem("pi-web.capability.v1", "a".repeat(64)); vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true })); });
 afterEach(() => { cleanup(); Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal"); Reflect.deleteProperty(HTMLDialogElement.prototype, "close"); vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear(); document.documentElement.classList.remove("dark"); history.replaceState(null, "", "/"); });
 
+it.each(["none", "current", "other"])("reloads the app with draft protection for %s conversation", async draft => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const reload = vi.fn();
+  vi.stubGlobal("location", { origin: location.origin, protocol: location.protocol, host: location.host, hash: "", reload });
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const frame of [...frames(a), ...frames(b)]) socket.emit(frame);
+  if (draft !== "none") {
+    fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "Keep my draft" } }); flush();
+    if (draft === "other") { fireEvent.click(page.getByRole("button", { name: /^Conversation 2/ })); flush(); }
+  }
+  // Reload is a local action, including while the server is disconnected.
+  socket.onclose?.(); flush(); socket.send.mockClear();
+  fireEvent.keyDown(page.getByLabelText("Session options"), { key: "Enter" }); flush();
+  fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Reload app" }), { key: "Enter" }); flush();
+  if (draft !== "none") {
+    expect(reload).not.toHaveBeenCalled();
+    expect(screen.getByText(/Unsent drafts, attached images, and reply quotes/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" })); flush();
+    expect(reload).not.toHaveBeenCalled();
+    if (draft === "current") expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep my draft");
+    fireEvent.keyDown(page.getByLabelText("Session options"), { key: "Enter" }); flush();
+    fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Reload app" }), { key: "Enter" }); flush();
+    fireEvent.click(screen.getByRole("button", { name: "Reload app" })); flush();
+  }
+  expect(reload).toHaveBeenCalledOnce();
+  expect(socket.send).not.toHaveBeenCalled();
+});
+
 it("opens local changes for a stopped session without starting Pi", async () => {
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const request = vi.fn(async (url: string) => url === "/auth" ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ files: [], truncated: false, note: null })));
@@ -433,8 +463,8 @@ it("leaves zoomed touch pans to the viewport, then restores sidebar swipes at no
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />); flush();
   const main = page.getByRole("main");
-  const start = () => fireEvent.touchStart(main, { touches: [{ identifier: 1, clientX: 80, clientY: 200 }] });
-  const end = () => { fireEvent.touchEnd(main, { touches: [], changedTouches: [{ identifier: 1, clientX: 200, clientY: 205 }] }); flush(); };
+  const start = () => fireEvent.touchStart(main, { touches: [{ identifier: 1, clientX: 10, clientY: 200 }] });
+  const end = () => { fireEvent.touchMove(main, { touches: [{ identifier: 1, clientX: 200, clientY: 205 }] }); fireEvent.touchEnd(main, { touches: [], changedTouches: [{ identifier: 1, clientX: 200, clientY: 205 }] }); flush(); };
   start(); end();
   expect(screen.queryByRole("dialog", { name: "Sessions" })).toBeNull();
   viewport.scale = 1; viewport.dispatchEvent(new Event("resize")); flush();
@@ -456,12 +486,17 @@ it("opens with a right swipe and closes with a left swipe on mobile", async () =
   const page = render(() => <App />);
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const main = page.getByRole("main");
-  fireEvent.touchStart(main, { touches: [{ identifier: 1, clientX: 80, clientY: 200 }] });
+  fireEvent.touchStart(main, { touches: [{ identifier: 1, clientX: 10, clientY: 200 }] });
+  fireEvent.touchMove(main, { touches: [{ identifier: 1, clientX: 200, clientY: 205 }] }); flush();
+  expect(document.querySelector(".sidebar-drawer")).not.toBeNull();
+  expect(page.getByRole("button", { name: "Open sessions" }).getAttribute("aria-expanded")).toBe("false");
   fireEvent.touchEnd(main, { touches: [], changedTouches: [{ identifier: 1, clientX: 200, clientY: 205 }] }); flush();
   const body = within(document.body);
   await vi.waitFor(() => expect(body.getByRole("dialog", { name: "Sessions" })).toBeTruthy());
   const drawer = body.getByRole("dialog", { name: "Sessions" });
+  await new Promise(resolve => setTimeout(resolve, 200)); flush();
   fireEvent.touchStart(drawer, { touches: [{ identifier: 2, clientX: 220, clientY: 200 }] });
+  fireEvent.touchMove(drawer, { touches: [{ identifier: 2, clientX: 80, clientY: 205 }] });
   fireEvent.touchEnd(drawer, { touches: [], changedTouches: [{ identifier: 2, clientX: 80, clientY: 205 }] }); flush();
   await vi.waitFor(() => expect(body.queryByRole("dialog")).toBeNull());
 });

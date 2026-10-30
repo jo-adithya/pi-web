@@ -44,6 +44,22 @@ it("keeps the caret in earlier lines across successive typo corrections", () => 
   expect(transport).not.toHaveBeenCalled();
 });
 
+it("does not collapse the live editor to measure each keystroke", () => {
+  const { input, type, model } = setup();
+  type("First line\nSecond line\nThird line");
+  const height = vi.spyOn(input.style, "height", "set");
+  try {
+    type("First line!\nSecond line\nThird line", 11);
+    // A temporary auto height can clamp page scrolling before the height is restored.
+    expect(height).not.toHaveBeenCalledWith("auto");
+    expect(input.selectionStart).toBe(11);
+    expect(model.draft()).toBe(input.value);
+    model.setDraft(""); flush();
+    expect(input.value).toBe("");
+    expect(height).not.toHaveBeenCalledWith("auto");
+  } finally { height.mockRestore(); }
+});
+
 it("filters loaded commands, shows descriptions and inserts with keyboard without sending", () => {
   const { page, input, type, key, transport } = setup();
   type("/re");

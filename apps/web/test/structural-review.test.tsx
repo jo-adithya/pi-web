@@ -32,7 +32,7 @@ it("loads structural comparison only on request and keeps Ask Pi as an unsent te
   expect(page.container.querySelector(".diff-add .structural-change")?.textContent).toBe("new");
   expect(page.container.querySelector(".diff-add code")?.textContent).toBe("fn main() { new(); }");
   expect(page.getByText(/Difftastic 0.72.0/)).toBeTruthy();
-  fireEvent.click(page.getByRole("button", { name: "Ask Pi" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
   expect(model.draft()).toContain(file.patch);
   expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledOnce();
   fireEvent.click(page.getByRole("button", { name: "Text" })); flush();

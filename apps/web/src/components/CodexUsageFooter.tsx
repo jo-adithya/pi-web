@@ -4,6 +4,7 @@ import { For, Show, createEffect, createSignal, onSettled } from "solid-js";
 import type { SessionModel } from "../session-model";
 import type { CodexWindow } from "../generated/protocol";
 import { Icon } from "./Icon";
+import { ProgressBar } from "./ProgressBar";
 
 /** Uses provider durations rather than assuming every subscription has the same windows. */
 function windowLabel(window: CodexWindow): string {
@@ -76,7 +77,7 @@ export function CodexUsageFooter(props: { model: SessionModel }) {
               const name = () => window().durationSeconds === 604800 ? "Weekly" : windowLabel(window());
               return <section class="codex-usage-window">
                 <div class="codex-usage-window-heading"><strong>{name()} limit</strong><span>{Math.round(window().usedPercent)}% used</span></div>
-                <progress max="100" value={window().usedPercent} aria-label={`${name()} usage`} />
+                <ProgressBar max={100} value={window().usedPercent} label={`${name()} usage`} />
                 <div class="codex-usage-window-detail">
                   <span>{Math.round(100 - window().usedPercent)}% remaining</span>
                   <span class="codex-usage-reset" title={new Date(window().resetsAt * 1000).toLocaleString()}>{resetCountdown(window().resetsAt, now())}</span>

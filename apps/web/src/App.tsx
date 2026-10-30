@@ -1,4 +1,4 @@
-import { Show, createEffect, createMemo, createSignal, onSettled } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, flush, onSettled } from "solid-js";
 import { ActionDialog, ConfirmationDialog, dialogReturnFocus } from "./components/ActionDialog";
 import { TextField } from "@kobalte/core/text-field";
 import { Dialog } from "@kobalte/core/dialog";
@@ -14,10 +14,11 @@ import { decodeWorkspace } from "./workspace-state";
 import { createSessionModel, type SessionModel } from "./session-model";
 import { SessionView } from "./SessionView";
 import { LocalReview } from "./LocalReview";
+import { SettingsPage } from "./SettingsPage";
 import { createCompletionNotifications } from "./notifications";
 import { createPhonePush } from "./phone-push";
-import { listenForSidebarSwipes } from "./sidebar-swipe";
-import { isCapability, loadCapability, saveCapability, SOCKET_PROTOCOL } from "./browser-auth";
+import { listenForSidebarSwipes, type SidebarDrag } from "./sidebar-swipe";
+import { capabilityFromLink, isCapability, loadCapability, saveCapability, SOCKET_PROTOCOL } from "./browser-auth";
 import "./style.css";
 
 /** The workspace owns one socket; every conversation owns independent bounded UI state. */
@@ -39,12 +40,17 @@ export default function App() {
     return () => viewport.removeEventListener("resize", resized);
   });
   const [sidebarOpen, setSidebarOpen] = createSignal(false);
+  const [sidebarDrag, setSidebarDrag] = createSignal<SidebarDrag | null>(null);
   const [catalog, setCatalog] = createSignal<CatalogItem[]>([]);
   const [selected, setSelected] = createSignal("");
-  const [view, setView] = createSignal<"conversation" | "changes">("conversation");
+  const [view, setView] = createSignal<"conversation" | "changes" | "settings">("conversation");
+  const [settingsReview, setSettingsReview] = createSignal("");
   const [workspaces, setWorkspaces] = createSignal<WorkspaceItem[]>([]);
   const [addingWorkspace, setAddingWorkspace] = createSignal(false);
   const [connection, setConnection] = createSignal("Connecting");
+  const [loginOpen, setLoginOpen] = createSignal(false);
+  const [loginLink, setLoginLink] = createSignal("");
+  const [reloadConfirmation, setReloadConfirmation] = createSignal<{ returnFocus: Element | null } | null>(null);
   const [notice, setNotice] = createSignal(""); const [managementPending, setManagementPending] = createSignal(0);
   const models = new Map<string, SessionModel>(); const subscriptions = new Set<string>(); const blocked = new Set<string>();
   const pending = new Map<string, WorkspaceAction>(); let selectionRequest: string | undefined;
@@ -59,8 +65,16 @@ export default function App() {
   }
   const entry = createMemo(() => catalog().find(item => item.sessionId === selected()));
   const current = createMemo(() => entry() ? modelFor(entry()!.sessionId) : undefined);
+  /** Keeps the current review mounted behind Settings so inspecting preferences cannot cancel a paid run. */
+  function openSettings() {
+    if (view() !== "settings") {
+      setSettingsReview(view() === "changes" ? current()?.id ?? "" : "");
+      setView("settings");
+    }
+    setSidebarOpen(false);
+  }
   const canShowSidebar = () => mobile() && !current()?.state.dialogs.length;
-  onSettled(() => listenForSidebarSwipes(() => canShowSidebar() && !pinchZoomed(), sidebarOpen, setSidebarOpen));
+  onSettled(() => listenForSidebarSwipes(() => canShowSidebar() && !pinchZoomed(), sidebarOpen, setSidebarOpen, setSidebarDrag));
   // Close for extension modals or desktop layout; ordinary stream updates preserve the drawer.
   createEffect(canShowSidebar, enabled => { if (!enabled) setSidebarOpen(false); });
   function command(action: WorkspaceAction) {
@@ -133,25 +147,29 @@ export default function App() {
       timer = setTimeout(connect, retry); retry = Math.min(retry * 2, 8000);
     };
   }
+  let attempt = 0;
+  /** Verifies a tab-local login; later attempts supersede outstanding responses. */
+  async function authenticate(candidate: string | null) {
+    const currentAttempt = ++attempt;
+    clearTimeout(timer); const previous = socket; socket = undefined; previous?.close(); capability = null; disconnectModels();
+    const denied = () => { setConnection("Authentication required"); setNotice("Open or paste the current URL printed by pi-web in your terminal."); };
+    if (!isCapability(candidate)) { denied(); return; }
+    setLoginOpen(false); setNotice(""); setConnection("Authenticating");
+    try {
+      const response = await fetch("/auth", { method: "POST", credentials: "omit", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15000), headers: { "content-type": "application/json" }, body: JSON.stringify({ capability: candidate }) });
+      if (currentAttempt !== attempt || disposed) return;
+      if (!response.ok) { saveCapability(null); denied(); return; }
+      capability = candidate;
+      if (!saveCapability(candidate)) setNotice("Browser storage is unavailable. This tab remains authenticated; reopen the terminal URL after reloading.");
+      connect();
+    } catch { if (currentAttempt === attempt && !disposed) denied(); }
+  }
   onSettled(() => {
-    let attempt = 0;
-    const start = async () => {
-      const currentAttempt = ++attempt;
+    const start = () => {
       const fragment = new URLSearchParams(location.hash.slice(1));
       const candidate = fragment.has("cap") ? fragment.get("cap") : loadCapability();
       if (location.hash) history.replaceState(null, "", location.pathname + location.search);
-      clearTimeout(timer); const previous = socket; socket = undefined; previous?.close(); capability = null; disconnectModels();
-      const denied = () => { setConnection("Authentication required"); setNotice("Open the current URL printed by pi-web in your terminal."); };
-      if (!isCapability(candidate)) { denied(); return; }
-      setConnection("Authenticating");
-      try {
-        const response = await fetch("/auth", { method: "POST", credentials: "omit", redirect: "error", cache: "no-store", headers: { "content-type": "application/json" }, body: JSON.stringify({ capability: candidate }) });
-        if (currentAttempt !== attempt || disposed) return;
-        if (!response.ok) { saveCapability(null); denied(); return; }
-        capability = candidate;
-        if (!saveCapability(candidate)) setNotice("Browser storage is unavailable. This tab remains authenticated; reopen the terminal URL after reloading.");
-        connect();
-      } catch { if (currentAttempt === attempt && !disposed) denied(); }
+      return authenticate(candidate);
     };
     const changed = () => { if (new URLSearchParams(location.hash.slice(1)).has("cap")) void start(); };
     window.addEventListener("hashchange", changed); void start();
@@ -227,6 +245,12 @@ export default function App() {
     }
     setAction(null);
   }
+  /** Reloads only this page, confirming loss of unsent content across all conversations. */
+  function reloadApp() {
+    const unsent = [...models.values()].some(model => model.draft().length > 0 || model.attachments().length > 0 || model.uploading() || model.quote());
+    if (unsent) setReloadConfirmation({ returnFocus: dialogReturnFocus() });
+    else window.location.reload();
+  }
   const canManage = () => connection() === "Connected" && managementPending() === 0;
   const canCreate = () => canManage() && Boolean(entry()) && catalog().filter(item => item.lifecycle !== "stopped").length < 4 && catalog().filter(item => item.workspaceId === entry()?.workspaceId).length < 32;
   const sidebar = () => <SessionSidebar catalog={catalog()} workspaces={workspaces()} selected={selected()} selectedWorkspace={entry()?.workspaceId ?? ""} canCreate={canCreate()}
@@ -236,9 +260,10 @@ export default function App() {
     selectWorkspace={workspaceId => command({ type: "select_workspace", workspaceId })}
     choose={item => { choose(item); setSidebarOpen(false); }} create={() => { const workspaceId = entry()?.workspaceId; if (workspaceId) command({ type: "create_in", workspaceId }); setSidebarOpen(false); }}
     activity={id => { const model = models.get(id); return model?.online() && model.state.status.process === "ready" ? model.state.status.activity : undefined; }}
-    needsInput={id => Boolean(models.get(id)?.state.dialogs.length)} theme={theme.preference()} setTheme={theme.setPreference} />;
-  return <Dialog open={canShowSidebar() && sidebarOpen()} onOpenChange={setSidebarOpen}>
-    <div class={["workspace", { "pinch-zoomed": pinchZoomed(), "review-workspace": view() === "changes" && Boolean(current()) }]}>
+    needsInput={id => Boolean(models.get(id)?.state.dialogs.length)} theme={theme.preference()} setTheme={theme.setPreference}
+    settingsOpen={view() === "settings"} openSettings={openSettings} />;
+  return <Dialog preventScroll={sidebarOpen()} forceMount={canShowSidebar() && sidebarDrag() !== null} open={canShowSidebar() && sidebarOpen()} onOpenChange={setSidebarOpen}>
+    <div class={["workspace", { "pinch-zoomed": pinchZoomed(), "review-workspace": view() === "changes" && Boolean(current()), "settings-workspace": view() === "settings" }]}>
       <Show when={!mobile()}>
         <aside class="sidebar" aria-label="Sessions">
           <div class="sidebar-brand"><span class="brand">π</span><span>Pi<span class="brand-subtitle">Local workspace</span></span></div>
@@ -249,15 +274,19 @@ export default function App() {
         <div class="workspace-controls">
           <Show when={mobile()}><Dialog.Trigger class="icon-button" aria-label="Open sessions" disabled={!canShowSidebar()}><Icon name="panel" /></Dialog.Trigger></Show>
           <Show when={current()}><div class="workspace-views" role="group" aria-label="Workspace view">
-            <button type="button" aria-pressed={view() === "conversation" ? "true" : "false"} onClick={() => setView("conversation")}>Conversation</button>
-            <button type="button" aria-pressed={view() === "changes" ? "true" : "false"} onClick={() => setView("changes")}>Changes</button>
+            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Conversation" title="Conversation" aria-pressed={view() === "conversation" ? "true" : "false"} onClick={() => setView("conversation")}><Show when={mobile()} fallback="Conversation"><Icon name="chat" /></Show></Button>
+            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Changes" title="Changes" aria-pressed={view() === "changes" ? "true" : "false"} onClick={() => setView("changes")}><Show when={mobile()} fallback="Changes"><Icon name="code" /></Show></Button>
           </div></Show>
           <div class="session-controls">
             <div class="statuses" aria-live="polite"><span class={["connection", { connected: connection() === "Connected" }]}>{connection()}</span>
             </div>
+            <Show when={(connection() === "Disconnected" || connection() === "Connecting") && capability !== null && !loginOpen()}>
+              <Button type="button" onClick={() => setLoginOpen(true)}>Update login link</Button>
+            </Show>
             <Show when={entry()}>{item => <DropdownMenu placement="bottom-end" gutter={8} modal={false}>
               <DropdownMenu.Trigger class="icon-button session-options-trigger" aria-label="Session options" title="Session options"><Icon name="more" /></DropdownMenu.Trigger>
               <DropdownMenu.Portal><DropdownMenu.Content class="session-menu session-actions">
+                <DropdownMenu.Item onSelect={reloadApp}>Reload app</DropdownMenu.Item>
                 <DropdownMenu.Item class="danger" disabled={!canManage() || !["open", "stopped"].includes(item().lifecycle)} onSelect={() => deleteConversation(item())}>Delete conversation…</DropdownMenu.Item>
                 <DropdownMenu.Item disabled={!notifications.supported} title="Notify when an agent finishes while this app is open" onSelect={() => void notifications.toggle()}>{notifications.enabled() ? "Disable notifications" : "Enable notifications"}</DropdownMenu.Item>
                 <DropdownMenu.Item disabled={phonePush.busy() || !phonePush.supported} onSelect={() => void phonePush.enable()}>{phonePush.enabled() ? "Renew phone push" : "Enable phone push"}</DropdownMenu.Item>
@@ -273,12 +302,37 @@ export default function App() {
         <DismissibleAlert class="workspace-notice" message={notice()} />
         <DismissibleAlert class="workspace-notice" message={phonePush.message()} />
         <DismissibleAlert class="workspace-notice" message={notifications.message()} />
-        <Show when={current()} keyed>{model => <Show when={view() === "conversation"} fallback={<LocalReview model={model} conversation={() => setView("conversation")} />}><Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
+        <Show when={view() === "settings" && !loginOpen()}><SettingsPage model={current()} conversation={entry()?.title ?? ""} theme={theme.preference()} setTheme={theme.setPreference} /></Show>
+        <div style={{ display: view() === "settings" ? "none" : "contents" }}>
+        <Show when={(view() !== "settings" || settingsReview() === current()?.id) && connection() !== "Authentication required" && !loginOpen()}><Show when={current()} keyed>{model => <Show when={view() === "conversation"} fallback={<LocalReview model={model} conversation={() => setView("conversation")} />}><Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
           <Show when={entry()?.lifecycle === "stopped"}><Button disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => command({ type: "open", sessionId: model.id })}>Reopen conversation</Button></Show>
-          <Show when={model.draft()}><p class="preserve">Unsent draft: {model.draft()}</p></Show></section>}><SessionView model={model} /></Show></Show>}</Show>
-        <Show when={!catalog().length}><section class="empty workspace-empty"><span class="empty-mark">π</span><h2>Connecting to your workspace</h2><p>Open the current terminal URL if authentication is required.</p></section></Show>
+          <Show when={model.draft()}><p class="preserve">Unsent draft: {model.draft()}</p></Show></section>}><SessionView model={model} /></Show></Show>}</Show></Show>
+        </div>
+        <Show when={(view() !== "settings" && connection() === "Authentication required") || loginOpen()}>
+          <section class="empty workspace-empty">
+            <span class="empty-mark">π</span><h2>Connect to Pi Web</h2>
+            <p>Paste this server’s current terminal link to sign in. Your login stays in this window.</p>
+            <TextField as="form" class="login-form" required value={loginLink()} onChange={value => { setLoginLink(value); flush(); }} onSubmit={event => {
+              event.preventDefault();
+              const input = event.currentTarget.elements.namedItem("login-link") as HTMLInputElement;
+              const candidate = capabilityFromLink(input.value); input.value = ""; setLoginLink("");
+              if (!candidate) { setNotice("Paste the complete login link for this server, including #cap=…."); return; }
+              void authenticate(candidate);
+            }}>
+              <TextField.Label>Terminal login link</TextField.Label>
+              <TextField.Input name="login-link" type="password" autocomplete="off" autocapitalize="off" spellcheck={false} />
+              <TextField.Description as="p">Treat this link like a password. It grants access to your coding agent.</TextField.Description>
+              <div class="dialog-actions">
+                <Show when={loginOpen()}><Button type="button" onClick={() => { setLoginLink(""); setLoginOpen(false); }}>Cancel</Button></Show>
+                <Button type="submit">Connect</Button>
+              </div>
+            </TextField>
+          </section>
+        </Show>
+        <Show when={view() !== "settings" && !catalog().length && connection() !== "Authentication required" && !loginOpen()}><section class="empty workspace-empty"><span class="empty-mark">π</span><h2>Connecting to your workspace</h2><p>Keep the computer and Pi Web server running.</p></section></Show>
       </main>
     </div>
+    <Show when={reloadConfirmation()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Reload app?" description="Unsent drafts, attached images, and reply quotes in all conversations will be discarded. Saved history is retained. This reloads the page without sending a stop or restart command." action="Reload app" close={() => setReloadConfirmation(null)} confirm={() => window.location.reload()} />}</Show>
     <Show when={workspaceRemoval()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Delete workspace" description={`Remove “${target.item.name}” (${target.item.path}) from Pi? All sessions in this workspace will be stopped and unsent drafts discarded. Project files and saved history will be retained.`} action="Delete workspace" disabled={!workspaceRemovalEligible()} close={() => setWorkspaceRemoval(null)} confirm={submitWorkspaceRemoval} />}</Show>
     <Show when={action()} keyed>{target => <Show when={target.kind === "rename"} fallback={<ConfirmationDialog returnFocus={target.returnFocus} title={target.kind === "delete" ? "Delete conversation" : "Stop session"} description={target.description} action={target.kind === "delete" ? "Delete conversation" : "Stop session"} disabled={!eligible()} close={() => setAction(null)} confirm={submitAction} />}>
       <ActionDialog returnFocus={target.returnFocus} title="Rename conversation" description={target.description} close={() => setAction(null)}>
@@ -291,8 +345,8 @@ export default function App() {
     </Show>}</Show>
     <Dialog.Portal>
       {/* Explicit dismissal also covers Kobalte alpha’s unregistered dismissable layer. */}
-      <Dialog.Overlay class="sidebar-overlay" onClick={() => setSidebarOpen(false)} />
-      <Dialog.Content class="sidebar sidebar-drawer" onKeyDown={event => {
+      <Dialog.Overlay class="sidebar-overlay" data-dragging={sidebarDrag()?.dragging ? "" : undefined} style={{ opacity: sidebarDrag()?.progress }} onClick={() => setSidebarOpen(false)} />
+      <Dialog.Content class="sidebar sidebar-drawer" inert={!sidebarOpen()} data-dragging={sidebarDrag()?.dragging ? "" : undefined} style={{ transform: sidebarDrag() ? `translateX(${(sidebarDrag()!.progress - 1) * 100}%)` : undefined }} onKeyDown={event => {
         if (event.key === "Escape" && !event.isComposing) { event.preventDefault(); setSidebarOpen(false); }
       }}>
         <div class="sidebar-brand"><span class="brand">π</span><Dialog.Title>Sessions</Dialog.Title><Dialog.CloseButton class="icon-button" aria-label="Close sessions"><Icon name="close" /></Dialog.CloseButton></div>

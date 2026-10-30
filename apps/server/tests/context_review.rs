@@ -516,8 +516,11 @@ async fn lazy_listing_and_context_cache_skip_expanded_git_work() {
                 .all(|f| f["patch"].is_null())
         );
         let commands = fs::read_to_string(&log).unwrap();
-        assert_eq!(commands.lines().count(), 5, "{commands}");
-        assert!(!commands.contains("--patch"));
+        assert_eq!(commands.lines().count(), 7, "{commands}");
+        assert_eq!(commands.matches("--numstat").count(), 1);
+        // Metadata stays lazy; one bounded full diff supplies content identity, not per-file patches.
+        assert_eq!(commands.matches("--patch").count(), 1);
+        assert!(commands.contains("--binary --full-index"));
         let input = f.context_input("unstaged", None, "file.txt").await;
         fs::write(&log, "").unwrap();
         let (status, first) = f.context(&input).await;

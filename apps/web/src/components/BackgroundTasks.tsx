@@ -1,28 +1,31 @@
-import { Collapsible } from "@kobalte/core/collapsible";
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { Button } from "@kobalte/core/button";
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
+import { ActionDialog } from "./ActionDialog";
 import type { BackgroundTask, BackgroundStatus } from "../generated/protocol";
 import { Icon } from "./Icon";
 
 const labels: Record<BackgroundStatus, string> = { active: "Queued / running", completed: "Completed", steered: "Steered", error: "Failed", aborted: "Aborted", stopped: "Stopped", unknown: "Interrupted" };
 
-/** Runtime activity summary and task identities/statuses; results stay out of this panel. */
+/** Compact activity button opening a live agent/workflow status modal, without result output. */
 export function BackgroundTasks(props: { tasks: BackgroundTask[] }) {
   const [open, setOpen] = createSignal(false);
+  let trigger!: HTMLButtonElement;
+  createEffect(() => props.tasks.length, count => { if (!count) setOpen(false); });
   const summary = createMemo(() => {
     const active = props.tasks.filter(task => task.status === "active").length;
     const failed = props.tasks.filter(task => task.status === "error").length;
     return `${props.tasks.length} ${props.tasks.length === 1 ? "task" : "tasks"}${active ? ` · ${active} queued / running` : ""}${failed ? ` · ${failed} failed` : ""}`;
   });
   return <Show when={props.tasks.length > 0}>
-    <Collapsible class="background-tasks" open={open()} onOpenChange={setOpen} forceMount>
-      <Collapsible.Trigger class="background-tasks-trigger">
-        <Icon name="chevronDown" />
-        <span class="background-tasks-summary" role="status" aria-live="polite">
-          <span class="background-tasks-title">Background agents & workflows</span>
-          <span class="background-tasks-count">{summary()}</span>
-        </span>
-      </Collapsible.Trigger>
-      <Collapsible.Content class="background-tasks-content" hidden={!open()}>
+    <div class="background-tasks">
+      <Button ref={trigger} class="background-tasks-trigger" aria-label="Agents" aria-haspopup="dialog" aria-expanded={open() ? "true" : "false"} title={summary()} onClick={() => setOpen(true)}>
+        <Icon name="structure" /><span>Agents</span><span class="background-tasks-count" aria-hidden="true">{props.tasks.length}</span>
+      </Button>
+      <span class="sr-only" role="status" aria-live="polite">{summary()}</span>
+      <Show when={open()}>
+        <ActionDialog title="Background agents & workflows" description="Live status of background agents and workflows for this conversation." class="background-tasks-dialog" returnFocus={trigger} close={() => setOpen(false)}>
+          <p role="status" aria-live="polite" class="background-tasks-count">{summary()}</p>
+          <Button class="icon-button background-tasks-close" aria-label="Close agents" title="Close agents" onClick={() => setOpen(false)}><Icon name="close" /></Button>
         <ul class="background-task-list" aria-label="Background tasks">
           <For each={props.tasks} keyed={task => task.id}>{task =>
             <li class="background-task" data-status={task().status}>
@@ -39,7 +42,8 @@ export function BackgroundTasks(props: { tasks: BackgroundTask[] }) {
             </li>
           }</For>
         </ul>
-      </Collapsible.Content>
-    </Collapsible>
+        </ActionDialog>
+      </Show>
+    </div>
   </Show>;
 }

@@ -59,6 +59,16 @@ it("does not load conversation images until requested and releases the blob on h
   const popup = screen.getByRole("dialog", { name: "Image preview" });
   expect(popup.querySelector("img")?.getAttribute("src")).toBe("blob:display");
   expect(load).toHaveBeenCalledTimes(1);
+  const expanded = popup.querySelector("img")!;
+  const viewport = expanded.parentElement!;
+  fireEvent.wheel(viewport, { deltaY: -500 }); flush();
+  expect(expanded.style.transform).toContain("scale(2)");
+  fireEvent.wheel(viewport, { deltaY: 500 }); flush();
+  expect(expanded.style.transform).toContain("scale(1)");
+  fireEvent.keyDown(viewport, { key: "+" }); flush();
+  expect(expanded.style.transform).toContain("scale(1.5)");
+  fireEvent.doubleClick(viewport); flush();
+  expect(expanded.style.transform).toContain("scale(1)");
   fireEvent.click(screen.getByRole("button", { name: "Close image preview" })); flush();
   expect(screen.queryByRole("dialog")).toBeNull();
   fireEvent.click(thumbnail); flush();

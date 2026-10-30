@@ -8,4 +8,6 @@
   const dark = saved === "dark" ||
     (saved === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.classList.toggle("dark", dark);
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  themeColor.content = themeColor.dataset[dark ? "dark" : "light"];
 })();
