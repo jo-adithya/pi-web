@@ -42,6 +42,12 @@ fn command(id: &str, action: WorkspaceAction) -> WorkspaceCommand {
         action,
     }
 }
+/// Captures only the conversation identities and runtime epochs approved for workspace removal.
+fn approved_sessions(snapshot: &WorkspaceReply, workspace_id: &str) -> std::collections::BTreeMap<String, Option<String>> {
+    snapshot.sessions.iter().filter(|entry| entry.workspace_id == workspace_id)
+        .map(|entry| (entry.session_id.clone(), entry.runtime.as_ref().map(|runtime| runtime.epoch.clone())))
+        .collect()
+}
 async fn until(
     connection: &mut Connection,
     predicate: impl Fn(&ServerMessage) -> bool,
@@ -59,6 +65,260 @@ async fn until(
 }
 async fn ready(connection: &mut Connection) -> ServerMessage {
     until(connection, |message| matches!(&message.body, ServerBody::Snapshot { status, .. } | ServerBody::Event { status, .. } if status.process == ProcessStatus::Ready && status.history_warning.is_none())).await
+}
+
+#[tokio::test]
+async fn delete_workspace_stops_its_runtimes_and_preserves_files_and_history() {
+    let fixture = Fixture::new();
+    let second = fixture.0.join("second");
+    fs::create_dir(&second).unwrap();
+    fs::write(second.join("keep.txt"), "project files").unwrap();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let first = manager.snapshot().await;
+    let other = manager.lookup(&first.selected).await.unwrap();
+    let added = manager.command(command("add", WorkspaceAction::AddWorkspace {
+        path: second.display().to_string(), confirmed: true,
+    })).await;
+    assert!(added.ok);
+    let handle = manager.lookup(&added.selected).await.unwrap();
+    let mut connection = handle.connect("delete-workspace".into()).await.unwrap();
+    ready(&mut connection).await;
+    let created = manager.command(command("create", WorkspaceAction::CreateIn {
+        workspace_id: added.selected_workspace.clone(),
+    })).await;
+    assert!(created.ok);
+    let extra = manager.lookup(&created.selected).await.unwrap();
+    let mut extra_connection = extra.connect("extra".into()).await.unwrap();
+    ready(&mut extra_connection).await;
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.0.join("state/workspaces/registry.json")).unwrap(),
+    ).unwrap();
+    let state_dir = PathBuf::from(registry["entries"][1]["stateDir"].as_str().unwrap());
+    let metadata = state_dir.join("sessions").join(&added.selected).join("state.json");
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+    let transcript = PathBuf::from(saved["piSessionPath"].as_str().unwrap());
+    let bytes = fs::read(&transcript).unwrap();
+    let action = serde_json::from_value(serde_json::json!({
+        "type": "delete_workspace", "workspaceId": added.selected_workspace, "confirmed": true,
+        "expectedSessions": approved_sessions(&manager.snapshot().await, &added.selected_workspace),
+    })).expect("workspace deletion must be supported");
+    let request = command("delete-workspace", action);
+    let deleted = manager.command(request.clone()).await;
+    assert!(deleted.ok, "{deleted:?}");
+    assert_eq!(deleted.code, "workspace_deleted");
+    assert_eq!(deleted.workspaces, first.workspaces);
+    assert_eq!(deleted.selected_workspace, first.selected_workspace);
+    assert_eq!(deleted.selected, first.selected);
+    assert_eq!(deleted.sessions.len(), 1);
+    assert!(manager.lookup(&added.selected).await.is_none());
+    assert!(manager.lookup(&created.selected).await.is_none());
+    assert!(handle.shutdown().await);
+    assert!(extra.shutdown().await);
+    assert_eq!(other.summary().epoch, manager.lookup(&first.selected).await.unwrap().summary().epoch);
+    assert_eq!(fs::read(second.join("keep.txt")).unwrap(), b"project files");
+    assert_eq!(fs::read(transcript).unwrap(), bytes);
+    assert!(metadata.exists());
+    assert_eq!(manager.command(request).await, deleted);
+    assert!(manager.shutdown().await);
+    drop(connection); drop(extra_connection); drop(handle); drop(extra); drop(other); drop(manager);
+    let mut config = fixture.config(); config.explicit_cwd = false;
+    let restarted = SessionManager::start(config).unwrap();
+    assert_eq!(restarted.snapshot().await.workspaces, first.workspaces);
+    assert!(restarted.shutdown().await);
+}
+
+#[tokio::test]
+async fn delete_workspace_rejects_stale_confirmation_after_creation_or_reopen() {
+    for reopen in [false, true] {
+        let fixture = Fixture::new();
+        let second = fixture.0.join("second");
+        fs::create_dir(&second).unwrap();
+        let manager = SessionManager::start(fixture.config()).unwrap();
+        let added = manager.command(command("add", WorkspaceAction::AddWorkspace {
+            path: second.display().to_string(), confirmed: true,
+        })).await;
+        let approved = manager.snapshot().await;
+        let request = command("delete", WorkspaceAction::DeleteWorkspace {
+            expected_sessions: approved_sessions(&approved, &approved.selected_workspace),
+            workspace_id: approved.selected_workspace.clone(), confirmed: true,
+        });
+        if reopen {
+            let epoch = manager.lookup(&added.selected).await.unwrap().summary().epoch;
+            assert!(manager.command(command("stop", WorkspaceAction::Stop {
+                session_id: added.selected.clone(), epoch, confirmed: true,
+            })).await.ok);
+            assert!(manager.command(command("open", WorkspaceAction::Open {
+                session_id: added.selected.clone(),
+            })).await.ok);
+        } else {
+            assert!(manager.command(command("create", WorkspaceAction::CreateIn {
+                workspace_id: added.selected_workspace.clone(),
+            })).await.ok);
+        }
+        let before = manager.snapshot().await;
+        let rejected = manager.command(request).await;
+        let retained = before.sessions.iter().all(|entry| rejected.sessions.iter().any(|current|
+            current.session_id == entry.session_id && current.lifecycle == entry.lifecycle &&
+            current.runtime.as_ref().map(|runtime| &runtime.epoch) == entry.runtime.as_ref().map(|runtime| &runtime.epoch)
+        ));
+        assert!(manager.shutdown().await);
+        assert!(!rejected.ok, "stale confirmation removed the workspace: {rejected:?}");
+        assert_eq!(rejected.code, "workspace_changed");
+        assert_eq!(rejected.workspaces, before.workspaces);
+        assert!(retained, "stale approval must leave every runtime running");
+    }
+}
+
+#[tokio::test]
+async fn delete_workspace_serializes_mutations_while_cleanup_is_pending() {
+    let fixture = Fixture::new();
+    let second = fixture.0.join("second");
+    fs::create_dir(&second).unwrap();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let added = manager.command(command("add", WorkspaceAction::AddWorkspace {
+        path: second.display().to_string(), confirmed: true,
+    })).await;
+    assert!(added.ok);
+    let handle = manager.lookup(&added.selected).await.unwrap();
+    let mut connection = handle.connect("delete".into()).await.unwrap();
+    ready(&mut connection).await;
+    let request = command("delete", WorkspaceAction::DeleteWorkspace {
+        expected_sessions: approved_sessions(&manager.snapshot().await, &added.selected_workspace),
+        workspace_id: added.selected_workspace.clone(), confirmed: true,
+    });
+    let task = manager.clone();
+    let pending_request = request.clone();
+    let pending = tokio::spawn(async move { task.command(pending_request).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if manager.snapshot().await.sessions.iter().any(|entry| entry.workspace_id == added.selected_workspace && entry.lifecycle == SlotStatus::Stopping) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let rejected = manager.command(command("create-during-delete", WorkspaceAction::CreateIn {
+        workspace_id: added.selected_workspace,
+    })).await;
+    assert!(!rejected.ok);
+    assert_eq!(rejected.code, "workspace_busy");
+    let duplicate = manager.command(request).await;
+    assert!(duplicate.ok);
+    assert_eq!(pending.await.unwrap(), duplicate);
+    assert_eq!(duplicate.workspaces.len(), 1);
+    assert!(manager.shutdown().await);
+}
+
+#[tokio::test]
+async fn delete_workspace_requires_confirmation_valid_identity_and_another_workspace() {
+    let fixture = Fixture::new();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let before = manager.snapshot().await;
+    for (request_id, workspace_id, confirmed, code) in [
+        ("unconfirmed", before.selected_workspace.clone(), false, "confirmation_required"),
+        ("invalid", "../../project".into(), true, "invalid_or_stopping"),
+        ("unknown", config::identity().unwrap(), true, "unknown_workspace"),
+        ("last", before.selected_workspace.clone(), true, "last_workspace"),
+    ] {
+        let reply = manager.command(command(request_id, WorkspaceAction::DeleteWorkspace {
+            expected_sessions: approved_sessions(&before, &workspace_id),
+            workspace_id, confirmed,
+        })).await;
+        assert!(!reply.ok);
+        assert_eq!(reply.code, code);
+        assert_eq!(reply.workspaces, before.workspaces);
+        assert_eq!(reply.sessions.len(), before.sessions.len());
+        assert_eq!(reply.sessions[0].session_id, before.sessions[0].session_id);
+        assert_eq!(reply.sessions[0].lifecycle, SlotStatus::Open);
+        assert_eq!(reply.sessions[0].runtime.as_ref().unwrap().epoch, before.sessions[0].runtime.as_ref().unwrap().epoch);
+        assert_eq!(reply.selected, before.selected);
+    }
+    for (request_id, expected_sessions) in [
+        ("invalid-session", std::collections::BTreeMap::from([("../outside".into(), None)])),
+        ("invalid-epoch", std::collections::BTreeMap::from([(before.selected.clone(), Some("invalid".into()))])),
+        ("too-many-sessions", (0..33).map(|_| (config::identity().unwrap(), None)).collect()),
+    ] {
+        let rejected = manager.command(command(request_id, WorkspaceAction::DeleteWorkspace {
+            workspace_id: before.selected_workspace.clone(), expected_sessions, confirmed: true,
+        })).await;
+        assert!(!rejected.ok);
+        assert_eq!(rejected.code, "invalid_or_stopping");
+        assert_eq!(rejected.workspaces, before.workspaces);
+        assert_eq!(rejected.sessions[0].lifecycle, SlotStatus::Open);
+    }
+    assert!(manager.shutdown().await);
+}
+
+#[tokio::test]
+async fn delete_workspace_can_forget_an_unavailable_stopped_folder_and_restore_its_catalog() {
+    let fixture = Fixture::new();
+    let second = fixture.0.join("second");
+    fs::create_dir(&second).unwrap();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let first = manager.snapshot().await;
+    let added = manager.command(command("add", WorkspaceAction::AddWorkspace {
+        path: second.display().to_string(), confirmed: true,
+    })).await;
+    assert!(added.ok);
+    let runtime = manager.lookup(&added.selected).await.unwrap().summary();
+    let stopped = manager.command(command("stop", WorkspaceAction::Stop {
+        session_id: added.selected.clone(), epoch: runtime.epoch, confirmed: true,
+    })).await;
+    assert!(stopped.ok);
+    assert!(manager.command(command("select", WorkspaceAction::SelectWorkspace {
+        workspace_id: first.selected_workspace.clone(),
+    })).await.ok);
+    fs::remove_dir(&second).unwrap();
+    let deleted = manager.command(command("delete", WorkspaceAction::DeleteWorkspace {
+        expected_sessions: approved_sessions(&manager.snapshot().await, &added.selected_workspace),
+        workspace_id: added.selected_workspace, confirmed: true,
+    })).await;
+    assert!(deleted.ok, "{deleted:?}");
+    assert_eq!(deleted.selected, first.selected);
+    assert_eq!(deleted.selected_workspace, first.selected_workspace);
+    assert_eq!(deleted.workspaces, first.workspaces);
+    fs::create_dir(&second).unwrap();
+    let restored = manager.command(command("restore", WorkspaceAction::AddWorkspace {
+        path: second.display().to_string(), confirmed: true,
+    })).await;
+    assert!(restored.ok, "{restored:?}");
+    assert_eq!(restored.selected, added.selected, "saved conversation identity must survive removal");
+    assert!(manager.shutdown().await);
+}
+
+#[tokio::test]
+async fn delete_workspace_keeps_registration_and_stopped_conversations_on_write_failure() {
+    let fixture = Fixture::new();
+    let second = fixture.0.join("second");
+    fs::create_dir(&second).unwrap();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let added = manager.command(command("add", WorkspaceAction::AddWorkspace {
+        path: second.display().to_string(), confirmed: true,
+    })).await;
+    assert!(added.ok);
+    let registry_path = fixture.0.join("state/workspaces/registry.json");
+    fs::remove_file(&registry_path).unwrap();
+    fs::create_dir(&registry_path).unwrap();
+    let failed = manager.command(command("fail", WorkspaceAction::DeleteWorkspace {
+        expected_sessions: approved_sessions(&manager.snapshot().await, &added.selected_workspace),
+        workspace_id: added.selected_workspace.clone(), confirmed: true,
+    })).await;
+    assert!(!failed.ok);
+    assert_eq!(failed.code, "workspace_write_failed");
+    assert_eq!(failed.workspaces, added.workspaces);
+    assert_eq!(failed.selected_workspace, added.selected_workspace);
+    assert_eq!(failed.selected, added.selected);
+    assert_eq!(failed.sessions.len(), 2);
+    assert_eq!(failed.sessions.iter().find(|entry| entry.session_id == added.selected).unwrap().lifecycle, SlotStatus::Stopped);
+    assert!(manager.lookup(&added.selected).await.is_none());
+    fs::remove_dir(&registry_path).unwrap();
+    let retried = manager.command(command("retry", WorkspaceAction::DeleteWorkspace {
+        expected_sessions: approved_sessions(&manager.snapshot().await, &added.selected_workspace),
+        workspace_id: added.selected_workspace, confirmed: true,
+    })).await;
+    assert!(retried.ok, "{retried:?}");
+    assert_eq!(retried.workspaces.len(), 1);
+    assert!(manager.shutdown().await);
 }
 
 #[tokio::test]

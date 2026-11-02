@@ -27,6 +27,16 @@ export default function App() {
     if (item) choose(item);
   });
   const mobile = createMediaQuery("(max-width: 760px)");
+  const viewport = window.visualViewport;
+  const [pinchZoomed, setPinchZoomed] = createSignal((viewport?.scale ?? 1) > 1);
+  // Native viewport panning needs scroll chaining while magnified.
+  onSettled(() => {
+    if (!viewport) return;
+    const resized = () => setPinchZoomed(viewport.scale > 1);
+    viewport.addEventListener("resize", resized);
+    resized();
+    return () => viewport.removeEventListener("resize", resized);
+  });
   const [sidebarOpen, setSidebarOpen] = createSignal(false);
   const [catalog, setCatalog] = createSignal<CatalogItem[]>([]);
   const [selected, setSelected] = createSignal("");
@@ -48,7 +58,7 @@ export default function App() {
   const entry = createMemo(() => catalog().find(item => item.sessionId === selected()));
   const current = createMemo(() => entry() ? modelFor(entry()!.sessionId) : undefined);
   const canShowSidebar = () => mobile() && !current()?.state.dialogs.length;
-  onSettled(() => listenForSidebarSwipes(canShowSidebar, sidebarOpen, setSidebarOpen));
+  onSettled(() => listenForSidebarSwipes(() => canShowSidebar() && !pinchZoomed(), sidebarOpen, setSidebarOpen));
   // Close for extension modals or desktop layout; ordinary stream updates preserve the drawer.
   createEffect(canShowSidebar, enabled => { if (!enabled) setSidebarOpen(false); });
   function command(action: WorkspaceAction) {
@@ -65,7 +75,7 @@ export default function App() {
   }
   function disconnectModels() {
     for (const model of models.values()) model.disconnected();
-    if ([...pending.values()].some(action => ["create", "create_in", "add_workspace", "select_workspace", "open", "stop", "delete", "rename"].includes(action.type))) setNotice("A workspace operation may have completed. Inspect the catalog before retrying; nothing was replayed.");
+    if ([...pending.values()].some(action => ["create", "create_in", "add_workspace", "select_workspace", "open", "stop", "delete", "delete_workspace", "rename"].includes(action.type))) setNotice("A workspace operation may have completed. Inspect the catalog before retrying; nothing was replayed.");
     pending.clear(); setManagementPending(0); subscriptions.clear(); blocked.clear(); selectionRequest = undefined;
   }
   function connect() {
@@ -93,7 +103,7 @@ export default function App() {
           setWorkspaces(reply.workspaces);
           setCatalog(reply.sessions);
           if (reply.ok && action?.type === "add_workspace") { setAddingWorkspace(false); setNotice(""); setSidebarOpen(false); }
-          if (reply.ok && action?.type === "delete") setNotice("");
+          if (reply.ok && (action?.type === "delete" || action?.type === "delete_workspace")) setNotice("");
           if (reply.ok && reply.requestId === selectionRequest && reply.target !== null) setSelected(reply.target);
           else if (!selected() || !reply.sessions.some(item => item.sessionId === selected())) setSelected(reply.selected);
           if (!reply.ok) {
@@ -156,6 +166,26 @@ export default function App() {
     }
   }
   const [action, setAction] = createSignal<{ kind: "rename" | "delete" | "stop"; item: CatalogItem; returnFocus: Element | null; description: string } | null>(null);
+  const [workspaceRemoval, setWorkspaceRemoval] = createSignal<{ item: WorkspaceItem; sessions: CatalogItem[]; returnFocus: Element | null } | null>(null);
+  /** Confirm removal of this registered folder while retaining its files and saved history. */
+  function deleteWorkspace(item: WorkspaceItem) {
+    const sessions = catalog().filter(session => session.workspaceId === item.workspaceId);
+    if (!canManage() || workspaces().length <= 1 || sessions.some(session => !["open", "stopped"].includes(session.lifecycle))) return;
+    setWorkspaceRemoval({ item, sessions, returnFocus: dialogReturnFocus() });
+  }
+  const workspaceRemovalEligible = () => {
+    const target = workspaceRemoval();
+    if (!target || !canManage() || workspaces().length <= 1 || !workspaces().some(item => item.workspaceId === target.item.workspaceId)) return false;
+    const live = catalog().filter(item => item.workspaceId === target.item.workspaceId);
+    return live.length === target.sessions.length && target.sessions.every(saved => live.some(item => item.sessionId === saved.sessionId && item.lifecycle === saved.lifecycle && item.runtime?.epoch === saved.runtime?.epoch));
+  };
+  /** A stale catalog or disconnected transport cannot authorize workspace removal. */
+  function submitWorkspaceRemoval() {
+    const target = workspaceRemoval();
+    if (!target || !workspaceRemovalEligible()) return;
+    setNotice(""); command({ type: "delete_workspace", workspaceId: target.item.workspaceId, expectedSessions: Object.fromEntries(target.sessions.map(session => [session.sessionId, session.runtime?.epoch ?? null])), confirmed: true });
+    setWorkspaceRemoval(null);
+  }
   const [renameValue, setRenameValue] = createSignal("");
   const [renameError, setRenameError] = createSignal("");
   /** Capture the target and runtime; later catalog updates cannot redirect approval. */
@@ -198,7 +228,7 @@ export default function App() {
   const canManage = () => connection() === "Connected" && managementPending() === 0;
   const canCreate = () => canManage() && Boolean(entry()) && catalog().filter(item => item.lifecycle !== "stopped").length < 4 && catalog().filter(item => item.workspaceId === entry()?.workspaceId).length < 32;
   const sidebar = () => <SessionSidebar catalog={catalog()} workspaces={workspaces()} selected={selected()} selectedWorkspace={entry()?.workspaceId ?? ""} canCreate={canCreate()}
-    rename={renameConversation} remove={deleteConversation}
+    rename={renameConversation} remove={deleteConversation} removeWorkspace={deleteWorkspace}
     canManage={canManage()} adding={addingWorkspace()} setAdding={value => { setNotice(""); setAddingWorkspace(value); }} notice={notice()}
     addWorkspace={path => { setNotice(""); command({ type: "add_workspace", path, confirmed: true }); }}
     selectWorkspace={workspaceId => command({ type: "select_workspace", workspaceId })}
@@ -206,7 +236,7 @@ export default function App() {
     activity={id => { const model = models.get(id); return model?.online() && model.state.status.process === "ready" ? model.state.status.activity : undefined; }}
     needsInput={id => Boolean(models.get(id)?.state.dialogs.length)} theme={theme.preference()} setTheme={theme.setPreference} />;
   return <Dialog open={canShowSidebar() && sidebarOpen()} onOpenChange={setSidebarOpen}>
-    <div class="workspace">
+    <div class={["workspace", { "pinch-zoomed": pinchZoomed() }]}>
       <Show when={!mobile()}>
         <aside class="sidebar" aria-label="Sessions">
           <div class="sidebar-brand"><span class="brand">π</span><span>Pi<span class="brand-subtitle">Local workspace</span></span></div>
@@ -243,6 +273,7 @@ export default function App() {
         <Show when={!catalog().length}><section class="empty workspace-empty"><span class="empty-mark">π</span><h2>Connecting to your workspace</h2><p>Open the current terminal URL if authentication is required.</p></section></Show>
       </main>
     </div>
+    <Show when={workspaceRemoval()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Delete workspace" description={`Remove “${target.item.name}” (${target.item.path}) from Pi? All sessions in this workspace will be stopped and unsent drafts discarded. Project files and saved history will be retained.`} action="Delete workspace" disabled={!workspaceRemovalEligible()} close={() => setWorkspaceRemoval(null)} confirm={submitWorkspaceRemoval} />}</Show>
     <Show when={action()} keyed>{target => <Show when={target.kind === "rename"} fallback={<ConfirmationDialog returnFocus={target.returnFocus} title={target.kind === "delete" ? "Delete conversation" : "Stop session"} description={target.description} action={target.kind === "delete" ? "Delete conversation" : "Stop session"} disabled={!eligible()} close={() => setAction(null)} confirm={submitAction} />}>
       <ActionDialog returnFocus={target.returnFocus} title="Rename conversation" description={target.description} close={() => setAction(null)}>
         <form onSubmit={event => { event.preventDefault(); submitAction(); }}>

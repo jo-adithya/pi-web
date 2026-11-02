@@ -21,6 +21,7 @@ interface SessionSidebarProps {
   notice: string;
   addWorkspace: (path: string) => void;
   selectWorkspace: (id: string) => void;
+  removeWorkspace: (workspace: WorkspaceItem) => void;
   choose: (item: CatalogItem) => void;
   rename: (item: CatalogItem) => void;
   remove: (item: CatalogItem) => void;
@@ -39,11 +40,17 @@ export function SessionSidebar(props: SessionSidebarProps) {
     <nav class="session-list" aria-label="Workspaces and conversations">
       <Show when={props.adding}><WorkspaceForm pending={!props.canManage} notice={props.notice} submit={props.addWorkspace} cancel={() => props.setAdding(false)} /></Show>
       <For each={props.workspaces}>{workspace => <section class="workspace-group" role="group" aria-label={workspace.name}>
-        <Button class={["workspace-heading", { selected: props.selectedWorkspace === workspace.workspaceId }]} title={workspace.path}
+        <div class="workspace-heading-row"><Button class={["workspace-heading", { selected: props.selectedWorkspace === workspace.workspaceId }]} title={workspace.path}
           aria-label={`Select workspace ${workspace.name}`} aria-pressed={props.selectedWorkspace === workspace.workspaceId ? "true" : "false"} disabled={!props.canManage}
           onClick={() => props.selectWorkspace(workspace.workspaceId)}>
           <Icon name="folder" /><span class="workspace-info"><strong>{workspace.name}</strong><small>{workspace.path}</small></span>
-        </Button>
+        </Button><DropdownMenu placement="bottom-end" gutter={6} modal={false}>
+          <DropdownMenu.Trigger class="icon-button sidebar-workspace-trigger" aria-label={`Workspace options for ${workspace.name}`} title={`Workspace options for ${workspace.name}`}><Icon name="more" /></DropdownMenu.Trigger>
+          <DropdownMenu.Portal><DropdownMenu.Content class="session-menu sidebar-workspace-actions">
+            <DropdownMenu.Item class="danger" disabled={!props.canManage || props.workspaces.length <= 1 || props.catalog.some(item => item.workspaceId === workspace.workspaceId && !["open", "stopped"].includes(item.lifecycle))} onSelect={() => props.removeWorkspace(workspace)}>Delete workspace…</DropdownMenu.Item>
+            <Show when={props.workspaces.length <= 1}><span class="workspace-menu-hint">Keep at least one workspace. Add another before deleting this one.</span></Show>
+          </DropdownMenu.Content></DropdownMenu.Portal>
+        </DropdownMenu></div>
         <For each={props.catalog.filter(item => item.workspaceId === workspace.workspaceId)}>{item => <div class="session-row"><Button class={["session-item", { selected: props.selected === item.sessionId, stopped: item.lifecycle === "stopped" }]}
           aria-label={`${item.title}, ${props.needsInput(item.sessionId) ? "needs input" : (props.activity(item.sessionId) ?? item.lifecycle).replaceAll("_", " ")}`}
           aria-pressed={props.selected === item.sessionId ? "true" : "false"} onClick={() => props.choose(item)}>

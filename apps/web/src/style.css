@@ -46,11 +46,14 @@ a:hover { color: var(--foreground); }
 .brand-subtitle { display: block; font-size: .72rem; font-weight: 400; line-height: 1.3; color: var(--muted-foreground); }
 .new-conversation { justify-content: flex-start; padding: .65rem .8rem; box-shadow: var(--shadow-card); font-size: .9rem; }
 .new-conversation .icon { color: var(--primary); }
-.sidebar-section-label { display: flex; justify-content: space-between; padding: 1.15rem .65rem .25rem; color: var(--muted-foreground); font-size: .78rem; }
-.sidebar-section-label { align-items: center; }
-.sidebar-section-label .icon-button { width: 1.7rem; height: 1.7rem; padding: .25rem; }
+.sidebar-section-label { display: flex; align-items: center; justify-content: space-between; padding: 1.15rem .2rem .25rem .65rem; color: var(--muted-foreground); font-size: .78rem; }
+.sidebar-section-label .icon-button, .sidebar-workspace-trigger, .sidebar-session-trigger { width: 1.75rem; height: 1.75rem; padding: .3rem; }
+.sidebar-section-label .icon, .sidebar-workspace-trigger .icon, .sidebar-session-trigger .icon { width: 1rem; height: 1rem; }
 .workspace-group { flex-shrink: 0; margin-bottom: .65rem; }
-.workspace-heading { width: 100%; justify-content: flex-start; text-align: left; padding: .25rem .45rem; border-color: transparent; background: transparent; }
+.workspace-heading-row { display: flex; align-items: center; gap: .15rem; padding-right: .2rem; }
+.workspace-heading { flex: 1; min-width: 0; justify-content: flex-start; text-align: left; padding: .25rem .45rem; border-color: transparent; background: transparent; }
+.workspace-heading:hover:not(:disabled) { background: transparent; }
+.workspace-menu-hint { display: block; max-width: 16rem; padding: .4rem .65rem; font-size: .75rem; color: var(--muted-foreground); }
 .workspace-heading.selected { color: var(--primary); }
 .workspace-info { min-width: 0; }
 .workspace-info strong, .workspace-info small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -68,9 +71,17 @@ a:hover { color: var(--foreground); }
 .session-list { display: flex; flex-direction: column; gap: .25rem; min-height: 0; overflow: auto; flex: 1; padding: 3px; margin: -3px; }
 .session-row { position: relative; }
 .session-row .session-item { padding-right: 2.8rem; }
-.sidebar-session-trigger { position: absolute; right: .2rem; top: 50%; transform: translateY(-50%); width: 1.75rem; height: 1.75rem; padding: .3rem; }
-.sidebar-session-trigger .icon { width: 1rem; height: 1rem; }
+.sidebar-session-trigger { position: absolute; right: .2rem; top: 50%; transform: translateY(-50%); }
 .sidebar-session-actions { min-width: 10rem; }
+/* Keep touch menus discoverable and desktop menus reachable by keyboard. */
+@media (min-width: 761px) and (hover: hover) and (pointer: fine) {
+  .sidebar-workspace-trigger, .sidebar-session-trigger { opacity: 0; pointer-events: none; }
+  .workspace-heading-row:hover .sidebar-workspace-trigger,
+  .workspace-heading-row:focus-within .sidebar-workspace-trigger,
+  .session-row:hover .sidebar-session-trigger,
+  .session-row:focus-within .sidebar-session-trigger,
+  .sidebar-workspace-trigger[data-expanded], .sidebar-session-trigger[data-expanded] { opacity: 1; pointer-events: auto; }
+}
 .session-item { min-width: 0; width: 100%; flex-shrink: 0; justify-content: flex-start; align-items: flex-start; gap: .7rem; text-align: left; background: transparent; border-color: transparent; padding: .35rem .65rem; }
 .session-item > .icon { margin-top: .15rem; color: var(--muted-foreground); width: 1rem; height: 1rem; }
 .session-item.selected { background: var(--accent); color: var(--accent-foreground); }
@@ -104,7 +115,7 @@ a:hover { color: var(--foreground); }
 .connection { display: flex; align-items: center; gap: .4rem; }
 .connection::before { content: ""; width: .4rem; height: .4rem; border-radius: 50%; background: var(--muted-foreground); flex-shrink: 0; }
 .connection.connected::before { background: var(--success); }
-.session-options-trigger .icon, .sidebar-session-trigger .icon { stroke-width: 3; }
+.session-options-trigger .icon, .sidebar-workspace-trigger .icon, .sidebar-session-trigger .icon { stroke-width: 3; }
 .session-menu { z-index: 20; display: flex; flex-direction: column; gap: .15rem; max-width: calc(100vw - 1rem); max-height: var(--kb-popper-content-available-height); overflow-y: auto; padding: .35rem; border: 1px solid var(--border); border-radius: var(--radius); color: var(--popover-foreground); background: var(--popover); box-shadow: var(--shadow-popover); }
 .session-menu [role=menuitem] { padding: .4rem .65rem; border-radius: calc(var(--radius) - 2px); cursor: pointer; font-size: .85rem; outline: none; }
 .session-menu [role=menuitem][data-highlighted] { background: var(--accent); color: var(--accent-foreground); }
@@ -172,15 +183,19 @@ a:hover { color: var(--foreground); }
 .composer form { border: 1px solid var(--border); border-radius: 1.2rem; padding: .65rem .75rem .55rem; background: var(--background); box-shadow: var(--shadow-card); }
 .composer form:focus-within { border-color: var(--ring); }
 .prompt-input { position: relative; }
-.composer textarea { border: 0; border-radius: .6rem; background: transparent; padding: .35rem .4rem; line-height: 1.6; min-height: 2.3rem; max-height: min(10rem, 25dvh); resize: none; box-shadow: none; }
+.composer textarea { border: 0; border-radius: .6rem; background: transparent; padding: .35rem .4rem; line-height: 1.6; min-height: 2.3rem; max-height: min(10rem, 25dvh); resize: none; overflow-x: hidden; overflow-wrap: anywhere; box-shadow: none; }
 .composer textarea:focus { outline: none; }
-.composer textarea::placeholder { color: var(--muted-foreground); opacity: 1; }
+.composer textarea::placeholder { color: var(--muted-foreground); opacity: 1; white-space: pre-wrap; }
 .composer-actions { display: flex; align-items: flex-end; gap: .6rem; padding: .35rem 0 0; }
 .composer-actions > .icon-button { flex-shrink: 0; }
 .send-button { width: 1.8rem; height: 1.8rem; padding: .25rem; border-radius: .7rem; flex-shrink: 0; }
 .composer-footnote { display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem; margin: .25rem 0 0; color: var(--muted-foreground); font-size: .68rem; }
 .latest { position: absolute; bottom: .75rem; left: 50%; transform: translateX(-50%); z-index: 2; white-space: nowrap; font-size: .78rem; border-radius: 2rem; box-shadow: var(--shadow-popover); }
 .command-suggestions { position: absolute; bottom: 100%; left: -.75rem; right: -.75rem; z-index: 3; margin: 0 0 1rem; padding: .35rem; max-height: min(18rem, 40dvh); overflow-y: auto; overscroll-behavior: contain; list-style: none; background: var(--popover); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-popover); }
+/* Let gestures reach the magnified viewport instead of trapping them in chat. */
+.workspace.pinch-zoomed .transcript, .workspace.pinch-zoomed .command-suggestions { overscroll-behavior: auto; }
+.completion-options { list-style: none; margin: 0; padding: 0; }
+.completion-status { margin: .35rem .5rem; color: var(--muted-foreground); font-size: .78rem; }
 .command-suggestions li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .1rem .8rem; padding: .6rem .8rem; border-radius: .5rem; cursor: pointer; }
 .command-suggestions li:hover { background: var(--muted); }
 .command-suggestions li[aria-selected=true] { background: var(--accent); color: var(--accent-foreground); }

@@ -1,5 +1,5 @@
 //! Loopback listener with one configured browser origin. Host, Origin and a per-launch capability guard
-//! every stateful route. The server exposes neither arbitrary RPC nor filesystem paths.
+//! every stateful route. The server exposes neither arbitrary RPC nor arbitrary filesystem access.
 use crate::{config, protocol::BrowserMessage, session_manager::SessionManager};
 use axum::{
     Router,
@@ -43,6 +43,7 @@ pub struct WebState {
     push: Option<crate::push::PushService>,
     push_slots: Arc<Semaphore>,
     image_slots: Arc<Semaphore>,
+    file_slots: Arc<Semaphore>,
 }
 impl WebState {
     /// Constructs a single-origin boundary for loopback HTTP or an explicitly configured
@@ -81,6 +82,7 @@ impl WebState {
             push: None,
             push_slots: Arc::new(Semaphore::new(4)),
             image_slots: Arc::new(Semaphore::new(2)),
+            file_slots: Arc::new(Semaphore::new(2)),
         }
     }
     /// Enables explicitly opted-in phone delivery through the server-owned worker.
@@ -127,6 +129,7 @@ pub fn router(state: WebState) -> Router {
         .route("/auth", post(auth))
         .route("/sw.js", get(service_worker))
         .route("/push", post(push_request))
+        .route("/files/{session}", post(workspace_files))
         .route("/images/{session}", post(upload_image))
         .route("/images/{session}/{id}", post(load_image))
         .route("/ws", get(upgrade))
@@ -144,7 +147,9 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
     let origins = request.headers().get_all(header::ORIGIN);
     let valid_origin =
         origins.iter().count() <= 1 && origins.iter().all(|origin| origin == state.origin.as_str());
-    let stateful = matches!(request.uri().path(), "/auth" | "/ws" | "/push") || request.uri().path().starts_with("/images/");
+    let stateful = matches!(request.uri().path(), "/auth" | "/ws" | "/push")
+        || request.uri().path().starts_with("/images/")
+        || request.uri().path().starts_with("/files/");
     let cross_site = request
         .headers()
         .get("sec-fetch-site")
@@ -417,4 +422,129 @@ async fn load_image(State(state): State<WebState>, Path((session, id)): Path<(St
     let Some(runtime) = state.runtime.lookup(&session).await else { return StatusCode::NOT_FOUND.into_response(); };
     let Some(image) = runtime.images.get(&id) else { return StatusCode::NOT_FOUND.into_response(); };
     ([(header::CONTENT_TYPE, image.mime)], image.bytes.as_ref().clone()).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesRequest {
+    query: String,
+}
+
+/// Lists bounded filename matches in the session's registered workspace.
+async fn workspace_files(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    if !image_proof(&state, request.headers()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_none_or(|v| v != "application/json")
+    {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let Ok(permit) = state.file_slots.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let body =
+        match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 2048))
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+        };
+    let Ok(input) = serde_json::from_slice::<FilesRequest>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if input.query.len() > 256 || input.query.chars().any(char::is_control) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(root) = state.runtime.workspace_directory(&session).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::task::spawn_blocking(move || {
+        // The blocking task owns admission even if the HTTP future is cancelled.
+        let _permit = permit;
+        crate::workspace_files::search(&root, &input.query)
+    })
+    .await
+    {
+        Ok(Ok(result)) => axum::Json(result).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn file_workers_have_independent_bounded_admission() {
+        let root =
+            std::env::temp_dir().join(format!("pi-web-file-slots-{}", config::identity().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        let options = config::Config::parse([
+            "--cwd".into(),
+            root.to_string_lossy().into_owned(),
+            "--state-dir".into(),
+            root.join("state").to_string_lossy().into_owned(),
+            "--pi".into(),
+            "/missing/pi".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        let runtime = SessionManager::start(options).unwrap();
+        let (_, stopping) = watch::channel(false);
+        let state = WebState::new(
+            runtime.clone(),
+            9876,
+            None,
+            "a".repeat(64),
+            root.clone(),
+            stopping,
+        );
+        let first = state.file_slots.clone().try_acquire_owned().unwrap();
+        let second = state.file_slots.clone().try_acquire_owned().unwrap();
+        let session = runtime.snapshot().await.selected;
+        let request = || {
+            Request::builder()
+                .header("x-pi-capability", "a".repeat(64))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"query":""}"#))
+                .unwrap()
+        };
+        assert_eq!(
+            workspace_files(State(state.clone()), Path(session.clone()), request())
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(state.image_slots.try_acquire().is_ok());
+        // Dropping the awaiting future must leave a blocking worker's permit owned.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = first;
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        worker.abort();
+        assert!(state.file_slots.clone().try_acquire_owned().is_err());
+        finish_tx.send(()).unwrap();
+        worker.await.unwrap();
+        assert_eq!(
+            workspace_files(State(state), Path(session), request())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        drop(second);
+        runtime.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

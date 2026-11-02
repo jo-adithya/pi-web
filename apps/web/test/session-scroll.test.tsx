@@ -32,8 +32,8 @@ function runFrame() {
   for (const callback of pending) callback(0);
 }
 
-function setup(stick = true) {
-  const model = createSessionModel("session", () => true, () => true);
+function setup(stick = true, transport = () => true) {
+  const model = createSessionModel("session", transport, () => true);
   model.receive({ v: 1, sessionId: "session", epoch: "epoch", body: { type: "hello", project: "fixture", process: "ready" } });
   model.receive({ v: 1, sessionId: "session", epoch: "epoch", body: { type: "snapshot", throughSeq: 0,
     messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } } });
@@ -109,6 +109,40 @@ it("restores a paused position and jump-to-latest resumes following growth", () 
   expect(scroller.scrollTop).toBe(1400);
   grow(1800); observer.resize(); runFrame();
   expect(scroller.scrollTop).toBe(1800);
+});
+
+it.each(["Enter", "Send"])("scrolls to the bottom when %s sends from a paused transcript without a resize", action => {
+  const { model, view, scroller } = setup(false);
+  runFrame(); expect(scroller.scrollTop).toBe(120);
+  model.setDraft("Hello"); flush();
+  if (action === "Enter") fireEvent.keyDown(view.getByLabelText("Message Pi"), { key: "Enter" });
+  else fireEvent.click(view.getByRole("button", { name: "Send" }));
+  flush();
+  expect(model.pending()).toBe(true);
+  expect(model.stick()).toBe(true);
+  runFrame();
+  expect(scroller.scrollTop).toBe(1000);
+  expect(view.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+});
+
+it("scrolls on send even when following is already enabled near the bottom", () => {
+  const { model, view, scroller } = setup(); runFrame();
+  scroller.scrollTop = 750; fireEvent.scroll(scroller); flush();
+  expect(model.stick()).toBe(true);
+  model.setDraft("Hello"); flush();
+  fireEvent.keyDown(view.getByLabelText("Message Pi"), { key: "Enter" }); flush();
+  runFrame(); expect(scroller.scrollTop).toBe(1000);
+});
+
+it.each(["empty", "disconnected", "rejected transport"])("keeps the reading position when a prompt is not sent: %s", reason => {
+  const { model, view, scroller } = setup(false, () => reason !== "rejected transport"); runFrame();
+  if (reason !== "empty") model.setDraft("Hello");
+  if (reason === "disconnected") model.disconnected();
+  flush();
+  fireEvent.keyDown(view.getByLabelText("Message Pi"), { key: "Enter" }); flush();
+  expect(model.pending()).toBe(false);
+  expect(model.stick()).toBe(false);
+  runFrame(); expect(scroller.scrollTop).toBe(120);
 });
 
 it("disconnects the observer, cancels pending scrolling, and saves position on unmount", () => {

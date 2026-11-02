@@ -584,3 +584,326 @@ async fn uploaded_image_reaches_rpc_and_live_user_and_tool_previews_only_as_refs
     assert_eq!(command["message"], ""); assert_eq!(command["images"][0]["mimeType"], "image/png");
     assert_eq!(command["images"][0]["data"], base64::engine::general_purpose::STANDARD.encode(png));
 }
+
+fn files_request(session: &str, query: &str) -> Request<Body> {
+    request(&format!("/files/{session}"))
+        .method("POST")
+        .header("origin", "http://127.0.0.1:9876")
+        .header("x-pi-capability", "a".repeat(64))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"query": query}).to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn workspace_files_returns_ranked_relative_paths() {
+    let (fixture, router, runtime) = setup().await;
+    fs::create_dir(fixture.0.join("src")).unwrap();
+    for path in [
+        "src/Needle.rs",
+        "needle.txt",
+        "a-needle.txt",
+        "src-file.rs",
+        "other-src.rs",
+    ] {
+        fs::write(fixture.0.join(path), "private contents").unwrap();
+    }
+    let session = runtime.snapshot().await.selected;
+    assert_eq!(
+        file_matches(&router, &session, "src").await,
+        serde_json::json!({"paths": ["src-file.rs", "src/Needle.rs", "other-src.rs"], "truncated": false})
+    );
+    let response = router
+        .clone()
+        .oneshot(files_request(&session, "NEEDLE"))
+        .await
+        .unwrap();
+    runtime.shutdown().await;
+    assert_eq!(
+        router
+            .oneshot(files_request(&session, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"paths": ["needle.txt", "src/Needle.rs", "a-needle.txt"], "truncated": false})
+    );
+}
+
+#[tokio::test]
+async fn workspace_files_validates_boundary_proof_and_bounded_json() {
+    let (_fixture, router, runtime) = setup().await;
+    let session = runtime.snapshot().await.selected;
+    for (body, expected) in [
+        ("not json".into(), StatusCode::BAD_REQUEST),
+        (r#"{"query":1}"#.into(), StatusCode::BAD_REQUEST),
+        (
+            r#"{"query":"","path":"/etc"}"#.into(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"query":"x".repeat(257)}).to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"query":"é".repeat(129)}).to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"query":"a\nb"}).to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"query":"\u{7f}"}).to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("x".repeat(2049), StatusCode::PAYLOAD_TOO_LARGE),
+        (
+            serde_json::json!({"query":"é".repeat(128)}).to_string(),
+            StatusCode::OK,
+        ),
+        (
+            serde_json::json!({"query":"../"}).to_string(),
+            StatusCode::OK,
+        ),
+    ] {
+        let mut req = files_request(&session, "");
+        *req.body_mut() = Body::from(body);
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            expected
+        );
+    }
+    for (header, value, duplicate, expected) in [
+        ("origin", None, false, StatusCode::FORBIDDEN),
+        (
+            "origin",
+            Some("https://evil.test"),
+            false,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "origin",
+            Some("http://127.0.0.1:9876"),
+            true,
+            StatusCode::FORBIDDEN,
+        ),
+        ("host", Some("evil.test"), false, StatusCode::FORBIDDEN),
+        ("host", Some("127.0.0.1:9876"), true, StatusCode::FORBIDDEN),
+        ("x-pi-capability", None, false, StatusCode::UNAUTHORIZED),
+        (
+            "x-pi-capability",
+            Some("wrong"),
+            false,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "x-pi-capability",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            true,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "content-type",
+            None,
+            false,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ] {
+        let mut req = files_request(&session, "");
+        if !duplicate {
+            req.headers_mut().remove(header);
+        }
+        if let Some(value) = value {
+            req.headers_mut().append(header, value.parse().unwrap());
+        }
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            expected,
+            "{header}"
+        );
+    }
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(files_request("invalid", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(files_request(&config::identity().unwrap(), ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let mut req = files_request(&session, "");
+    *req.body_mut() = Body::from_stream(futures_util::stream::pending::<
+        Result<axum::body::Bytes, std::io::Error>,
+    >());
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), router.oneshot(req))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    runtime.shutdown().await;
+}
+
+async fn file_matches(router: &Router, session: &str, query: &str) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(files_request(session, query))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn workspace_files_ignores_hidden_outputs_and_symlink_escapes() {
+    use std::os::unix::fs::symlink;
+    let (fixture, router, runtime) = setup().await;
+    let outside = Fixture(fixture.0.with_extension("outside"));
+    fs::create_dir(&outside.0).unwrap();
+    fs::write(outside.0.join("secret-match.txt"), "secret").unwrap();
+    symlink(&outside.0, fixture.0.join("linked-match")).unwrap();
+    symlink(
+        outside.0.join("secret-match.txt"),
+        fixture.0.join("match-link.txt"),
+    )
+    .unwrap();
+    fs::write(fixture.0.join("visible-match.txt"), "contents").unwrap();
+    fs::write(fixture.0.join(".env-match"), "secret").unwrap();
+    fs::write(fixture.0.join("bad\nmatch.txt"), "contents").unwrap();
+    fs::create_dir(fixture.0.join("bad\u{85}match")).unwrap();
+    fs::write(fixture.0.join("bad\u{85}match/inside.txt"), "contents").unwrap();
+    for dir in [
+        ".git",
+        ".hidden",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "vendor",
+        "__pycache__",
+    ] {
+        fs::create_dir(fixture.0.join(dir)).unwrap();
+        fs::write(fixture.0.join(dir).join("hidden-match.txt"), "secret").unwrap();
+    }
+    let session = runtime.snapshot().await.selected;
+    assert_eq!(
+        file_matches(&router, &session, "match").await,
+        serde_json::json!({"paths":["visible-match.txt"],"truncated":false})
+    );
+    assert_eq!(
+        file_matches(&router, &session, "/etc/passwd").await["paths"],
+        serde_json::json!([])
+    );
+    // The registered root itself may not be redirected after registration.
+    let moved = Fixture(fixture.0.with_extension("moved"));
+    fs::rename(&fixture.0, &moved.0).unwrap();
+    symlink(&outside.0, &fixture.0).unwrap();
+    assert_eq!(
+        router
+            .oneshot(files_request(&session, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    fs::remove_file(&fixture.0).unwrap();
+    fs::rename(&moved.0, &fixture.0).unwrap();
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn workspace_files_uses_catalog_workspace_even_when_stopped_and_unselected() {
+    use pi_web::protocol::{WorkspaceAction, WorkspaceCommand};
+    let (fixture, router, runtime) = setup().await;
+    let first = runtime.snapshot().await;
+    fs::write(fixture.0.join("first-scope.txt"), "").unwrap();
+    let second = Fixture(fixture.0.with_extension("second"));
+    fs::create_dir(&second.0).unwrap();
+    fs::write(second.0.join("second-scope.txt"), "").unwrap();
+    let added = runtime
+        .command(WorkspaceCommand {
+            v: 2,
+            request_id: "files-add".into(),
+            action: WorkspaceAction::AddWorkspace {
+                path: second.0.to_str().unwrap().into(),
+                confirmed: true,
+            },
+        })
+        .await;
+    assert!(added.ok, "{added:?}");
+    let epoch = runtime
+        .lookup(&first.selected)
+        .await
+        .unwrap()
+        .summary()
+        .epoch;
+    let stopped = runtime
+        .command(WorkspaceCommand {
+            v: 2,
+            request_id: "files-stop".into(),
+            action: WorkspaceAction::Stop {
+                session_id: first.selected.clone(),
+                epoch,
+                confirmed: true,
+            },
+        })
+        .await;
+    assert!(stopped.ok, "{stopped:?}");
+    assert!(runtime.lookup(&first.selected).await.is_none());
+    assert_eq!(
+        file_matches(&router, &first.selected, "scope").await["paths"],
+        serde_json::json!(["first-scope.txt"])
+    );
+    assert_eq!(
+        file_matches(&router, &added.selected, "scope").await["paths"],
+        serde_json::json!(["second-scope.txt"])
+    );
+    fs::remove_dir_all(&second.0).unwrap();
+    assert_eq!(
+        router
+            .oneshot(files_request(&added.selected, ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn workspace_files_bounds_results_and_reports_truncation() {
+    let (fixture, router, runtime) = setup().await;
+    for index in 0..60 {
+        fs::write(fixture.0.join(format!("bounded-{index:03}.txt")), "").unwrap();
+    }
+    let session = runtime.snapshot().await.selected;
+    let body = file_matches(&router, &session, "bounded-").await;
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body["paths"].as_array().unwrap().len(), 50);
+    assert_eq!(body["paths"][0], "bounded-000.txt");
+    assert_eq!(body["paths"][49], "bounded-049.txt");
+    runtime.shutdown().await;
+}

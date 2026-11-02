@@ -14,6 +14,7 @@ pub mod session_manager;
 pub mod view;
 
 mod workspaces;
+mod workspace_files;
 
 
 pub mod images;

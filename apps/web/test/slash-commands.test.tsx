@@ -28,6 +28,22 @@ function setup() {
   return { page, input, type, key, transport, receive, model };
 }
 
+it("keeps the caret in earlier lines across successive typo corrections", () => {
+  const { input, type, model, transport } = setup();
+  type("Fix teh typo\nKeep this second line\nAnd this third line");
+  input.setSelectionRange(4, 7); fireEvent.select(input); flush();
+  type("Fix the typo\nKeep this second line\nAnd this third line", 7);
+  expect(input.selectionStart).toBe(7);
+  expect(input.selectionEnd).toBe(7);
+  type("Fix th typo\nKeep this second line\nAnd this third line", 6);
+  expect(input.selectionStart).toBe(6);
+  type("Fix the typo\nKeep this second line\nAnd this third line", 7);
+  expect(input.selectionStart).toBe(7);
+  expect(input.selectionEnd).toBe(7);
+  expect(model.draft()).toBe("Fix the typo\nKeep this second line\nAnd this third line");
+  expect(transport).not.toHaveBeenCalled();
+});
+
 it("filters loaded commands, shows descriptions and inserts with keyboard without sending", () => {
   const { page, input, type, key, transport } = setup();
   type("/re");

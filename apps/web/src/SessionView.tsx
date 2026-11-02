@@ -1,5 +1,5 @@
 import { ConfirmationDialog } from "./components/ActionDialog";
-import { For, Show, createSignal, onSettled } from "solid-js";
+import { For, Show, createEffect, createSignal, onSettled } from "solid-js";
 import type { SessionModel } from "./session-model";
 import { MessageList } from "./Conversation";
 import { ExtensionDialog } from "./components/ExtensionDialog";
@@ -52,6 +52,8 @@ export function SessionView(props: { model: SessionModel }) {
       if (!disposed && stick()) scroller.scrollTop = scroller.scrollHeight;
     });
   };
+  // Sending resumes following immediately, even before transcript content grows.
+  createEffect(() => pending(), sending => { if (sending) scheduleScroll(); });
   onSettled(() => {
     scroller.scrollTop = model.scroll;
     const observer = new ResizeObserver(scheduleScroll);
@@ -106,7 +108,7 @@ export function SessionView(props: { model: SessionModel }) {
           <form onSubmit={event => { event.preventDefault(); submit(); }}>
             <PromptInput id={`prompt-${model.id}`} value={draft()} onInput={setDraft} commands={state.commands}
               completionEnabled={online() && state.synced && state.status.process === "ready" && state.status.activity === "idle" && !pending()}
-              onImages={model.addImages} onSubmit={submit} />
+              searchFiles={model.searchFiles} onImages={model.addImages} onSubmit={submit} />
             <div class="composer-actions">
               <AgentControls model={model} />
               <Show when={state.status.activity !== "idle" && state.status.activity !== "failed"} fallback={

@@ -1,6 +1,7 @@
 import { createSignal, createStore } from "solid-js";
 import type { BrowserAction, BrowserMessage, ServerMessage, ThinkingLevel, RunOutcome } from "./generated/protocol";
 import { imageRequest, prepareImage, IMAGE_BYTES, type Attachment } from "./images";
+import { searchWorkspaceFiles } from "./workspace-files";
 import { loadCapability } from "./browser-auth";
 import { applyServer, initialState } from "./client-state";
 
@@ -126,6 +127,6 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     }
     return true;
   }
-  return { id, dispose, attachments, uploading, addImages, removeImage, loadImage, state, draft, setDraft, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, receive, disconnected, stopped, scroll: 0 };
+  return { id, dispose, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, receive, disconnected, stopped, scroll: 0 };
 }
 export type SessionModel = ReturnType<typeof createSessionModel>;

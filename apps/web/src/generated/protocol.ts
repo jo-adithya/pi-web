@@ -226,7 +226,11 @@ export type CatalogItem = { workspaceId: string, sessionId: string, title: strin
 
 export type WorkspaceItem = { workspaceId: string, name: string, path: string, };
 
-export type WorkspaceAction = { "type": "list" } | { "type": "create" } | { "type": "create_in", workspaceId: string, } | { "type": "add_workspace", path: string, confirmed: boolean, } | { "type": "select_workspace", workspaceId: string, } | { "type": "open", sessionId: string, } | { "type": "stop", sessionId: string, epoch: string, confirmed: boolean, } | { "type": "rename", sessionId: string, title: string, } | { "type": "delete", sessionId: string, epoch: string | null, confirmed: boolean, } | { "type": "subscribe", sessionId: string, } | { "type": "unsubscribe", sessionId: string, };
+export type WorkspaceAction = { "type": "list" } | { "type": "create" } | { "type": "create_in", workspaceId: string, } | { "type": "add_workspace", path: string, confirmed: boolean, } | { "type": "select_workspace", workspaceId: string, } | { "type": "delete_workspace", workspaceId: string, 
+/**
+ * Approved conversation IDs mapped to runtime epochs, or null for stopped conversations.
+ */
+expectedSessions: { [key in string]: string | null }, confirmed: boolean, } | { "type": "open", sessionId: string, } | { "type": "stop", sessionId: string, epoch: string, confirmed: boolean, } | { "type": "rename", sessionId: string, title: string, } | { "type": "delete", sessionId: string, epoch: string | null, confirmed: boolean, } | { "type": "subscribe", sessionId: string, } | { "type": "unsubscribe", sessionId: string, };
 
 export type WorkspaceCommand = { v: number, requestId: string, action: WorkspaceAction, };
 

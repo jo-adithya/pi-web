@@ -47,6 +47,7 @@ struct State {
     projects: BTreeMap<String, Project>,
     active: BTreeMap<String, Active>,
     requests: VecDeque<Cached>,
+    removing_workspace: bool,
     stopping: bool,
 }
 
@@ -129,6 +130,7 @@ impl SessionManager {
                 projects,
                 active,
                 requests: VecDeque::new(),
+                removing_workspace: false,
                 stopping: false,
             }),
         })))
@@ -284,6 +286,24 @@ impl SessionManager {
             .filter(|slot| slot.lifecycle == SlotStatus::Open)
             .map(|slot| slot.handle.clone())
     }
+    /// Returns the catalog session's registered workspace, including stopped sessions.
+    /// Missing sessions and stopping/removing workspaces are unavailable. The caller
+    /// must verify directory availability when opening it on a blocking worker.
+    pub async fn workspace_directory(&self, id: &str) -> Option<std::path::PathBuf> {
+        let state = self.0.state.lock().await;
+        if !valid_id(id)
+            || state.stopping
+            || state.removing_workspace
+            || state.active.get(id).is_some_and(|slot| slot.lifecycle != SlotStatus::Open)
+        {
+            return None;
+        }
+        state
+            .projects
+            .values()
+            .find(|project| project.catalog.entries.iter().any(|entry| entry.id == id))
+            .map(|project| project.config.cwd.clone())
+    }
     pub async fn snapshot(&self) -> WorkspaceReply {
         let state = self.0.state.lock().await;
         Self::reply(&state, None, true, "catalog")
@@ -344,6 +364,10 @@ impl SessionManager {
                 WorkspaceAction::List | WorkspaceAction::Create => true,
                 WorkspaceAction::CreateIn { workspace_id }
                 | WorkspaceAction::SelectWorkspace { workspace_id } => valid_id(workspace_id),
+                WorkspaceAction::DeleteWorkspace { workspace_id, expected_sessions, .. } => {
+                    valid_id(workspace_id) && expected_sessions.len() <= MAX_SESSIONS
+                        && expected_sessions.iter().all(|(session_id, epoch)| valid_id(session_id) && epoch.as_deref().is_none_or(valid_id))
+                },
                 WorkspaceAction::AddWorkspace { path, .. } => path.len() <= 1024,
                 WorkspaceAction::Open { session_id }
                 | WorkspaceAction::Rename { session_id, .. }
@@ -447,8 +471,78 @@ impl SessionManager {
         if state.stopping {
             return Self::reply(&state, id, false, "stopping");
         }
+        // Cleanup releases the lock so snapshots and subscriptions remain available.
+        // Serialize mutations until removal commits to prevent new runtimes or selection races.
+        if state.removing_workspace && !matches!(command.action,
+            WorkspaceAction::List | WorkspaceAction::Subscribe { .. } | WorkspaceAction::Unsubscribe { .. }
+        ) {
+            return Self::reply(&state, id, false, "workspace_busy");
+        }
         match &command.action {
             WorkspaceAction::List => Self::reply(&state, id, true, "catalog"),
+            WorkspaceAction::DeleteWorkspace { workspace_id, expected_sessions, confirmed } => {
+                if !confirmed {
+                    return Self::reply(&state, id, false, "confirmation_required");
+                }
+                let Some(project) = state.projects.get(workspace_id) else {
+                    return Self::reply(&state, id, false, "unknown_workspace");
+                };
+                if state.registry.entries.len() == 1 {
+                    return Self::reply(&state, id, false, "last_workspace");
+                }
+                let sessions: Vec<_> = project.catalog.entries.iter().map(|entry| entry.id.clone()).collect();
+                if expected_sessions.len() != sessions.len() || sessions.iter().any(|session_id| {
+                    expected_sessions.get(session_id) != Some(&state.active.get(session_id).map(|slot| slot.handle.summary().epoch))
+                }) {
+                    return Self::reply(&state, id, false, "workspace_changed");
+                }
+                if sessions.iter().any(|session_id| state.active.get(session_id).is_some_and(|slot| slot.lifecycle != SlotStatus::Open)) {
+                    return Self::reply(&state, id, false, "cleanup_not_complete");
+                }
+                state.removing_workspace = true;
+                let mut jobs = tokio::task::JoinSet::new();
+                for session_id in &sessions {
+                    if let Some(slot) = state.active.get_mut(session_id) {
+                        slot.lifecycle = SlotStatus::Stopping;
+                        let handle = slot.handle.clone();
+                        let session_id = session_id.clone();
+                        jobs.spawn(async move { (session_id, handle.shutdown().await) });
+                    }
+                }
+                drop(state);
+                let mut cleaned = Vec::new();
+                while let Some(result) = jobs.join_next().await {
+                    if let Ok((session_id, true)) = result {
+                        cleaned.push(session_id);
+                    }
+                }
+                state = self.0.state.lock().await;
+                state.removing_workspace = false;
+                for session_id in cleaned {
+                    state.active.remove(&session_id);
+                }
+                let mut failed = false;
+                for session_id in &sessions {
+                    if let Some(slot) = state.active.get_mut(session_id) {
+                        slot.lifecycle = SlotStatus::CleanupFailed;
+                        failed = true;
+                    }
+                }
+                if failed {
+                    return Self::reply(&state, id, false, "cleanup_failed");
+                }
+                let mut next = state.registry.clone();
+                next.entries.retain(|entry| entry.id != *workspace_id);
+                if next.selected == *workspace_id {
+                    next.selected = next.entries[0].id.clone();
+                }
+                if next.save(&self.0.registry_store).is_err() {
+                    return Self::reply(&state, id, false, "workspace_write_failed");
+                }
+                state.registry = next;
+                state.projects.remove(workspace_id);
+                Self::reply(&state, id, true, "workspace_deleted")
+            }
             WorkspaceAction::AddWorkspace { path, confirmed } => {
                 if !confirmed {
                     return Self::reply(&state, id, false, "confirmation_required");

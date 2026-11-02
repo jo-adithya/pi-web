@@ -32,6 +32,22 @@ beforeEach(() => {
   sessionStorage.setItem("pi-web.capability.v1", "a".repeat(64)); vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true })); });
 afterEach(() => { cleanup(); Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal"); Reflect.deleteProperty(HTMLDialogElement.prototype, "close"); vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear(); document.documentElement.classList.remove("dark"); history.replaceState(null, "", "/"); });
 
+it.each([1, 2])("tracks pinch-zoom scale from %s and releases its viewport listener on unmount", async initialScale => {
+  const viewport = Object.assign(new EventTarget(), { scale: initialScale });
+  const removed = vi.spyOn(viewport, "removeEventListener");
+  vi.stubGlobal("visualViewport", viewport);
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />); flush();
+  const workspace = page.container.querySelector(".workspace")!;
+  expect(workspace.classList.contains("pinch-zoomed")).toBe(initialScale > 1);
+  viewport.scale = 1.5; viewport.dispatchEvent(new Event("resize")); flush();
+  expect(workspace.classList.contains("pinch-zoomed")).toBe(true);
+  viewport.scale = 1; viewport.dispatchEvent(new Event("resize")); flush();
+  expect(workspace.classList.contains("pinch-zoomed")).toBe(false);
+  page.unmount();
+  expect(removed).toHaveBeenCalledWith("resize", expect.any(Function));
+});
+
 it.each(["Session options", "Options for Conversation 2"])("dismisses %s on outside interaction", async label => {
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
@@ -124,6 +140,87 @@ it("shows live sidebar activity beside titles without status labels", async () =
     expect(Boolean(first.querySelector(".session-title-row .working-dot"))).toBe(["running", "retrying", "compacting"].includes(activity));
     expect(first.getAttribute("aria-label")).toContain(activity.replaceAll("_", " "));
   }
+});
+
+it("deletes a workspace only after confirmation and selects a remaining conversation", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.();
+  const value = { ...grouped(), selected: b, selectedWorkspace: wb };
+  socket.emit(value);
+  for (const id of [a, b]) for (const frame of frames(id)) socket.emit(frame);
+  for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...value, requestId: JSON.parse(wire).requestId });
+  fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "discard this draft" } }); flush();
+  const open = async () => {
+    fireEvent.keyDown(page.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
+    fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Delete workspace…" }), { key: "Enter" }); flush();
+    return screen.getByRole("dialog", { name: "Delete workspace" });
+  };
+  const before = socket.send.mock.calls.length;
+  await open();
+  expect(screen.getByText(/Project files and saved history will be retained/)).toBeTruthy();
+  expect(socket.send.mock.calls).toHaveLength(before);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" })); flush();
+  expect(socket.send.mock.calls).toHaveLength(before);
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: "Delete workspace" })); flush();
+  const request = JSON.parse(socket.send.mock.calls.at(-1)![0]);
+  expect(request.action).toEqual({ type: "delete_workspace", workspaceId: wb, expectedSessions: { [b]: item(b, "Conversation 2", wb).runtime!.epoch }, confirmed: true });
+  socket.emit({ ...catalog(), sessions: [item(a, "Conversation 1")], requestId: request.requestId, code: "workspace_deleted" });
+  expect(page.queryByRole("group", { name: "Beta" })).toBeNull();
+  expect(page.getByRole("button", { name: /^Conversation 1/ }).getAttribute("aria-pressed")).toBe("true");
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("");
+});
+
+it("disables deletion of the last workspace and explains how to remove it", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...catalog(), requestId: JSON.parse(wire).requestId });
+  fireEvent.keyDown(page.getByLabelText("Workspace options for Alpha"), { key: "Enter" }); flush();
+  const deletion = await screen.findByRole("menuitem", { name: "Delete workspace…" });
+  expect(deletion.getAttribute("aria-disabled")).toBe("true");
+  expect(screen.getByText(/Keep at least one workspace/)).toBeTruthy();
+});
+
+it.each(["changed runtime", "disconnected"])("prevents workspace confirmation when %s", async change => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...grouped(), requestId: JSON.parse(wire).requestId });
+  fireEvent.keyDown(page.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
+  fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Delete workspace…" }), { key: "Enter" }); flush();
+  const confirm = screen.getByRole("button", { name: "Delete workspace" }) as HTMLButtonElement;
+  expect(confirm.disabled).toBe(false);
+  if (change === "disconnected") { socket.readyState = 3; socket.onclose?.(); flush(); }
+  else socket.emit({ ...grouped(), sessions: [item(a, "Conversation 1"), { ...item(b, "Conversation 2", wb), runtime: { ...item(b, "Conversation 2", wb).runtime!, epoch: b } }] });
+  const before = socket.send.mock.calls.length;
+  expect(confirm.disabled).toBe(true);
+  fireEvent.click(confirm); flush();
+  expect(socket.send.mock.calls).toHaveLength(before);
+});
+
+it("retains the workspace and draft when workspace deletion fails", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.();
+  const value = { ...grouped(), selected: b, selectedWorkspace: wb };
+  socket.emit(value);
+  for (const id of [a, b]) for (const frame of frames(id)) socket.emit(frame);
+  for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...value, requestId: JSON.parse(wire).requestId });
+  fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "keep my draft" } }); flush();
+  fireEvent.keyDown(page.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
+  fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Delete workspace…" }), { key: "Enter" }); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Delete workspace" })); flush();
+  const request = JSON.parse(socket.send.mock.calls.at(-1)![0]);
+  socket.emit({ ...value, requestId: request.requestId, ok: false, code: "workspace_write_failed", sessions: [item(a, "Conversation 1"), { ...item(b, "Conversation 2", wb), lifecycle: "stopped", runtime: null }] });
+  expect(page.getByRole("group", { name: "Beta" })).toBeTruthy();
+  expect(page.getByText("Workspace command not completed: workspace write failed.")).toBeTruthy();
+  expect(page.getByText("Unsent draft: keep my draft")).toBeTruthy();
 });
 
 it("groups conversations by workspace and creates in the chosen folder", async () => {
@@ -305,6 +402,30 @@ it("keeps conversations in a sidebar and persists the selected color scheme", as
   expect(next.getByRole("button", { name: /^Color scheme / }).textContent).toContain("Dark");
   chooseOption(next.getByRole("button", { name: /^Color scheme / }), "Light");
   expect(document.documentElement.classList.contains("dark")).toBe(false);
+});
+
+it("leaves zoomed touch pans to the viewport, then restores sidebar swipes at normal scale", async () => {
+  const viewport = Object.assign(new EventTarget(), { scale: 2 });
+  vi.stubGlobal("visualViewport", viewport);
+  vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
+    matches: query === "(max-width: 760px)", media: query,
+    addEventListener: vi.fn(), removeEventListener: vi.fn(),
+  })));
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />); flush();
+  const main = page.getByRole("main");
+  const start = () => fireEvent.touchStart(main, { touches: [{ identifier: 1, clientX: 80, clientY: 200 }] });
+  const end = () => { fireEvent.touchEnd(main, { touches: [], changedTouches: [{ identifier: 1, clientX: 200, clientY: 205 }] }); flush(); };
+  start(); end();
+  expect(screen.queryByRole("dialog", { name: "Sessions" })).toBeNull();
+  viewport.scale = 1; viewport.dispatchEvent(new Event("resize")); flush();
+  start();
+  viewport.scale = 2; viewport.dispatchEvent(new Event("resize")); flush();
+  end();
+  expect(screen.queryByRole("dialog", { name: "Sessions" })).toBeNull();
+  viewport.scale = 1; viewport.dispatchEvent(new Event("resize")); flush();
+  start(); end();
+  await vi.waitFor(() => expect(screen.getByRole("dialog", { name: "Sessions" })).toBeTruthy());
 });
 
 it("opens with a right swipe and closes with a left swipe on mobile", async () => {

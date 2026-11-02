@@ -133,8 +133,18 @@ application's automated proxy-boundary tests.
   smaller screens). Use the **+** beside Workspaces to add a trusted project folder
   on the server machine; folders are remembered across launches. Selecting a workspace
   restores its selected conversation without automatically launching a stopped runtime.
+  Each workspace has a three-dot menu with **Delete workspace…**. After confirmation,
+  deletion stops its runtimes and removes the workspace and its conversations from
+  the sidebar. Project files and saved history are retained; page-local drafts are
+  discarded. At least one workspace must remain, so add another before deleting
+  your last workspace. Failed cleanup or saving leaves the workspace visible.
   **New conversation** creates in the currently selected workspace. The compact
-  composer grows with your message. Choose **System**, **Light**, or **Dark** in the
+  composer grows with your message. Type **@** to search the current workspace's
+  files, then use arrow keys and **Tab**/**Enter** or tap a result to insert its
+  relative path; **Escape** dismisses suggestions. Paths with spaces are quoted.
+  The picker inserts references, not file contents. Search skips hidden files,
+  symlinks and common dependency/build folders; limited results ask you to narrow
+  the query. Choose **System**, **Light**, or **Dark** in the
   sidebar; the preference is saved locally and System follows your OS setting.
 - Use **New conversation** and the sidebar for up to **four active Pi
   runtimes across all workspaces**, with at most **16 workspaces** and

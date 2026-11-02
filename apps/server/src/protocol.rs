@@ -412,6 +412,14 @@ pub enum WorkspaceAction {
     SelectWorkspace {
         workspace_id: String,
     },
+    /// Stops this workspace's runtimes and unregisters it, retaining project files and saved history.
+    /// The final workspace must be kept.
+    DeleteWorkspace {
+        workspace_id: String,
+        /// Approved conversation IDs mapped to runtime epochs, or null for stopped conversations.
+        expected_sessions: std::collections::BTreeMap<String, Option<String>>,
+        confirmed: bool,
+    },
     Open {
         session_id: String,
     },
