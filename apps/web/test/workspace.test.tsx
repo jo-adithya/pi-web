@@ -32,6 +32,25 @@ beforeEach(() => {
   sessionStorage.setItem("pi-web.capability.v1", "a".repeat(64)); vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true })); });
 afterEach(() => { cleanup(); Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal"); Reflect.deleteProperty(HTMLDialogElement.prototype, "close"); vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear(); document.documentElement.classList.remove("dark"); history.replaceState(null, "", "/"); });
 
+it("opens local changes for a stopped session without starting Pi", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const request = vi.fn(async (url: string) => url === "/auth" ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ files: [], truncated: false, note: null })));
+  vi.stubGlobal("fetch", request);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.();
+  socket.emit({ ...catalog(), sessions: [{ ...item(a, "Conversation 1"), lifecycle: "stopped", runtime: null }] });
+  socket.send.mockClear();
+  fireEvent.click(page.getByRole("button", { name: "Changes" })); flush();
+  expect(page.container.querySelector(".workspace")?.classList.contains("review-workspace")).toBe(true);
+  await vi.waitFor(() => { flush(); expect(page.getByText(/No changes in this scope\./)).toBeTruthy(); });
+  expect(request).toHaveBeenCalledWith(`/review/${a}`, expect.objectContaining({ method: "POST", body: JSON.stringify({ scope: "unstaged" }) }));
+  expect(socket.send).not.toHaveBeenCalled();
+  fireEvent.click(page.getByRole("button", { name: "Conversation" })); flush();
+  expect(page.getByText("Session stopped")).toBeTruthy();
+  expect(page.container.querySelector(".workspace")?.classList.contains("review-workspace")).toBe(false);
+});
+
 it.each([1, 2])("tracks pinch-zoom scale from %s and releases its viewport listener on unmount", async initialScale => {
   const viewport = Object.assign(new EventTarget(), { scale: initialScale });
   const removed = vi.spyOn(viewport, "removeEventListener");

@@ -102,6 +102,95 @@ See [Tailscale Serve documentation](https://tailscale.com/kb/1242/tailscale-serv
 Actual phone connectivity requires a configured tailnet and is separate from the
 application's automated proxy-boundary tests.
 
+## Local changes review
+
+Open **Changes** beside **Conversation** to review the selected conversation’s
+workspace, even when its Pi runtime is stopped. The workspace must be the root of
+a Git working tree (including a Git-colocated jj repository).
+
+- **Unstaged** compares tracked files with the index. Untracked filenames are listed,
+  but their contents are not read. **Staged** compares the index with HEAD.
+- **Branch** accepts an existing local branch, tag, or full ref and compares its
+  merge-base with committed HEAD. It excludes staged/unstaged edits. GitHub URLs,
+  fetching, staging, committing, and publishing are not supported.
+- **Commit** shows one local commit against its first parent, or an empty tree for
+  a root commit. The picker loads up to 100 recent commits reachable from local
+  HEAD on demand, including merged history. **Reload commits** updates the list;
+  the selected full commit ID stays pinned, even if HEAD moves. Staged/unstaged
+  edits are excluded. Missing parent objects in shallow repositories produce an
+  error rather than a misleading root diff. History is read-only and bounded to
+  256 KiB per response with a ten-second request deadline.
+- Filter files by path and read unified diffs with old/new line numbers and change
+  counts. **Next unreviewed** moves through remaining files. **Reviewed** marks are
+  local to this conversation and page. Refresh revalidates marks as each file loads;
+  only identical content stays reviewed. Reloading clears them. The file list loads
+  first; patches load only when selected, with a 1 MiB per-conversation memory cache
+  cleared by Refresh. Ask Pi, Reviewed, and Structural wait for that file’s patch. Long lines wrap in both text and structural diffs,
+  keeping source whitespace and line numbers. Diffs scroll with the page; the files sidebar scrolls
+  independently. Top controls scroll away; file headers stay sticky. On narrow
+  screens, **Files** opens the scrollable file picker; choosing a file returns to its diff. File jumps respect reduced-motion settings.
+  Large diffs use **Previous rows / Next rows** pages of at most 500 rows instead
+  of mounting the entire file. Structural pages also bound segment rendering;
+  lines with more than 256 syntax segments retain their text without emphasis.
+- Syntax colors use Catppuccin Latte in light mode and Mocha in dark mode, shared
+  with conversation code blocks. Diff addition/removal backgrounds stay unchanged.
+- Small patches (up to 16 KiB and 400 lines) get syntax highlighting for JS/TS/JSX/TSX,
+  Rust, Python, JSON, shell, CSS, HTML/XML/SVG, and YAML. Larger or unknown-language
+  patches stay plain. Colors use each hunk’s available context, not the entire file.
+- In **Text** mode, **Expand above / below** reveals up to 20 unchanged lines per
+  click before, between, or after hunks. Expanded lines retain numbering, wrapping,
+  and the same highlighting limits. They do not change Reviewed marks or the patch
+  sent to your draft. Expansion is on demand and checks the original file fingerprint;
+  if the file changed, refresh first. Refresh or selecting another file clears it.
+  Verified expanded diffs are cached in server memory (up to 4 entries / 4 MiB).
+  Every hit still checks fresh membership and the original/final file fingerprints;
+  it skips the expanded Git diff, not the safety checks.
+  Context requests have a five-second server deadline, a 1 MiB full-diff scan limit,
+  and a 64 KiB response limit; the browser retains at most 256 KiB of extra context
+  for the selected file. Unsupported or oversized files keep their original diff.
+- **Structural** optionally compares syntax for the selected file using locally installed
+  **Difftastic 0.72.0** (`difft` on the server’s PATH). Text is the default and remains
+  visible during comparison or fallback. Changed syntax is emphasized; switch back to
+  **Text** to inspect formatting and metadata too. This is syntax-aware matching, not
+  a proof that behavior is equivalent. No installation or model call happens automatically.
+  Only this Difftastic version is accepted because its JSON interface is unstable.
+  Comparisons run one at a time, separately from text review, with a five-second process
+  budget, a 128 KiB limit per input, and a 1 MiB output limit. This assumes responsive
+  local storage: stalled filesystem calls and child cleanup can exceed the time budget.
+  Up to 16 results / 4 MiB are cached in server memory after validating current
+  content. Deterministic unsupported-language/parser fallbacks are cached too;
+  timeouts and transient engine failures are not. Cache hits avoid comparison-input
+  writes for staged/branch/commit review; unstaged review still captures and verifies new
+  content before lookup. Refresh or changing the selected file cancels pending work. A changed source
+  snapshot requires refreshing Changes. Added/deleted files, untracked files, symlinks,
+  binary content, and unsupported languages stay in text mode with an explanation;
+  missing or incompatible engines also fall back to text.
+- **Group with AI** is optional; folder grouping remains the default. Clicking it
+  sends the displayed file names and bounded diff snippets to the conversation’s
+  current Pi provider/model. Provider charges may apply. It uses a separate,
+  ephemeral session with tools, extensions and MCP disabled; it does not send a
+  message in your conversation or change its draft. The conversation must be open
+  and idle with an available model; extension-only or project-only model configurations
+  may be unavailable in this isolated analysis session. It uses your global Pi provider
+  credentials/settings, but explicitly overrides system-prompt additions. This is not
+  an OS sandbox.
+  At most 20 patches are fetched on demand, clipped to 8 KiB each / 48 KiB total;
+  other files supply names only. Partial coverage is shown. Suggestions are not a
+  verified assessment: unknown or duplicate paths reject the result, omitted files
+  remain under **Ungrouped**, and errors leave folders available. Switch between
+  **Folders** and **AI intent** without another model request. Refresh/scope changes
+  discard suggestions; results stay in page memory only. The server admits one
+  grouping job at a time with a 60-second analysis deadline plus supervised cleanup.
+- **Ask Pi** appends the selected file’s patch and scope to your existing draft and
+  returns to Conversation. It never sends automatically. Oversized context is
+  rejected without changing the draft; reopen stopped conversations before sending.
+- Snapshots are best-effort, not live or atomic: refresh after edits, and coordinate
+  concurrent agents. Limits are 100 listed files, 64 KiB per selected patch, 1 MiB per JSON response,
+  and a ten-second deadline per list or patch request. Omitted content is explicitly marked; binary diffs show
+  Git’s summary rather than file contents. Git must be installed locally and
+  support `--no-lazy-fetch`; older versions fail closed. Repositories with configured
+  Git filters (including Git LFS) are rejected so review cannot execute filter helpers.
+
 ## Use and limits
 
 - Send with Enter, the button or Ctrl/⌘ Enter; Shift+Enter inserts a newline. Stop clears queued prompts, then requests

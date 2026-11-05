@@ -54,6 +54,17 @@ pub struct SessionHandle {
     summary: watch::Receiver<RuntimeSummary>,
 }
 impl SessionHandle {
+    /// Atomically snapshots a ready runtime's operator launch identity without changing its state.
+    pub(crate) async fn grouping_config(&self) -> Result<GroupingConfig, &'static str> {
+        let (send, receive) = oneshot::channel();
+        self.tx
+            .try_send(Control::GroupingConfig(send))
+            .map_err(|_| "Session is busy; retry grouping")?;
+        tokio::time::timeout(Duration::from_secs(2), receive)
+            .await
+            .map_err(|_| "Session did not answer; retry grouping")?
+            .map_err(|_| "Start the session before grouping")?
+    }
     /// Stable catalog identity and bounded lifecycle state, without attaching a subscriber.
     pub(crate) fn same_runtime(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
@@ -107,7 +118,13 @@ impl SessionHandle {
         }
     }
 }
+/// Read-only operator configuration; grouping always overrides thinking to off and uses a private cwd.
+pub(crate) struct GroupingConfig {
+    pub executable: PathBuf,
+    pub model: ModelOption,
+}
 enum Control {
+    GroupingConfig(oneshot::Sender<Result<GroupingConfig, &'static str>>),
     Connect(String, oneshot::Sender<Result<Connection, &'static str>>),
     Message(String, BrowserMessage),
     Disconnect(String),
@@ -462,6 +479,32 @@ impl Runtime {
     }
     fn control(&mut self, control: Control) {
         match control {
+            Control::GroupingConfig(reply) => {
+                let result = if self.status.process != ProcessStatus::Ready
+                    || self.setting_pending.is_some()
+                    || self.settings_refresh
+                    || self.state_requests != 0
+                    || self.capabilities_pending
+                    || self.cancelling
+                    || self.activity() != Activity::Idle
+                    || self
+                        .events
+                        .as_ref()
+                        .is_some_and(|events| events.pending() != 0)
+                {
+                    Err("Start a ready session with a selected model before grouping")
+                } else if let Some(model) = self.settings.model.clone() {
+                    resolve_executable(&self.config)
+                        .map(|executable| GroupingConfig {
+                            executable,
+                            model,
+                        })
+                        .map_err(|_| "Configured Pi executable is unavailable")
+                } else {
+                    Err("Select a supported model before grouping")
+                };
+                let _ = reply.send(result);
+            }
             #[cfg(test)]
             Control::Pause(..) => unreachable!("test pause is handled by the runtime loop"),
             Control::Stop(epoch, reply) => {
@@ -2007,15 +2050,7 @@ fn valid_head(head: &HistoryHead) -> bool {
 }
 /// Resolves only the operator's executable and constructs argument-array invocation.
 fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::ProcessSpec> {
-    let executable = if config.pi.components().count() > 1 {
-        config.pi.canonicalize()?
-    } else {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join(&config.pi))
-            .find(|path| path.is_file())
-            .ok_or_else(|| io::Error::other("Pi executable not found"))?
-            .canonicalize()?
-    };
+    let executable = resolve_executable(config)?;
     let root = config.state_dir.join("pi-sessions");
     std::fs::create_dir_all(&root)?;
     let mut args: Vec<OsString> = vec![
@@ -2058,4 +2093,18 @@ fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::Proce
         args,
         cwd: config.cwd.clone(),
     })
+}
+
+/// Resolves the operator executable identically for main and isolated helper launches.
+fn resolve_executable(config: &Config) -> io::Result<PathBuf> {
+    let executable = if config.pi.components().count() > 1 {
+        config.pi.canonicalize()?
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(&config.pi))
+            .find(|path| path.is_file())
+            .ok_or_else(|| io::Error::other("Pi executable not found"))?
+            .canonicalize()?
+    };
+    Ok(executable)
 }

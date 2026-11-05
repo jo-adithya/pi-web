@@ -32,6 +32,7 @@ export function developmentServer(env: Record<string, string | undefined>): Serv
     proxy: {
       "^/(?:auth|push|sw\\.js)(?:\\?|$)": { target, changeOrigin: false },
       "^/images/": { target, changeOrigin: false },
+      "^/review/": { target, changeOrigin: false },
       "^/ws(?:\\?|$)": { target, changeOrigin: false, ws: true },
     },
   };

@@ -152,6 +152,7 @@ async fn read_stdout(
     let mut chunk = [0; 8192];
     let mut line = Vec::new();
     let mut sequence = 0u64;
+    let mut remaining = shared.limits.total_output_bytes;
     loop {
         let read = match stdout.read(&mut chunk).await {
             Ok(n) => n,
@@ -163,6 +164,12 @@ async fn read_stdout(
             } else {
                 Error::Protocol("partial record at EOF".into())
             };
+        }
+        if let Some(budget) = &mut remaining {
+            if read > *budget {
+                return Error::Protocol("total output byte budget exceeded".into());
+            }
+            *budget -= read;
         }
         for &byte in &chunk[..read] {
             if byte != b'\n' {

@@ -13,6 +13,7 @@ import { decodeServer } from "./client-state";
 import { decodeWorkspace } from "./workspace-state";
 import { createSessionModel, type SessionModel } from "./session-model";
 import { SessionView } from "./SessionView";
+import { LocalReview } from "./LocalReview";
 import { createCompletionNotifications } from "./notifications";
 import { createPhonePush } from "./phone-push";
 import { listenForSidebarSwipes } from "./sidebar-swipe";
@@ -40,6 +41,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = createSignal(false);
   const [catalog, setCatalog] = createSignal<CatalogItem[]>([]);
   const [selected, setSelected] = createSignal("");
+  const [view, setView] = createSignal<"conversation" | "changes">("conversation");
   const [workspaces, setWorkspaces] = createSignal<WorkspaceItem[]>([]);
   const [addingWorkspace, setAddingWorkspace] = createSignal(false);
   const [connection, setConnection] = createSignal("Connecting");
@@ -236,7 +238,7 @@ export default function App() {
     activity={id => { const model = models.get(id); return model?.online() && model.state.status.process === "ready" ? model.state.status.activity : undefined; }}
     needsInput={id => Boolean(models.get(id)?.state.dialogs.length)} theme={theme.preference()} setTheme={theme.setPreference} />;
   return <Dialog open={canShowSidebar() && sidebarOpen()} onOpenChange={setSidebarOpen}>
-    <div class={["workspace", { "pinch-zoomed": pinchZoomed() }]}>
+    <div class={["workspace", { "pinch-zoomed": pinchZoomed(), "review-workspace": view() === "changes" && Boolean(current()) }]}>
       <Show when={!mobile()}>
         <aside class="sidebar" aria-label="Sessions">
           <div class="sidebar-brand"><span class="brand">π</span><span>Pi<span class="brand-subtitle">Local workspace</span></span></div>
@@ -246,6 +248,10 @@ export default function App() {
       <main class="chat-panel">
         <div class="workspace-controls">
           <Show when={mobile()}><Dialog.Trigger class="icon-button" aria-label="Open sessions" disabled={!canShowSidebar()}><Icon name="panel" /></Dialog.Trigger></Show>
+          <Show when={current()}><div class="workspace-views" role="group" aria-label="Workspace view">
+            <button type="button" aria-pressed={view() === "conversation" ? "true" : "false"} onClick={() => setView("conversation")}>Conversation</button>
+            <button type="button" aria-pressed={view() === "changes" ? "true" : "false"} onClick={() => setView("changes")}>Changes</button>
+          </div></Show>
           <div class="session-controls">
             <div class="statuses" aria-live="polite"><span class={["connection", { connected: connection() === "Connected" }]}>{connection()}</span>
             </div>
@@ -267,9 +273,9 @@ export default function App() {
         <DismissibleAlert class="workspace-notice" message={notice()} />
         <DismissibleAlert class="workspace-notice" message={phonePush.message()} />
         <DismissibleAlert class="workspace-notice" message={notifications.message()} />
-        <Show when={current()} keyed>{model => <Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
+        <Show when={current()} keyed>{model => <Show when={view() === "conversation"} fallback={<LocalReview model={model} conversation={() => setView("conversation")} />}><Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
           <Show when={entry()?.lifecycle === "stopped"}><Button disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => command({ type: "open", sessionId: model.id })}>Reopen conversation</Button></Show>
-          <Show when={model.draft()}><p class="preserve">Unsent draft: {model.draft()}</p></Show></section>}><SessionView model={model} /></Show>}</Show>
+          <Show when={model.draft()}><p class="preserve">Unsent draft: {model.draft()}</p></Show></section>}><SessionView model={model} /></Show></Show>}</Show>
         <Show when={!catalog().length}><section class="empty workspace-empty"><span class="empty-mark">π</span><h2>Connecting to your workspace</h2><p>Open the current terminal URL if authentication is required.</p></section></Show>
       </main>
     </div>

@@ -44,6 +44,11 @@ pub struct WebState {
     push_slots: Arc<Semaphore>,
     image_slots: Arc<Semaphore>,
     file_slots: Arc<Semaphore>,
+    review_slots: Arc<Semaphore>,
+    structural_slots: Arc<Semaphore>,
+    group_slots: Arc<Semaphore>,
+    context_cache: Arc<std::sync::Mutex<crate::context_review::Cache>>,
+    structural_cache: Arc<std::sync::Mutex<crate::structural_review::Cache>>,
 }
 impl WebState {
     /// Constructs a single-origin boundary for loopback HTTP or an explicitly configured
@@ -83,6 +88,15 @@ impl WebState {
             push_slots: Arc::new(Semaphore::new(4)),
             image_slots: Arc::new(Semaphore::new(2)),
             file_slots: Arc::new(Semaphore::new(2)),
+            review_slots: Arc::new(Semaphore::new(2)),
+            structural_slots: Arc::new(Semaphore::new(1)),
+            group_slots: Arc::new(Semaphore::new(1)),
+            context_cache: Arc::new(std::sync::Mutex::new(
+                crate::context_review::Cache::default(),
+            )),
+            structural_cache: Arc::new(std::sync::Mutex::new(
+                crate::structural_review::Cache::default(),
+            )),
         }
     }
     /// Enables explicitly opted-in phone delivery through the server-owned worker.
@@ -130,6 +144,11 @@ pub fn router(state: WebState) -> Router {
         .route("/sw.js", get(service_worker))
         .route("/push", post(push_request))
         .route("/files/{session}", post(workspace_files))
+        .route("/review/{session}", post(local_review))
+        .route("/review/{session}/structural", post(structural_review))
+        .route("/review/{session}/context", post(context_review))
+        .route("/review/{session}/commits", post(commit_review))
+        .route("/review/{session}/groups", post(group_review))
         .route("/images/{session}", post(upload_image))
         .route("/images/{session}/{id}", post(load_image))
         .route("/ws", get(upgrade))
@@ -149,7 +168,8 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
         origins.iter().count() <= 1 && origins.iter().all(|origin| origin == state.origin.as_str());
     let stateful = matches!(request.uri().path(), "/auth" | "/ws" | "/push")
         || request.uri().path().starts_with("/images/")
-        || request.uri().path().starts_with("/files/");
+        || request.uri().path().starts_with("/files/")
+        || request.uri().path().starts_with("/review/");
     let cross_site = request
         .headers()
         .get("sec-fetch-site")
@@ -169,7 +189,15 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
         || (cross_site && !public_navigation)
         || (stateful && origins.iter().count() != 1)
     {
-        StatusCode::FORBIDDEN.into_response()
+        if request.uri().path().starts_with("/review/") {
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({"error": "Invalid request origin or host"})),
+            )
+                .into_response()
+        } else {
+            StatusCode::FORBIDDEN.into_response()
+        }
     } else if request.uri().path() == "/ws" && !state.authenticated(request.headers()) {
         StatusCode::UNAUTHORIZED.into_response()
     } else {
@@ -400,13 +428,33 @@ mod tests {
 /// An img tag cannot supply the capability; the client displays a fetched blob.
 fn image_proof(state: &WebState, headers: &HeaderMap) -> bool {
     let proofs = headers.get_all("x-pi-capability");
-    proofs.iter().count() == 1 && proofs.iter().next().and_then(|v| v.to_str().ok()).is_some_and(|proof| secret_equal(proof, &state.capability))
+    proofs.iter().count() == 1
+        && proofs
+            .iter()
+            .next()
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|proof| secret_equal(proof, &state.capability))
 }
-async fn upload_image(State(state): State<WebState>, Path(session): Path<String>, request: Request<Body>) -> Response {
-    if !image_proof(&state, request.headers()) { return StatusCode::UNAUTHORIZED.into_response(); }
-    let Ok(_permit) = state.image_slots.try_acquire() else { return StatusCode::TOO_MANY_REQUESTS.into_response(); };
-    let Some(runtime) = state.runtime.lookup(&session).await else { return StatusCode::NOT_FOUND.into_response(); };
-    let body = match tokio::time::timeout(Duration::from_secs(5), to_bytes(request.into_body(), crate::images::MAX_UPLOAD_BYTES)).await {
+async fn upload_image(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    if !image_proof(&state, request.headers()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(_permit) = state.image_slots.try_acquire() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let Some(runtime) = state.runtime.lookup(&session).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let body = match tokio::time::timeout(
+        Duration::from_secs(5),
+        to_bytes(request.into_body(), crate::images::MAX_UPLOAD_BYTES),
+    )
+    .await
+    {
         Ok(Ok(body)) => body,
         Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
@@ -416,12 +464,28 @@ async fn upload_image(State(state): State<WebState>, Path(session): Path<String>
         Err(_) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     }
 }
-async fn load_image(State(state): State<WebState>, Path((session, id)): Path<(String, String)>, request: Request<Body>) -> Response {
-    if !image_proof(&state, request.headers()) { return StatusCode::UNAUTHORIZED.into_response(); }
-    let Ok(_permit) = state.image_slots.try_acquire() else { return StatusCode::TOO_MANY_REQUESTS.into_response(); };
-    let Some(runtime) = state.runtime.lookup(&session).await else { return StatusCode::NOT_FOUND.into_response(); };
-    let Some(image) = runtime.images.get(&id) else { return StatusCode::NOT_FOUND.into_response(); };
-    ([(header::CONTENT_TYPE, image.mime)], image.bytes.as_ref().clone()).into_response()
+async fn load_image(
+    State(state): State<WebState>,
+    Path((session, id)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Response {
+    if !image_proof(&state, request.headers()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(_permit) = state.image_slots.try_acquire() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let Some(runtime) = state.runtime.lookup(&session).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(image) = runtime.images.get(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [(header::CONTENT_TYPE, image.mime)],
+        image.bytes.as_ref().clone(),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -546,5 +610,314 @@ mod file_tests {
         drop(second);
         runtime.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Reviews only the registered workspace, including sessions without a running Pi process.
+async fn local_review(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    fn error(status: StatusCode, message: &str) -> Response {
+        (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+    }
+    if !image_proof(&state, request.headers()) {
+        return error(StatusCode::UNAUTHORIZED, "Capability required");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_none_or(|v| v != "application/json")
+    {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        );
+    }
+    let Ok(permit) = state.review_slots.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Review workers are busy");
+    };
+    let body =
+        match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 2048))
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Review request exceeds 2 KiB",
+                );
+            }
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Review request timed out"),
+        };
+    let Ok(input) = serde_json::from_slice::<crate::local_review::Request>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid review request");
+    };
+    let Some(root) = state.runtime.workspace_directory(&session).await else {
+        return error(StatusCode::NOT_FOUND, "Session workspace not found");
+    };
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        // The task retains admission through child kill/reap even if the HTTP future is dropped.
+        let _permit = permit;
+        crate::local_review::review(&root, input, cancelled).await
+    });
+    let result = worker.await;
+    drop(cancel);
+    match result {
+        Ok(Ok(review)) => axum::Json(review).into_response(),
+        Ok(Err(message)) => error(StatusCode::UNPROCESSABLE_ENTITY, message),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Review worker failed"),
+    }
+}
+
+/// Reviews only the registered workspace, including sessions without a running Pi process.
+async fn commit_review(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    fn error(status: StatusCode, message: &str) -> Response {
+        (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+    }
+    if !image_proof(&state, request.headers()) {
+        return error(StatusCode::UNAUTHORIZED, "Capability required");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_none_or(|v| v != "application/json")
+    {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        );
+    }
+    let Ok(permit) = state.review_slots.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Review workers are busy");
+    };
+    let body =
+        match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 2048))
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Review request exceeds 2 KiB",
+                );
+            }
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Review request timed out"),
+        };
+    let Ok(input) = serde_json::from_slice::<crate::commit_review::Request>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid review request");
+    };
+    let Some(root) = state.runtime.workspace_directory(&session).await else {
+        return error(StatusCode::NOT_FOUND, "Session workspace not found");
+    };
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        // The task retains admission through child kill/reap even if the HTTP future is dropped.
+        let _permit = permit;
+        crate::commit_review::review(&root, input, cancelled).await
+    });
+    let result = worker.await;
+    drop(cancel);
+    match result {
+        Ok(Ok(review)) => axum::Json(review).into_response(),
+        Ok(Err(message)) => error(StatusCode::UNPROCESSABLE_ENTITY, message),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Review worker failed"),
+    }
+}
+
+/// Reviews only the registered workspace, including sessions without a running Pi process.
+async fn structural_review(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    fn error(status: StatusCode, message: &str) -> Response {
+        (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+    }
+    if !image_proof(&state, request.headers()) {
+        return error(StatusCode::UNAUTHORIZED, "Capability required");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_none_or(|v| v != "application/json")
+    {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        );
+    }
+    let Ok(permit) = state.structural_slots.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Review workers are busy");
+    };
+    let body =
+        match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 2048))
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Review request exceeds 2 KiB",
+                );
+            }
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Review request timed out"),
+        };
+    let Ok(input) = serde_json::from_slice::<crate::structural_review::Request>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid review request");
+    };
+    let Some(root) = state.runtime.workspace_directory(&session).await else {
+        return error(StatusCode::NOT_FOUND, "Session workspace not found");
+    };
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        // The task retains admission through child kill/reap even if the HTTP future is dropped.
+        let _permit = permit;
+        crate::structural_review::review(&root, input, cancelled, &state.structural_cache).await
+    });
+    let result = worker.await;
+    drop(cancel);
+    match result {
+        Ok(Ok(review)) => axum::Json(review).into_response(),
+        Ok(Err(message)) => error(StatusCode::UNPROCESSABLE_ENTITY, message),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Review worker failed"),
+    }
+}
+
+/// Reviews only the registered workspace, including sessions without a running Pi process.
+async fn context_review(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    fn error(status: StatusCode, message: &str) -> Response {
+        (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+    }
+    if !image_proof(&state, request.headers()) {
+        return error(StatusCode::UNAUTHORIZED, "Capability required");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_none_or(|v| v != "application/json")
+    {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        );
+    }
+    let Ok(permit) = state.review_slots.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Review workers are busy");
+    };
+    let body =
+        match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 2048))
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Review request exceeds 2 KiB",
+                );
+            }
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Review request timed out"),
+        };
+    let Ok(input) = serde_json::from_slice::<crate::context_review::Request>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid review request");
+    };
+    let Some(root) = state.runtime.workspace_directory(&session).await else {
+        return error(StatusCode::NOT_FOUND, "Session workspace not found");
+    };
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        // The task retains admission through child kill/reap even if the HTTP future is dropped.
+        let _permit = permit;
+        crate::context_review::review(&root, input, cancelled, &state.context_cache).await
+    });
+    let result = worker.await;
+    drop(cancel);
+    match result {
+        Ok(Ok(review)) => axum::Json(review).into_response(),
+        Ok(Err(message)) => error(StatusCode::UNPROCESSABLE_ENTITY, message),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Review worker failed"),
+    }
+}
+
+/// Groups supplied diffs only after authenticated, bounded admission and a ready-session snapshot.
+async fn group_review(
+    State(state): State<WebState>,
+    Path(session): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    fn error(status: StatusCode, message: &str) -> Response {
+        (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+    }
+    if !image_proof(&state, request.headers()) {
+        return error(StatusCode::UNAUTHORIZED, "Capability required");
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_none_or(|v| v != "application/json")
+    {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        );
+    }
+    let Ok(permit) = state.group_slots.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "Grouping worker is busy");
+    };
+    let body = match tokio::time::timeout(
+        Duration::from_secs(2),
+        to_bytes(request.into_body(), 192 * 1024),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Grouping request exceeds 192 KiB",
+            );
+        }
+        Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "Grouping request timed out"),
+    };
+    let Ok(input) = serde_json::from_slice::<crate::group_review::Request>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid grouping request");
+    };
+    if let Err(message) = input.validate() {
+        return error(StatusCode::BAD_REQUEST, message);
+    }
+    if state.runtime.workspace_directory(&session).await.is_none() {
+        return error(StatusCode::NOT_FOUND, "Session workspace not found");
+    }
+    let Some(runtime) = state.runtime.lookup(&session).await else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Start the session before grouping",
+        );
+    };
+    let config = match runtime.grouping_config().await {
+        Ok(config) => config,
+        Err(message) => return error(StatusCode::UNPROCESSABLE_ENTITY, message),
+    };
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        let _permit = permit;
+        crate::group_review::review(config, input, cancelled).await
+    });
+    let result = worker.await;
+    drop(cancel);
+    match result {
+        Ok(Ok(groups)) => axum::Json(groups).into_response(),
+        Ok(Err(message)) => error(StatusCode::UNPROCESSABLE_ENTITY, message),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Grouping worker failed"),
     }
 }

@@ -32,6 +32,12 @@ describe("Markdown trust boundary", () => {
     rendered("```unknown\n<script>\n```"); rendered(`\`\`\`rust\n${"x".repeat(9000)}\n\`\`\``);
     expect(spy).toHaveBeenCalledTimes(1);
   });
+  it("keeps HTML fences inert with the shared review grammars", () => {
+    const result = rendered('```html\n<img src="https://attacker.invalid/track" onerror="alert(1)"><script>alert(1)</script>\n```');
+    expect(result.querySelector(".hljs-name")?.textContent).toBe("img");
+    expect(result.querySelector("img,script")).toBeNull();
+    expect(result.textContent).toContain('<script>alert(1)</script>');
+  });
   it("does not parse or highlight during streaming and replaces with final Markdown", () => {
     const spy = vi.spyOn(highlight, "highlight");
     const [text, setText] = createSignal("```rust\nlet x = ");

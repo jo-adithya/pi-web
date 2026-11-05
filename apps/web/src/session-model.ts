@@ -2,11 +2,23 @@ import { createSignal, createStore } from "solid-js";
 import type { BrowserAction, BrowserMessage, ServerMessage, ThinkingLevel, RunOutcome } from "./generated/protocol";
 import { imageRequest, prepareImage, IMAGE_BYTES, type Attachment } from "./images";
 import { searchWorkspaceFiles } from "./workspace-files";
+import { createLocalReview, fetchReview } from "./local-review";
+import { fetchStructuralReview } from "./structural-review";
+import { fetchContextReview } from "./context-review";
+import { fetchCommits } from "./commit-review";
+import { fetchReviewGroups } from "./review-groups";
 import { loadCapability } from "./browser-auth";
 import { applyServer, initialState } from "./client-state";
 
 /** Session-local presentation and unsent draft. Connection loss never replays a command. */
 export function createSessionModel(id: string, transport: (message: BrowserMessage) => boolean, connected: () => boolean, completed?: (sessionId: string, outcome: RunOutcome) => void, capability: () => string | null = loadCapability) {
+  const review = createLocalReview(
+    (request, signal) => fetchReview(id, request, signal, capability()),
+    (request, signal) => fetchStructuralReview(id, request, signal, capability()),
+    (request, signal) => fetchContextReview(id, request, signal, capability()),
+    signal => fetchCommits(id, signal, capability()),
+    (request, signal) => fetchReviewGroups(id, request, signal, capability()),
+  );
   const [state, setState] = createStore(initialState());
   const [draft, setDraft] = createSignal(""); const [notice, setNotice] = createSignal("");
   const [settingsPending, setSettingsPending] = createSignal(false);
@@ -66,7 +78,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     setAttachments(previous => previous.filter(image => { if (image.id !== imageId) return true; URL.revokeObjectURL(image.preview); return false; }));
   }
   /** Releases previews when the workspace permanently discards this draft. */
-  function dispose() { disposed = true; for (const image of attachments()) removeImage(image.id); }
+  function dispose() { disposed = true; review.cancel(); for (const image of attachments()) removeImage(image.id); }
   async function loadImage(imageId: string): Promise<Blob> { return (await imageRequest(id, imageId, undefined, capability())).blob(); }
   const canSend = () => canConfigure() && !settingsRequest && (!!draft().trim() || attachments().length > 0) && !uploading() && (!attachments().length || !!state.settings.model?.images) && new TextEncoder().encode(draft()).length <= 32_768;
   function submit() {
@@ -127,6 +139,6 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     }
     return true;
   }
-  return { id, dispose, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, receive, disconnected, stopped, scroll: 0 };
+  return { id, dispose, review, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, receive, disconnected, stopped, scroll: 0 };
 }
 export type SessionModel = ReturnType<typeof createSessionModel>;

@@ -1,15 +1,5 @@
 import MarkdownIt from "markdown-it";
-import highlight from "highlight.js/lib/core";
-import rust from "highlight.js/lib/languages/rust";
-import javascript from "highlight.js/lib/languages/javascript";
-import typescript from "highlight.js/lib/languages/typescript";
-import json from "highlight.js/lib/languages/json";
-import bash from "highlight.js/lib/languages/bash";
-import python from "highlight.js/lib/languages/python";
-
-for (const [name, language] of Object.entries({ rust, javascript, typescript, json, bash, python })) {
-  highlight.registerLanguage(name, language);
-}
+import highlight from "./syntax";
 
 const parser = new MarkdownIt({
   html: false,

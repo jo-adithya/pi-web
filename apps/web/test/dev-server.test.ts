@@ -11,7 +11,7 @@ describe("private Tailscale development server", () => {
     expect(server.cors).toBe(false);
     expect(server.hmr).toMatchObject({ protocol: "wss", host: "machine.tailnet.ts.net", clientPort: 443, path: "/__pi_web_hmr" });
     const proxy = server.proxy!;
-    for (const path of ["/auth", "/ws", "/push", "/sw.js"]) {
+    for (const path of ["/auth", "/ws", "/push", "/sw.js", "/review/session-id", "/review/session-id/structural", "/review/session-id/context", "/review/session-id/commits"]) {
       const match = Object.entries(proxy).find(([pattern]) => new RegExp(pattern.slice(1)).test(path));
       expect(match, path).toBeDefined();
       expect(match![1]).toMatchObject({ target: "http://127.0.0.1:9876", changeOrigin: false });

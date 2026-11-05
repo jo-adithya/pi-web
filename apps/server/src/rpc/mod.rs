@@ -39,6 +39,8 @@ pub struct ProcessSpec {
 #[derive(Clone, Debug)]
 pub struct Limits {
     pub record_bytes: usize,
+    /// Optional lifetime stdout byte limit, including responses and framing.
+    pub total_output_bytes: Option<usize>,
     pub json_depth: usize,
     pub json_nodes: usize,
     pub retained_records: usize,
@@ -58,6 +60,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            total_output_bytes: None,
             record_bytes: 32 * 1024 * 1024,
             json_depth: 64,
             json_nodes: 262_144,
