@@ -1745,3 +1745,132 @@ async fn rename_validates_utf8_bytes_and_preserves_title_on_save_failure() {
     assert_eq!(resumed.snapshot().await.sessions[0].title, title);
     assert!(resumed.shutdown().await);
 }
+
+#[tokio::test]
+async fn grouping_settings_default_and_persist_across_restart() {
+    let fixture = Fixture::new();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let defaults = serde_json::to_value(manager.snapshot().await).unwrap();
+    assert_eq!(defaults["groupingSettings"], serde_json::json!({
+        "model": null, "maxCalls": 6, "maxRequestBytes": 524288, "includeGenerated": false
+    }));
+    let settings = serde_json::json!({
+        "model": {"provider": "test", "id": "model"},
+        "maxCalls": 12, "maxRequestBytes": 1048576, "includeGenerated": true
+    });
+    let action = serde_json::from_value(serde_json::json!({
+        "type": "set_grouping_settings", "settings": settings
+    })).expect("settings update must be supported");
+    let reply = manager.command(command("settings", action)).await;
+    assert!(reply.ok, "{reply:?}");
+    assert_eq!(serde_json::to_value(reply).unwrap()["groupingSettings"], settings);
+    assert!(manager.shutdown().await);
+    drop(manager);
+    let restarted = SessionManager::start(fixture.config()).unwrap();
+    assert_eq!(serde_json::to_value(restarted.snapshot().await).unwrap()["groupingSettings"], settings);
+    assert!(restarted.shutdown().await);
+}
+
+#[tokio::test]
+async fn grouping_settings_reject_invalid_updates_and_publish_only_saved_values() {
+    let fixture = Fixture::new();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let mut changes = manager.grouping_changes();
+    let defaults = serde_json::to_value(manager.snapshot().await).unwrap()["groupingSettings"].clone();
+    let mut invalid = Vec::new();
+    for (key, values) in [
+        ("maxCalls", vec![serde_json::json!(0), serde_json::json!(101)]),
+        ("maxRequestBytes", vec![serde_json::json!(1023), serde_json::json!(16777217)]),
+    ] {
+        for value in values {
+            let mut settings = defaults.clone(); settings[key] = value; invalid.push(settings);
+        }
+    }
+    for key in ["provider", "id"] {
+        for value in ["".to_string(), "  ".into(), "-model".into(), "bad\nmodel".into(), "é".repeat(129)] {
+            let mut settings = defaults.clone();
+            settings["model"] = serde_json::json!({"provider": "test", "id": "test"});
+            settings["model"][key] = serde_json::json!(value);
+            invalid.push(settings);
+        }
+    }
+    for (index, settings) in invalid.into_iter().enumerate() {
+        let action = serde_json::from_value(serde_json::json!({"type": "set_grouping_settings", "settings": settings})).unwrap();
+        let reply = manager.command(command(&format!("invalid-{index}"), action)).await;
+        assert!(!reply.ok, "{reply:?}");
+        assert_eq!(reply.grouping_settings, GroupingSettings::default());
+        assert!(!changes.has_changed().unwrap());
+    }
+    // Both inclusive budget endpoints and 256-byte identifiers are valid.
+    for (index, (max_calls, max_request_bytes)) in [(1, 1024), (100, 16777216)].into_iter().enumerate() {
+        let settings = GroupingSettings {
+            model: Some(GroupModel { provider: "é".repeat(128), id: "x".repeat(256) }),
+            max_calls, max_request_bytes, include_generated: true,
+        };
+        let reply = manager.command(command(&format!("valid-{index}"), WorkspaceAction::SetGroupingSettings { settings: settings.clone() })).await;
+        assert!(reply.ok, "{reply:?}");
+        changes.changed().await.unwrap();
+        assert_eq!(reply.grouping_settings, settings);
+    }
+    let previous = manager.snapshot().await.grouping_settings;
+    let record = fixture.0.join("state/workspaces/grouping-settings.json");
+    fs::remove_file(&record).unwrap();
+    fs::create_dir(&record).unwrap();
+    let reply = manager.command(command("save-fails", WorkspaceAction::SetGroupingSettings { settings: GroupingSettings::default() })).await;
+    assert!(!reply.ok);
+    assert_eq!(reply.code, "grouping_settings_write_failed");
+    assert_eq!(manager.snapshot().await.grouping_settings, previous);
+    assert!(!changes.has_changed().unwrap());
+    assert!(manager.shutdown().await);
+}
+
+#[tokio::test]
+async fn grouping_settings_reconcile_after_directory_flush_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let mut changes = manager.grouping_changes();
+    let directory = fixture.0.join("state/workspaces");
+    // Renaming needs write/search permission; opening the directory for fsync needs read.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o300)).unwrap();
+    if fs::File::open(&directory).is_ok() {
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("Skipping permission fault injection: this user can bypass directory permissions");
+        assert!(manager.shutdown().await);
+        return;
+    }
+    let settings = GroupingSettings { max_calls: 9, ..GroupingSettings::default() };
+    let reply = manager.command(command("flush-fails", WorkspaceAction::SetGroupingSettings { settings: settings.clone() })).await;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!reply.ok, "durability must not be claimed after a flush failure");
+    assert_eq!(reply.code, "grouping_settings_write_failed");
+    assert_eq!(reply.grouping_settings, settings);
+    assert_eq!(manager.snapshot().await.grouping_settings, settings);
+    assert!(changes.has_changed().unwrap());
+    changes.changed().await.unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(directory.join("grouping-settings.json")).unwrap()).unwrap();
+    assert_eq!(saved["settings"]["maxCalls"], 9);
+    assert!(manager.shutdown().await);
+    drop(manager);
+    let restarted = SessionManager::start(fixture.config()).unwrap();
+    assert_eq!(restarted.snapshot().await.grouping_settings, settings);
+    assert!(restarted.shutdown().await);
+}
+
+#[tokio::test]
+async fn grouping_settings_startup_rejects_invalid_saved_records() {
+    for record in [
+        "not json".into(),
+        serde_json::json!({"version": 2, "settings": GroupingSettings::default()}).to_string(),
+        serde_json::json!({"version": 1, "settings": {"model": null, "maxCalls": 0, "maxRequestBytes": 524288, "includeGenerated": false}}).to_string(),
+    ] {
+        let fixture = Fixture::new();
+        let manager = SessionManager::start(fixture.config()).unwrap();
+        assert!(manager.shutdown().await);
+        drop(manager);
+        let path = fixture.0.join("state/workspaces/grouping-settings.json");
+        fs::write(&path, record).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(SessionManager::start(fixture.config()).is_err());
+    }
+}

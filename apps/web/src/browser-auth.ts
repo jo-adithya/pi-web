@@ -9,10 +9,12 @@ export function isCapability(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
-/** Extracts a credential from this server's terminal link without navigating to it. */
+/** Parses a same-origin terminal URL, #cap fragment, or raw token; returns null for invalid input. */
 export function capabilityFromLink(value: string): string | null {
+  if (isCapability(value.trim())) return value.trim();
+  const input = value.trim();
   try {
-    const url = new URL(value.trim());
+    const url = input.startsWith("#") ? new URL(input, location.origin) : new URL(input);
     const values = new URLSearchParams(url.hash.slice(1)).getAll("cap");
     if (url.origin !== location.origin || url.username || url.password || url.pathname !== "/" || url.search || values.length !== 1) return null;
     return isCapability(values[0]) ? values[0] : null;

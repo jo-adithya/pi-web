@@ -11,7 +11,7 @@ const epoch = "20000000-0000-4000-8000-000000000001";
 const wa = "30000000-0000-4000-8000-000000000001", wb = "30000000-0000-4000-8000-000000000002";
 const workspace = (workspaceId = wa, name = "Alpha", path = "/projects/alpha") => ({ workspaceId, name, path });
 const item = (sessionId: string, title: string, workspaceId = wa): CatalogItem => ({ sessionId, workspaceId, title, lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } });
-const catalog = () => ({ v: 2, requestId: null, ok: true, code: "catalog", target: null, selected: a, selectedWorkspace: wa, workspaces: [workspace()], sessions: [item(a, "Conversation 1"), item(b, "Conversation 2")] });
+const catalog = () => ({ v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: a, selectedWorkspace: wa, workspaces: [workspace()], sessions: [item(a, "Conversation 1"), item(b, "Conversation 2")] });
 const grouped = () => ({ ...catalog(), workspaces: [workspace(), workspace(wb, "Beta", "/projects/beta")], sessions: [item(a, "Conversation 1"), item(b, "Conversation 2", wb)] });
 function frames(sessionId: string): ServerMessage[] { return [
   { v: 1, sessionId, epoch, body: { type: "hello", project: "fixture", process: "ready" } },
@@ -31,6 +31,63 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); } });
   sessionStorage.setItem("pi-web.capability.v1", "a".repeat(64)); vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true })); });
 afterEach(() => { cleanup(); Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal"); Reflect.deleteProperty(HTMLDialogElement.prototype, "close"); vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear(); document.documentElement.classList.remove("dark"); history.replaceState(null, "", "/"); });
+
+it.each([
+  undefined,
+  { ...catalog().groupingSettings, maxCalls: 0 },
+  { ...catalog().groupingSettings, maxCalls: 1.5 },
+  { ...catalog().groupingSettings, maxRequestBytes: 16 * 1024 * 1024 + 1 },
+  { ...catalog().groupingSettings, includeGenerated: "yes" },
+  { ...catalog().groupingSettings, model: { provider: "test", id: "--unsafe" } },
+])("rejects invalid server grouping settings %j", groupingSettings => {
+  expect(() => decodeWorkspace(JSON.stringify({ ...catalog(), groupingSettings }))).toThrow("Invalid global grouping settings");
+});
+
+it("applies live global grouping settings across conversations and future AI runs", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const file = { path: "a.ts", previousPath: null, status: "modified", fingerprint: "one", patch: "@@ -1 +1 @@\n-old\n+new\n" };
+  const fetcher = vi.fn(async (url: string, _init?: RequestInit) => url === "/auth" ? new Response(null, { status: 204 }) : new Response(JSON.stringify(url.endsWith("/groups") ? { groups: [{ title: "Feature", reason: "", paths: [file.path] }] } : { files: [file], truncated: false, note: null })));
+  vi.stubGlobal("fetch", fetcher);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const frame of [...frames(a), ...frames(b)]) socket.emit(frame);
+  fireEvent.click(page.getByRole("button", { name: "Settings" })); flush();
+  const remote = { ...catalog().groupingSettings, maxCalls: 3, model: { provider: "test", id: "small" } };
+  socket.emit({ ...catalog(), groupingSettings: remote });
+  expect((page.getByLabelText("Maximum AI calls") as HTMLInputElement).value).toBe("3");
+  fireEvent.click(page.getByRole("button", { name: /^Conversation 2,/ })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Settings" })); flush();
+  expect((page.getByLabelText("Maximum AI calls") as HTMLInputElement).value).toBe("3");
+  fireEvent.click(page.getByRole("button", { name: "Changes" })); flush();
+  await page.findByRole("heading", { name: file.path });
+  fireEvent.click(page.getByRole("button", { name: "Group with AI" }));
+  await page.findByRole("heading", { name: "Feature" });
+  const call = fetcher.mock.calls.find(([url]) => url.endsWith("/groups"))!;
+  // The session transport consumes the canonical global model, not per-conversation defaults.
+  expect(JSON.parse(call[1]!.body as string).model).toEqual(remote.model);
+});
+
+it("keeps server-confirmed settings after a failed save and refreshes them on reconnect", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  fireEvent.click(page.getByRole("button", { name: "Settings" })); flush();
+  fireEvent.change(page.getByLabelText("Maximum AI calls"), { target: { value: "2" } }); flush();
+  const update = JSON.parse(socket.send.mock.calls.at(-1)![0]);
+  expect(update.action.settings.maxCalls).toBe(2);
+  socket.emit({ ...catalog(), requestId: update.requestId, ok: false, code: "settings_write_failed" });
+  expect(page.getByText(/Settings could not be saved/)).toBeTruthy();
+  expect((page.getByLabelText("Maximum AI calls") as HTMLInputElement).value).toBe("6");
+  socket.onclose?.(); flush();
+  expect(page.getByLabelText("Maximum AI calls").closest("fieldset")?.disabled).toBe(true);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(2));
+  const reconnected = Socket.instances[1]; reconnected.onopen?.();
+  reconnected.emit({ ...catalog(), groupingSettings: { ...catalog().groupingSettings, maxCalls: 8 } });
+  expect((page.getByLabelText("Maximum AI calls") as HTMLInputElement).value).toBe("8");
+  expect(page.getByLabelText("Maximum AI calls").closest("fieldset")?.disabled).toBe(false);
+});
 
 it.each(["none", "current", "other"])("reloads the app with draft protection for %s conversation", async draft => {
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);

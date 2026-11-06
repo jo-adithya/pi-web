@@ -70,10 +70,11 @@ export function SessionSidebar(props: SessionSidebarProps) {
     </nav>
     <footer class="sidebar-footer">
       <p class="shared-project">Separate project folders<br /><span>Conversations in a workspace share its files.</span></p>
-      <div class="theme-picker"><span>Color scheme</span><SelectField label="Color scheme" value={props.theme} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} change={value => {
+      <div class="theme-picker"><SelectField label="Color scheme" value={props.theme} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} change={value => {
         if (value === "system" || value === "light" || value === "dark") props.setTheme(value);
-      }} /></div>
-      <Button class="sidebar-settings" aria-pressed={props.settingsOpen ? "true" : "false"} onClick={props.openSettings}><Icon name="settings" />Settings</Button>
+      }} />
+        <Button class="icon-button sidebar-settings" aria-label="Settings" title="Settings" aria-pressed={props.settingsOpen ? "true" : "false"} onClick={props.openSettings}><Icon name="settings" /></Button>
+      </div>
     </footer>
   </>;
 }

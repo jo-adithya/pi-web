@@ -19,6 +19,20 @@ const storageKey = "pi-web.capability.v1", first = "a".repeat(64), second = "b".
 beforeEach(() => { sessionStorage.setItem(storageKey, first); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear(); history.replaceState(null, "", "/"); });
 
+it("places icon-only Settings to the right of the color picker with accessible labels", () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true })); vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  const settings = page.getByRole("button", { name: "Settings" });
+  const picker = page.getByRole("button", { name: /^Color scheme / });
+  expect(settings.textContent).toBe("");
+  expect(settings.title).toBe("Settings");
+  expect(settings.parentElement).toBe(picker.closest(".theme-picker"));
+  expect(settings.previousElementSibling?.contains(picker)).toBe(true);
+  expect(picker.closest(".theme-picker")?.querySelector(":scope > span")).toBeNull();
+  fireEvent.click(settings); flush();
+  expect(page.getByRole("heading", { name: "Settings" })).toBeTruthy();
+});
+
 it("leaves composer positioning to CSS during viewport changes while preserving pinch-zoom support", async () => {
   const viewport = Object.assign(new EventTarget(), { height: 800, offsetTop: 0, scale: 1 });
   vi.stubGlobal("visualViewport", viewport);
@@ -52,7 +66,8 @@ it.each(["terminal URL", "pasted link"])("keeps an unacknowledged draft editable
   function attach(socket: Socket) {
     socket.onopen?.();
     const sessionId = "10000000-0000-4000-8000-000000000001", epoch = "20000000-0000-4000-8000-000000000001";
-    socket.onmessage?.({ data: JSON.stringify({ v: 2, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] }) });
+  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
+  socket.onmessage?.({ data: JSON.stringify(catalog) });
     for (const body of [
       { type: "hello", project: "fixture", process: "ready" },
       { type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } },
@@ -91,7 +106,7 @@ it("opens Settings without a conversation or starting AI work", async () => {
   expect(settings.closest(".workspace-controls")).toBeNull();
   fireEvent.click(settings); flush();
   expect(page.getByRole("heading", { name: "Settings", level: 1 })).toBeTruthy();
-  expect(page.getByText("Select a conversation to configure AI review.")).toBeTruthy();
+  expect(page.getByText("Connect to load global AI review settings.")).toBeTruthy();
   expect(page.queryByText("Connecting to your workspace")).toBeNull();
   expect(page.queryByLabelText("Grouping model")).toBeNull();
   expect(fetcher).toHaveBeenCalledTimes(1);
@@ -124,7 +139,8 @@ it("keeps the chat draft and review preferences when navigating through Settings
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0], sessionId = "10000000-0000-4000-8000-000000000001", epoch = "20000000-0000-4000-8000-000000000001";
   socket.onopen?.();
-  socket.onmessage?.({ data: JSON.stringify({ v: 2, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] }) });
+  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
+  socket.onmessage?.({ data: JSON.stringify(catalog) });
   for (const body of [
     { type: "hello", project: "fixture", process: "ready" },
     { type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } },
@@ -133,14 +149,18 @@ it("keeps the chat draft and review preferences when navigating through Settings
   fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "Keep my draft" } }); flush();
   const sends = socket.send.mock.calls.length;
   fireEvent.click(page.getByRole("button", { name: "Settings" })); flush();
-  expect(page.getByText("My review", { selector: "strong" })).toBeTruthy();
+  expect(page.getByText(/Saved on this server for all workspaces/)).toBeTruthy();
   fireEvent.change(page.getByLabelText("Maximum AI calls"), { target: { value: "2" } }); flush();
+  const update = JSON.parse(socket.send.mock.calls.at(-1)![0]);
+  expect(update.action).toEqual({ type: "set_grouping_settings", settings: { model: null, maxCalls: 2, maxRequestBytes: 524288, includeGenerated: false } });
+  expect(page.getByRole("status").textContent).toContain("Saving settings");
+  socket.onmessage?.({ data: JSON.stringify({ ...catalog, code: "grouping_settings_updated", requestId: update.requestId, groupingSettings: update.action.settings }) }); flush();
   fireEvent.click(page.getByRole("button", { name: "Conversation" })); flush();
   expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep my draft");
   fireEvent.click(page.getByRole("button", { name: "Settings" })); flush();
   expect((page.getByLabelText("Maximum AI calls") as HTMLInputElement).value).toBe("2");
   expect(fetcher).toHaveBeenCalledTimes(1);
-  expect(socket.send).toHaveBeenCalledTimes(sends);
+  expect(socket.send).toHaveBeenCalledTimes(sends + 1);
 });
 
 it.each([true, false])("keeps a grouping run alive across Settings (finish there: %s)", async finishInSettings => {
@@ -163,7 +183,8 @@ it.each([true, false])("keeps a grouping run alive across Settings (finish there
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0], sessionId = "10000000-0000-4000-8000-000000000001", epoch = "20000000-0000-4000-8000-000000000001";
   socket.onopen?.();
-  socket.onmessage?.({ data: JSON.stringify({ v: 2, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] }) });
+  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
+  socket.onmessage?.({ data: JSON.stringify(catalog) });
   for (const body of [
     { type: "hello", project: "fixture", process: "ready" },
     { type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } },
@@ -176,7 +197,7 @@ it.each([true, false])("keeps a grouping run alive across Settings (finish there
   const requests = fetcher.mock.calls.length;
   fireEvent.click(page.getByRole("button", { name: "Settings" })); flush();
   expect(signal!.aborted).toBe(false);
-  expect(page.getByLabelText("Grouping model").closest("fieldset")?.disabled).toBe(true);
+  expect(page.getByLabelText("Grouping model").closest("fieldset")?.disabled).toBe(false);
   expect(page.queryByRole("region", { name: "Local changes" })).toBeNull();
   if (!finishInSettings) {
     fireEvent.click(page.getByRole("button", { name: "Changes" })); flush();
@@ -201,7 +222,8 @@ it("uses accessible icon-only view buttons on mobile and text on desktop", async
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   Socket.instances[0].onopen?.();
   const sessionId = "10000000-0000-4000-8000-000000000001";
-  Socket.instances[0].onmessage?.({ data: JSON.stringify({ v: 2, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "stopped", runtime: null }] }) });
+  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "stopped", runtime: null }] };
+  Socket.instances[0].onmessage?.({ data: JSON.stringify(catalog) });
   flush();
   for (const name of ["Conversation", "Changes"]) {
     const button = page.getByRole("button", { name });
@@ -254,7 +276,11 @@ it.each([null, "malformed"])("requires a valid origin-scoped capability instead 
   expect(Socket.instances).toHaveLength(0); expect(fetcher).not.toHaveBeenCalled();
 });
 
-it("lets an installed app sign in with a pasted same-origin terminal link", async () => {
+it.each([
+  `${location.origin}/#cap=${second}`,
+  `  #cap=${second}  `,
+  `  ${second}  `,
+])("lets an installed app sign in with a terminal link, fragment, or token (%s)", async credential => {
   sessionStorage.clear(); Socket.instances = [];
   const persistentWrite = vi.fn();
   vi.stubGlobal("localStorage", { getItem: () => null, setItem: persistentWrite });
@@ -263,7 +289,7 @@ it("lets an installed app sign in with a pasted same-origin terminal link", asyn
   const page = render(() => <App />);
   const input = await page.findByLabelText("Terminal login link") as HTMLInputElement;
   expect(input.type).toBe("password");
-  fireEvent.input(input, { target: { value: `${location.origin}/#cap=${second}` } });
+  fireEvent.input(input, { target: { value: credential } });
   fireEvent.submit(input.closest("form")!);
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   expect(fetcher).toHaveBeenCalledWith("/auth", expect.objectContaining({ body: JSON.stringify({ capability: second }), credentials: "omit", cache: "no-store" }));
@@ -272,6 +298,21 @@ it("lets an installed app sign in with a pasted same-origin terminal link", asyn
   expect(input.value).toBe("");
   expect(location.hash).toBe("");
   expect(page.queryByLabelText("Terminal login link")).toBeNull();
+});
+
+it("requires server approval for a well-formed pasted token", async () => {
+  sessionStorage.clear(); Socket.instances = [];
+  const fetcher = vi.fn().mockResolvedValue({ ok: false });
+  vi.stubGlobal("fetch", fetcher); vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  const input = await page.findByLabelText("Terminal login link") as HTMLInputElement;
+  fireEvent.input(input, { target: { value: second } });
+  fireEvent.submit(input.closest("form")!);
+  await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+  await vi.waitFor(() => expect(page.getByText("Authentication required")).toBeDefined());
+  expect(sessionStorage.getItem(storageKey)).toBeNull();
+  expect(Socket.instances).toHaveLength(0);
+  expect(input.value).toBe("");
 });
 
 it("can replace a stale login from the installed window while reconnecting", async () => {
@@ -295,13 +336,24 @@ it.each([
   `${location.origin}/#cap=invalid`,
   `${location.origin}/?cap=${first}`,
   `${location.origin}/#cap=${first}&cap=${second}`,
+  `${location.origin}/other/#cap=${first}`,
+  `${location.origin}/?extra=1#cap=${first}`,
+  `${location.protocol}//user:password@${location.host}/#cap=${first}`,
+  "#cap=invalid",
+  `#cap=${first}&cap=${second}`,
+  "#cap=",
+  first.slice(1),
+  `${first}a`,
+  first.toUpperCase(),
+  `#cap=${first.toUpperCase()}`,
+  `cap=${first}`,
 ])("rejects a pasted invalid or foreign login link without sending it (%s)", async link => {
   sessionStorage.clear(); Socket.instances = [];
   const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher); vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
   const input = await page.findByLabelText("Terminal login link") as HTMLInputElement;
   fireEvent.input(input, { target: { value: link } }); fireEvent.submit(input.closest("form")!); flush();
-  expect(page.getByText(/Paste the complete login link for this server/)).toBeDefined();
+  expect(page.getByText(/Paste this server’s login link, #cap=… fragment, or 64-character token/)).toBeDefined();
   expect(fetcher).not.toHaveBeenCalled(); expect(Socket.instances).toHaveLength(0);
   expect(input.value).toBe("");
 });

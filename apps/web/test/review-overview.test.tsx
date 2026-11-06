@@ -14,8 +14,8 @@ it("links risk and test hints to exact files without claiming tests passed", () 
   expect(page.getByRole("heading", { name: "Access and trust" })).toBeTruthy();
   expect(page.getByRole("heading", { name: "Stored data" })).toBeTruthy();
   expect(page.getByRole("heading", { name: "Dependencies and delivery" })).toBeTruthy();
-  const tests = within(page.getByRole("region", { name: "Test evidence" }));
-  expect(tests.getByText(/Test results are not available/)).toBeTruthy();
+  const tests = within(page.getByRole("region", { name: "Changed tests" }));
+  expect(tests.getByText(/Tests are not run here/)).toBeTruthy();
   expect(tests.getByText(/Deleted tests may remove coverage/)).toBeTruthy();
   fireEvent.click(tests.getByRole("button", { name: "test/auth.test.ts" }));
   expect(open).toHaveBeenCalledExactlyOnceWith("test/auth.test.ts");

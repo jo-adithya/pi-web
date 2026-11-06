@@ -65,6 +65,7 @@ async fn refreshed_reply(manager: &SessionManager, mut reply: WorkspaceReply) ->
     reply.selected_workspace = current.selected_workspace;
     reply.sessions = current.sessions;
     reply.selected = current.selected;
+    reply.grouping_settings = current.grouping_settings;
     reply
 }
 
@@ -125,12 +126,23 @@ pub(super) async fn socket_loop(socket: WebSocket, mut state: WebState) {
     let mut last_pong = tokio::time::Instant::now();
     let mut commands = 0;
     let mut window = tokio::time::Instant::now();
-    let mut last_catalog = None;
+    let mut grouping_changes = state.runtime.grouping_changes();
+    let initial = state.runtime.snapshot().await;
+    if !send_catalog(&mut writer, &initial).await {
+        return;
+    }
+    let mut last_catalog = Some(initial);
     loop {
         tokio::select! {
             _ = state.stopping.changed() => break,
             _ = heartbeat.tick() => {
                 if last_pong.elapsed() > Duration::from_secs(15) || !send(&mut writer, Message::Ping(Vec::new().into())).await { break; }
+            }
+            changed = grouping_changes.changed() => {
+                if changed.is_err() { break; }
+                let snapshot = state.runtime.snapshot().await;
+                if !send_catalog(&mut writer, &snapshot).await { break; }
+                last_catalog = Some(snapshot);
             }
             _ = catalog_tick.tick() => {
                 let snapshot = state.runtime.snapshot().await;

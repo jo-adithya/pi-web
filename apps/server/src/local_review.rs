@@ -41,6 +41,19 @@ pub(crate) struct File {
     status: &'static str,
     patch: Option<String>,
     fingerprint: Option<String>,
+    /// Text counts from metadata; absent for binary, untracked, or unavailable statistics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_stats: Option<FileLineStats>,
+}
+#[derive(Clone, Copy, Serialize)]
+pub(crate) struct FileLineStats {
+    added: u64,
+    removed: u64,
+}
+#[derive(Default)]
+struct ParsedLineStats {
+    totals: LineStats,
+    files: std::collections::HashMap<Vec<u8>, FileLineStats>,
 }
 /// Scope-wide Git line counts, independent of the bounded file list and lazy patches.
 /// Binary and untracked files contribute to unavailable_files instead of line counts.
@@ -69,7 +82,8 @@ pub(crate) struct Review {
 
 /// Lists up to 100 metadata entries per page, or loads one fresh member, within ten seconds.
 /// Cursors bind the listing and resolved scope identity; changed listings require a restart.
-/// Line statistics appear only on the first page. More pages do not imply omitted content.
+/// Scope totals appear only on the first page; file counts accompany every metadata page.
+/// More pages do not imply omitted content.
 /// Snapshot keys identify the captured diff, including binary changes, not an atomic workspace state.
 /// Untracked names participate in the identity; their content remains unread and omitted.
 /// Concurrent edits may change files between listing, identity, and selected patch reads;
@@ -123,7 +137,7 @@ pub(crate) async fn review(
         }
         None => 0,
     };
-    let line_stats = if request.path.is_none() && request.cursor.is_none() {
+    let stats = if request.path.is_none() {
         let mut stats_args = args.clone();
         stats_args.extend(["--numstat".into(), "-z".into(), "--".into()]);
         match git.strings(&stats_args, MAX_LIST).await {
@@ -131,6 +145,13 @@ pub(crate) async fn review(
             Err("Git output exceeds review limit") => None,
             Err(error) => return Err(error),
         }
+    } else {
+        None
+    };
+    let stats_available = stats.is_some();
+    let ParsedLineStats { totals, files: file_stats } = stats.unwrap_or_default();
+    let line_stats = if request.path.is_none() && request.cursor.is_none() && stats_available {
+        Some(totals)
     } else {
         None
     };
@@ -231,6 +252,7 @@ pub(crate) async fn review(
             status,
             patch: None,
             fingerprint: None,
+            line_stats: file_stats.get(path.as_bytes()).copied(),
         };
         result.files.push(file);
     }
@@ -258,6 +280,7 @@ pub(crate) async fn review(
                     status: "untracked",
                     patch: None,
                     fingerprint: None,
+                    line_stats: None,
                 };
                 result.files.push(file);
             }
@@ -354,26 +377,26 @@ fn paginate(review: &mut Review, offset: usize, snapshot: u64) -> Result<(), &'s
     Ok(())
 }
 
-/// Totals NUL-delimited numstat records, including the two-path rename form.
+/// Totals NUL-delimited numstat records and indexes text counts by destination path.
 /// Paths stay opaque bytes so tabs, newlines and non-UTF-8 names cannot alter counts.
-fn parse_line_stats(bytes: &[u8]) -> Result<LineStats, &'static str> {
-    let mut result = LineStats::default();
+fn parse_line_stats(bytes: &[u8]) -> Result<ParsedLineStats, &'static str> {
+    let mut result = ParsedLineStats::default();
     let mut records = bytes.split(|b| *b == 0);
     while let Some(record) = records.next().filter(|record| !record.is_empty()) {
         let mut fields = record.splitn(3, |b| *b == b'\t');
         let added = fields.next().ok_or("Invalid Git line statistics")?;
         let removed = fields.next().ok_or("Invalid Git line statistics")?;
         let path = fields.next().ok_or("Invalid Git line statistics")?;
-        if path.is_empty() {
-            for _ in 0..2 {
-                records
-                    .next()
-                    .filter(|path| !path.is_empty())
-                    .ok_or("Invalid Git rename statistics")?;
-            }
-        }
+        let path = if path.is_empty() {
+            records.next().filter(|path| !path.is_empty())
+                .ok_or("Invalid Git rename statistics")?;
+            records.next().filter(|path| !path.is_empty())
+                .ok_or("Invalid Git rename statistics")?
+        } else {
+            path
+        };
         if added == b"-" && removed == b"-" {
-            result.unavailable_files += 1;
+            result.totals.unavailable_files += 1;
         } else {
             let count = |bytes| {
                 std::str::from_utf8(bytes)
@@ -381,11 +404,14 @@ fn parse_line_stats(bytes: &[u8]) -> Result<LineStats, &'static str> {
                     .and_then(|s| s.parse::<u64>().ok())
                     .ok_or("Invalid Git line count")
             };
-            result.added = result.added
-                .checked_add(count(added)?)
+            let added = count(added)?;
+            let removed = count(removed)?;
+            result.files.insert(path.to_vec(), FileLineStats { added, removed });
+            result.totals.added = result.totals.added
+                .checked_add(added)
                 .ok_or("Git line counts exceed limit")?;
-            result.removed = result.removed
-                .checked_add(count(removed)?)
+            result.totals.removed = result.totals.removed
+                .checked_add(removed)
                 .ok_or("Git line counts exceed limit")?;
         }
     }
@@ -728,6 +754,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numstat_retains_destination_counts_and_omits_binary_counts() {
+        let parsed = parse_line_stats(
+            b"12\t3\tplain\0\
+              0\t0\t\0old\tname\0new\nname\0\
+              -\t-\t\0old-bin\0new-bin\0\
+              2\t1\t\xff\0",
+        ).unwrap();
+        assert_eq!(parsed.totals.added, 14);
+        assert_eq!(parsed.totals.removed, 4);
+        assert_eq!(parsed.totals.unavailable_files, 1);
+        assert_eq!(parsed.files.len(), 3);
+        assert_eq!(parsed.files[b"plain".as_slice()].added, 12);
+        assert_eq!(parsed.files[b"plain".as_slice()].removed, 3);
+        assert_eq!(parsed.files[b"new\nname".as_slice()].added, 0);
+        assert!(!parsed.files.contains_key(b"old\tname".as_slice()));
+        assert!(!parsed.files.contains_key(b"new-bin".as_slice()));
+        assert_eq!(parsed.files[b"\xff".as_slice()].removed, 1);
+        assert!(parse_line_stats(b"1\t2\t\0old\0").is_err());
+        assert!(parse_line_stats(b"-\t2\tfile\0").is_err());
+        assert!(parse_line_stats(b"18446744073709551615\t0\ta\x001\t0\tb\0").is_err());
+    }
+
+    #[test]
     fn snapshot_digest_is_sha256() {
         assert_eq!(
             format!("{:x}", Sha256::digest(b"abc")),
@@ -753,6 +802,7 @@ mod tests {
                 status: "untracked",
                 patch: Some("notice".into()),
                 fingerprint: Some("token".into()),
+                line_stats: None,
             };
             if !append_file(&mut review, &mut total, file).unwrap() {
                 break;
@@ -772,6 +822,7 @@ mod tests {
                 status: "renamed",
                 patch: None,
                 fingerprint: None,
+                line_stats: None,
             }).collect(),
             truncated: false,
             note: None,

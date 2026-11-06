@@ -79,14 +79,15 @@ it("shows empty history and can reload commits without changing the workspace", 
   expect(page.getByRole("button", { name: /^Commit / }).textContent).toContain("Latest change");
 });
 
-it("shows actionable history errors and retries without hiding the previous snapshot's scope", async () => {
+it("shows actionable history errors and retries while retaining the previous snapshot", async () => {
   let failed = true;
   vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("/commits") && failed ? new Response(JSON.stringify({ error: "Local history unavailable" }), { status: 422 }) : new Response(JSON.stringify(url.endsWith("/commits") ? history : snapshot))));
   const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await page.findByRole("article"); fireEvent.click(page.getByRole("button", { name: "Commit" }));
   expect((await page.findByRole("alert")).textContent).toBe("Local history unavailable");
-  expect(page.getByText("Snapshot: unstaged")).toBeTruthy();
+  expect(model.review.target()?.scope).toBe("unstaged");
+  expect(page.getByRole("article")).toBeTruthy();
   failed = false; fireEvent.click(page.getByRole("button", { name: "Reload commits" }));
   await waitFor(() => { flush(); expect(model.review.target()?.commit).toBe(latest); });
 });

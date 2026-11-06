@@ -401,6 +401,10 @@ pub struct WorkspaceItem {
 )]
 pub enum WorkspaceAction {
     List,
+    /// Persists global defaults for future client grouping jobs.
+    SetGroupingSettings {
+        settings: GroupingSettings,
+    },
     Create,
     CreateIn {
         workspace_id: String,
@@ -454,6 +458,27 @@ pub struct WorkspaceCommand {
     pub action: WorkspaceAction,
 }
 
+/// Provider and model identifiers for grouping requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct GroupModel {
+    pub provider: String,
+    pub id: String,
+}
+
+/// Global defaults captured by clients when starting a grouping job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupingSettings {
+    /// Null selects the client's current conversation model.
+    pub model: Option<GroupModel>,
+    /// Maximum calls per job, inclusive range 1..100.
+    pub max_calls: u32,
+    /// Maximum request bytes per job, inclusive range 1024..16777216.
+    pub max_request_bytes: u32,
+    pub include_generated: bool,
+}
+
 /// Workspace v2 envelope; session frames remain independently versioned v1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -469,6 +494,7 @@ pub struct WorkspaceReply {
     pub sessions: Vec<CatalogItem>,
     pub workspaces: Vec<WorkspaceItem>,
     pub selected_workspace: String,
+    pub grouping_settings: GroupingSettings,
 }
 
 /// Generates shared declarations without writing files.
@@ -521,6 +547,8 @@ pub fn typescript_bindings() -> String {
         (SlotStatus::docs(), SlotStatus::decl(&config)),
         (CatalogItem::docs(), CatalogItem::decl(&config)),
         (WorkspaceItem::docs(), WorkspaceItem::decl(&config)),
+        (GroupModel::docs(), GroupModel::decl(&config)),
+        (GroupingSettings::docs(), GroupingSettings::decl(&config)),
         (WorkspaceAction::docs(), WorkspaceAction::decl(&config)),
         (WorkspaceCommand::docs(), WorkspaceCommand::decl(&config)),
         (WorkspaceReply::docs(), WorkspaceReply::decl(&config)),

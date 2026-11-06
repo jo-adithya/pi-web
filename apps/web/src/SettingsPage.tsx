@@ -4,16 +4,24 @@ import { TextField } from "@kobalte/core/text-field";
 import { SelectField } from "./components/SelectField";
 import type { SessionModel } from "./session-model";
 import type { ThemePreference } from "./theme";
+import type { GroupOptions } from "./review-costs";
 import "./settings.css";
 
+/** Server-confirmed preferences shared by all conversations and connected devices. */
+export interface GroupingPreferences {
+  options: () => GroupOptions;
+  setOptions: (next: GroupOptions) => void;
+  disabled: () => boolean;
+  status: () => string;
+}
 interface SettingsPageProps {
   model?: SessionModel;
-  conversation: string;
+  grouping?: GroupingPreferences;
   theme: ThemePreference;
   setTheme: (value: ThemePreference) => void;
 }
 
-/** Edits browser appearance and the selected conversation's in-memory review preferences; opening makes no requests. */
+/** Edits browser appearance and server-wide grouping preferences; opening makes no requests. */
 export function SettingsPage(props: SettingsPageProps) {
   let heading!: HTMLHeadingElement;
   onSettled(() => heading.focus());
@@ -26,26 +34,26 @@ export function SettingsPage(props: SettingsPageProps) {
         change={value => { if (value === "system" || value === "light" || value === "dark") props.setTheme(value); }} />
     </section>
     <section class="settings-section" aria-labelledby="review-settings-title">
-      <div><h2 id="review-settings-title">AI review</h2><p><Show when={props.model} fallback="Select a conversation to configure AI review.">For <strong>{props.conversation}</strong>. These choices last until this page is reloaded.</Show></p></div>
-      <Show when={props.model} keyed>{model => <ReviewSettings model={model} />}</Show>
+      <div><h2 id="review-settings-title">AI review</h2><p>Saved on this server for all workspaces, conversations, and devices. Changes apply to new runs; active runs keep their starting settings.</p></div>
+      <Show when={props.grouping} fallback={<p class="settings-help">Connect to load global AI review settings.</p>}><ReviewSettings grouping={props.grouping!} model={props.model} /></Show>
     </section>
   </section>;
 }
 
-/** Updates idle grouping preferences without changing chat's model or launching a paid run. */
-function ReviewSettings(props: { model: SessionModel }) {
-  const grouping = props.model.review.grouping;
+/** Saves global preferences without changing chat models or launching AI work. */
+function ReviewSettings(props: { grouping: GroupingPreferences; model?: SessionModel }) {
+  const grouping = props.grouping;
   const [limitError, setLimitError] = createSignal("");
   const modelValue = () => grouping.options().model ? JSON.stringify(grouping.options().model) : "";
-  const available = () => props.model.state.settings.models;
+  const available = () => props.model?.state.settings.models ?? [];
   const modelKey = (model: { provider: string; id: string }) => JSON.stringify({ provider: model.provider, id: model.id });
   return <div class="settings-review">
-    <fieldset disabled={grouping.busy()}>
+    <fieldset disabled={grouping.disabled()}>
       <legend class="sr-only">AI review preferences</legend>
-      <SelectField class="settings-field" visibleLabel label="Grouping model" disabled={grouping.busy()} value={modelValue()}
-        description="A separate model for grouping changed files. Your chat model stays unchanged."
+      <SelectField class="settings-field" visibleLabel label="Grouping model" disabled={grouping.disabled()} value={modelValue()}
+        description="A separate model for grouping changed files. Same as chat uses each conversation’s model; chat models stay unchanged."
         options={[
-          { value: "", label: `Same as chat${props.model.state.settings.model ? ` (${props.model.state.settings.model!.name})` : ""}` },
+          { value: "", label: `Same as chat${props.model?.state.settings.model ? ` (${props.model.state.settings.model.name})` : ""}` },
           ...(grouping.options().model && !available().some(model => modelKey(model) === modelValue()) ? [{ value: modelValue(), label: `${grouping.options().model?.id} · currently unavailable`, disabled: true }] : []),
           ...available().map(model => ({ value: modelKey(model), label: `${model.name} · ${model.provider}` })),
         ]} change={value => {
@@ -53,7 +61,7 @@ function ReviewSettings(props: { model: SessionModel }) {
           grouping.setOptions({ ...grouping.options(), model: model ? { provider: model.provider, id: model.id } : undefined });
         }} />
       <div class="settings-limits">
-        <TextField class="settings-field" defaultValue={String(grouping.options().maxCalls)} required disabled={grouping.busy()} validationState={limitError() ? "invalid" : "valid"}>
+        <TextField class="settings-field" value={String(grouping.options().maxCalls)} required disabled={grouping.disabled()} validationState={limitError() ? "invalid" : "valid"}>
           <TextField.Label>Maximum AI calls</TextField.Label>
           <TextField.Input type="number" min="1" max="100" step="1" aria-invalid={limitError() ? "true" : "false"} onChange={event => {
             if (!event.currentTarget.checkValidity()) { setLimitError("Enter a whole number from 1 to 100. The previous limit is still active."); return; }
@@ -61,16 +69,16 @@ function ReviewSettings(props: { model: SessionModel }) {
           }} />
           <TextField.Description class="field-description">{limitError() || "Maximum requests in one grouping run."}</TextField.Description>
         </TextField>
-        <SelectField class="settings-field" visibleLabel label="Total request limit" disabled={grouping.busy()} value={String(grouping.options().maxRequestBytes)}
+        <SelectField class="settings-field" visibleLabel label="Total request limit" disabled={grouping.disabled()} value={String(grouping.options().maxRequestBytes)}
           options={[[128 * 1024, "128 KiB"], [512 * 1024, "512 KiB"], [2 * 1024 * 1024, "2 MiB"], [16 * 1024 * 1024, "16 MiB"]].map(([value, label]) => ({ value: String(value), label: String(label) }))}
           description="Includes data sent again in later requests." change={value => grouping.setOptions({ ...grouping.options(), maxRequestBytes: Number(value) })} />
       </div>
-      <Checkbox class="settings-check" disabled={grouping.busy()} checked={grouping.options().includeGenerated} onChange={checked => grouping.setOptions({ ...grouping.options(), includeGenerated: checked })}>
+      <Checkbox class="settings-check" disabled={grouping.disabled()} checked={grouping.options().includeGenerated} onChange={checked => grouping.setOptions({ ...grouping.options(), includeGenerated: checked })}>
         <Checkbox.Input /><Checkbox.Control class="checkbox-control"><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control>
         <div><Checkbox.Label>Include generated / lockfile contents</Checkbox.Label><Checkbox.Description class="field-description">Off saves context. These files still appear in Changes.</Checkbox.Description></div>
       </Checkbox>
     </fieldset>
-    <p class="settings-help" role="status">{grouping.busy() ? "Grouping is running. Wait or cancel it in Changes before editing these settings." : "Changes apply immediately. AI runs only when you ask it to group files in Changes."}</p>
+    <p class="settings-help" role="status">{grouping.status()}</p>
     <p class="settings-help">Limits reduce work, but are not a dollar cap. Usage and available cost estimates appear beside the result in Changes.</p>
   </div>;
 }

@@ -8,11 +8,18 @@ const boundedText = (value: unknown, max: number): value is string => typeof val
 export function validWorkspacePath(value: unknown): value is string {
   return boundedText(value, 1024) && value.startsWith("/") && !value.includes("\0");
 }
+/** Checks the server-wide grouping budget and optional model identity. */
+function validGroupingSettings(value: unknown): boolean {
+  if (!object(value) || typeof value.maxCalls !== "number" || !Number.isInteger(value.maxCalls) || value.maxCalls < 1 || value.maxCalls > 100 || typeof value.maxRequestBytes !== "number" || !Number.isInteger(value.maxRequestBytes) || value.maxRequestBytes < 1024 || value.maxRequestBytes > 16 * 1024 * 1024 || typeof value.includeGenerated !== "boolean") return false;
+  const identifier = (part: unknown) => boundedText(part, 256) && part.trim().length > 0 && !part.startsWith("-") && !/[\u0000-\u001f\u007f-\u009f]/.test(part);
+  return value.model === null || object(value.model) && identifier(value.model.provider) && identifier(value.model.id);
+}
 /** Validate the bounded multi-project catalog independently from session v1 frames. */
 export function decodeWorkspace(text: string): WorkspaceReply {
   if (text.length > 262_144) throw new Error("Catalog frame too large");
   const value: unknown = JSON.parse(text);
   if (!object(value) || value.v !== 2 || typeof value.ok !== "boolean" || !boundedText(value.code, 128) || !(value.requestId === null || boundedText(value.requestId, 64)) || !id(value.selected) || !id(value.selectedWorkspace) || !(value.target === null || id(value.target)) || !Array.isArray(value.sessions) || value.sessions.length > 512 || !Array.isArray(value.workspaces) || value.workspaces.length === 0 || value.workspaces.length > 16) throw new Error("Invalid workspace envelope");
+  if (!validGroupingSettings(value.groupingSettings)) throw new Error("Invalid global grouping settings");
   const workspaces = new Map<string, number>();
   for (const workspace of value.workspaces) {
     if (!object(workspace) || !id(workspace.workspaceId) || workspaces.has(workspace.workspaceId) || !boundedText(workspace.name, 64) || !validWorkspacePath(workspace.path)) throw new Error("Invalid workspace entry");

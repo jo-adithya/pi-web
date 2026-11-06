@@ -4,12 +4,310 @@ import { flush } from "solid-js";
 import { LocalReview } from "../src/LocalReview";
 import { SettingsPage } from "../src/SettingsPage";
 import { createSessionModel } from "../src/session-model";
-import { createLocalReview, diffLines, fetchReview, reviewDraft, type ReviewEntry, type ReviewFile, type ReviewSnapshot } from "../src/local-review";
+import { initialState } from "../src/client-state";
+import type { BrowserMessage } from "../src/generated/protocol";
+import { createLocalReview, diffLines, fetchReview, reviewDraft, reviewScopeDraft, type ReviewEntry, type ReviewFile, type ReviewSnapshot } from "../src/local-review";
 
 const file: ReviewFile = { fingerprint: "snapshot-a", path: "src/a.ts", previousPath: null, status: "modified", patch: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n same\n-old\n+<script>alert(1)</script>\n" };
 const snapshot = (files: ReviewEntry[] = [file]): ReviewSnapshot => ({ files, truncated: false, note: null });
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+it("prepares focused selection questions without sending or replacing the draft", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const transport = vi.fn(() => true), conversation = vi.fn();
+  const model = createSessionModel("questions", transport, () => true, undefined, () => "cap");
+  model.setDraft("My question");
+  const page = render(() => <LocalReview model={model} conversation={conversation} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
+  fireEvent.keyDown(page.getByRole("button", { name: "Focused questions" }), { key: "Enter" }); flush();
+  fireEvent.keyDown(screen.getByRole("menuitem", { name: "What could break?" }), { key: "Enter" }); flush();
+  expect(model.draft()).toContain("My question");
+  expect(model.draft()).toContain("What could break?");
+  expect(model.draft()).toContain("old — | new 2 | +<script>alert(1)</script>");
+  expect(model.draft()).not.toContain("| -old");
+  expect(transport).not.toHaveBeenCalled();
+  expect(conversation).toHaveBeenCalledOnce();
+});
+
+it("combines review questions in one collapsible panel with independent scopes", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const model = createSessionModel("combined-ask", vi.fn(() => true), () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  expect(page.queryByRole("region", { name: "Ask" })).toBeNull();
+  const trigger = page.getByRole("button", { name: "Ask" });
+  expect(trigger.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(trigger); flush();
+  const panel = within(page.getByRole("region", { name: "Ask" }));
+  expect(page.getAllByRole("button", { name: "Explain change" })).toHaveLength(1);
+  expect(panel.getByRole("button", { name: "This file" }).getAttribute("aria-pressed")).toBe("true");
+  expect((panel.getByRole("button", { name: "Selected lines" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
+  expect(panel.getByRole("button", { name: "Selected lines" }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(panel.getByRole("button", { name: "This file" })); flush();
+  fireEvent.click(panel.getByRole("button", { name: "Explain change" })); flush();
+  expect(model.draft()).toContain(file.patch);
+  expect(model.draft()).not.toContain("Selected lines only");
+  fireEvent.click(panel.getByRole("button", { name: "Selected lines" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Clear selection" })); flush();
+  expect(panel.getByRole("button", { name: "This file" }).getAttribute("aria-pressed")).toBe("true");
+  expect((panel.getByRole("button", { name: "Selected lines" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(trigger); flush();
+  expect(page.queryByRole("region", { name: "Ask" })).toBeNull();
+  expect(trigger.getAttribute("aria-expanded")).toBe("false");
+});
+
+it("offers review question buttons for the current file or selected lines without sending", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const transport = vi.fn(() => true), conversation = vi.fn();
+  const model = createSessionModel("question-buttons", transport, () => true, undefined, () => "cap");
+  model.setDraft("Keep my draft");
+  const page = render(() => <LocalReview model={model} conversation={conversation} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
+  const questions = within(page.getByRole("region", { name: "Ask" }));
+  expect(questions.getByText(/Whole file/)).toBeTruthy();
+  fireEvent.click(questions.getByRole("button", { name: "Explain change" })); flush();
+  expect(model.draft()).toContain("Keep my draft");
+  expect(model.draft()).toContain("Explain this:");
+  expect(model.draft()).toContain(file.patch);
+  expect(model.draft()).toContain("Do not edit files");
+  model.setDraft("Selection question");
+  fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
+  expect(questions.getByText(/1 selected line/)).toBeTruthy();
+  fireEvent.click(questions.getByRole("button", { name: "Security review" })); flush();
+  expect(model.draft()).toContain("Selection question");
+  expect(model.draft()).toContain("trust boundaries");
+  expect(model.draft()).toContain("old — | new 2 |");
+  expect(model.draft()).not.toContain("| -old");
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledTimes(2);
+});
+
+it("prepares an overall review from every listed file, independently of file filters and selection", async () => {
+  const other: ReviewEntry = { path: "src/b.ts", previousPath: "old/b.ts", status: "renamed", patch: null, fingerprint: null };
+  const fetch = vi.fn(async () => new Response(JSON.stringify(snapshot([file, other]))));
+  vi.stubGlobal("fetch", fetch);
+  const transport = vi.fn(() => true), conversation = vi.fn();
+  const model = createSessionModel("overall-question", transport, () => true, undefined, () => "cap");
+  model.setDraft("Keep my notes");
+  const page = render(() => <LocalReview model={model} conversation={conversation} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
+  fireEvent.input(page.getByRole("searchbox", { name: "Filter files" }), { target: { value: "a.ts" } }); flush();
+  fireEvent.click(page.getByRole("button", { name: "Overview" })); flush();
+  const calls = fetch.mock.calls.length;
+  expect(page.queryByRole("region", { name: "Organize changed files" })).toBeNull();
+  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
+  const questions = within(page.getByRole("region", { name: "Ask" }));
+  fireEvent.click(questions.getByRole("button", { name: "All changes" })); flush();
+  expect(questions.getByText(/2 files/)).toBeTruthy();
+  expect(questions.getByText(/Nothing is sent automatically/)).toBeTruthy();
+  fireEvent.click(questions.getByRole("button", { name: "What could break?" })); flush();
+  expect(model.draft()).toContain("Keep my notes");
+  expect(model.draft()).toContain("overall local unstaged changes");
+  expect(model.draft()).toContain("src/a.ts");
+  expect(model.draft()).toContain("src/b.ts");
+  expect(model.draft()).toContain("old/b.ts");
+  expect(model.draft()).toContain("Inspect the actual diffs");
+  expect(model.draft()).toContain("Do not edit files");
+  expect(model.draft()).not.toContain(file.patch);
+  expect(model.draft()).not.toContain("Selected lines only");
+  expect(fetch.mock.calls).toHaveLength(calls);
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledOnce();
+});
+
+it("keeps overall questions tied to the exact Git comparison and reports incomplete evidence", () => {
+  const partial = { ...snapshot(), truncated: true, nextCursor: "next" };
+  const branch = reviewScopeDraft("Notes", partial, { scope: "branch", base: "release/v2" }, "risks");
+  expect(branch).toContain('branch changes against merge-base with "release/v2"');
+  expect(branch).toContain("file list is incomplete");
+  expect(branch).toContain("Discover the remaining files");
+  expect(branch).toContain("not just the selected file");
+  expect(branch).not.toContain(file.patch);
+  expect(reviewScopeDraft("", snapshot(), { scope: "commit", commit: "abc123" }, "explain")).toContain("commit abc123 against its first parent (empty tree for a root commit)");
+  expect(reviewScopeDraft("", snapshot(), { scope: "staged" }, "security")).toContain("overall local staged changes");
+  const commands = [{ name: "skill:security-review", description: null, source: "skill" as const }];
+  expect(reviewScopeDraft("Notes", snapshot(), { scope: "unstaged" }, "security", commands)).toMatch(/^\/skill:security-review Notes\n\n/);
+  expect(reviewScopeDraft("/existing notes", snapshot(), { scope: "unstaged" }, "security", commands)).toMatch(/^\/existing notes\n\n/);
+  expect(() => reviewScopeDraft("🙂".repeat(9000), snapshot(), { scope: "unstaged" }, "risks")).toThrow("message limit");
+});
+
+it("keeps the draft and quote when an overall question exceeds the message limit", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const transport = vi.fn(() => true), conversation = vi.fn();
+  const model = createSessionModel("overall-limit", transport, () => true, undefined, () => "cap");
+  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
+  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "commands", commands: [{ name: "skill:security-review", description: null, source: "skill" }] } });
+  model.setDraft("Keep my notes");
+  expect(model.quoteReply({ author: "Pi", text: "x".repeat(32000) })).toBe(true); flush();
+  const quote = model.quote();
+  const page = render(() => <LocalReview model={model} conversation={conversation} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
+  const questions = within(page.getByRole("region", { name: "Ask" }));
+  fireEvent.click(questions.getByRole("button", { name: "All changes" })); flush();
+  expect(questions.getByRole("button", { name: "Security review" }).getAttribute("title")).not.toContain("/skill:");
+  fireEvent.click(questions.getByRole("button", { name: "Security review" })); flush();
+  expect(page.getByRole("alert").textContent).toContain("message limit");
+  expect(model.draft()).toBe("Keep my notes"); expect(model.quote()).toBe(quote);
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
+});
+
+it("uses only advertised skills and preserves an existing slash command", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const transport = vi.fn(() => true);
+  const model = createSessionModel("skills", transport, () => true, undefined, () => "cap");
+  model.receive({ v: 1, sessionId: "skills", epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
+  const commands = [
+    { name: "skill:assess-impact", description: "Impact", source: "skill" as const },
+    { name: "skill:security-review", description: "Not a skill", source: "prompt" as const },
+  ];
+  model.receive({ v: 1, sessionId: "skills", epoch: "e", body: { type: "commands", commands } });
+  model.setDraft("Existing notes");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
+  const questions = within(page.getByRole("region", { name: "Ask" }));
+  expect(questions.getByRole("button", { name: "What could break?" }).getAttribute("title")).toContain("/skill:assess-impact");
+  fireEvent.click(questions.getByRole("button", { name: "What could break?" })); flush();
+  expect(model.draft().startsWith("/skill:assess-impact Existing notes\n\n")).toBe(true);
+  expect(model.draft()).toContain("Do not edit files");
+  model.setDraft("/existing keep these arguments"); flush();
+  fireEvent.click(questions.getByRole("button", { name: "What could break?" })); flush();
+  expect(model.draft().startsWith("/existing keep these arguments\n\n")).toBe(true);
+  expect(model.draft()).not.toContain("/skill:assess-impact");
+  model.setDraft(""); flush();
+  fireEvent.click(questions.getByRole("button", { name: "Security review" })); flush();
+  expect(model.draft()).not.toContain("/skill:");
+  expect(model.draft()).toContain("trust boundaries");
+  expect(transport).not.toHaveBeenCalled();
+});
+
+it("preserves a pending quote and submits a plain review question instead of an inactive skill command", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const transport = vi.fn((_message: BrowserMessage) => true), conversation = vi.fn();
+  const model = createSessionModel("quoted-question", transport, () => true, undefined, () => "cap");
+  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
+  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } } });
+  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "commands", commands: [{ name: "skill:security-review", description: null, source: "skill" }] } });
+  model.setDraft("Keep my notes");
+  expect(model.quoteReply({ author: "Pi", text: "Quoted context" })).toBe(true); flush();
+  const quote = model.quote();
+  const page = render(() => <LocalReview model={model} conversation={conversation} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
+  const button = page.getByRole("button", { name: "Security review" });
+  expect(button.getAttribute("title")).not.toContain("/skill:");
+  fireEvent.click(button); flush();
+  expect(model.draft()).not.toContain("/skill:");
+  expect(model.quote()).toBe(quote);
+  expect(model.draft()).toContain("trust boundaries");
+  expect(conversation).toHaveBeenCalledOnce(); expect(transport).not.toHaveBeenCalled();
+  expect(model.canSend()).toBe(true); model.submit();
+  expect(transport.mock.calls[0][0].action).toEqual({ type: "prompt", text: `> Quoted context\n\n${model.draft()}`, images: [] });
+});
+
+it("rejects an over-budget quoted review question without changing the draft or quote", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const conversation = vi.fn(), transport = vi.fn(() => true);
+  const model = createSessionModel("quoted-budget", transport, () => true, undefined, () => "cap");
+  const prompt = reviewDraft("", file, { scope: "unstaged" }, undefined, "security");
+  const draft = "x".repeat(32768 - new TextEncoder().encode(prompt).length - 2);
+  model.setDraft(draft); expect(model.quoteReply({ author: "Pi", text: "é" })).toBe(true); flush();
+  const quote = model.quote();
+  const page = render(() => <LocalReview model={model} conversation={conversation} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Security review" })); flush();
+  expect(model.draft()).toBe(draft); expect(model.quote()).toBe(quote);
+  expect(page.getByText(/exceed the message limit/)).toBeTruthy();
+  expect(conversation).not.toHaveBeenCalled(); expect(transport).not.toHaveBeenCalled();
+});
+
+it("counts the skill command in the complete draft byte limit", () => {
+  const target = { scope: "unstaged" as const };
+  const plain = reviewDraft("", file, target, undefined, "risks");
+  const draft = "x".repeat(32768 - new TextEncoder().encode(plain).length - 2);
+  expect(new TextEncoder().encode(reviewDraft(draft, file, target, undefined, "risks")).length).toBe(32768);
+  expect(() => reviewDraft(draft, file, target, undefined, "risks", [{ name: "skill:assess-impact", description: null, source: "skill" }])).toThrow("message limit");
+});
+
+it("generates explanations only on request and links validated evidence without marking or sending", async () => {
+  const explanation = { explanation: { observations: [{ text: "Replaces the old expression.", citations: [{ path: file.path, startLine: 6, endLine: 7 }] }], inferences: [], risks: [], limitations: ["Only the supplied patch."] } };
+  const fetch = vi.fn(async (url: string, init: RequestInit) => new Response(JSON.stringify(url.endsWith("/groups")
+    ? JSON.parse(init.body as string).explain ? explanation : { groups: [{ title: "Behavior", reason: "Related change", paths: [file.path] }] }
+    : snapshot())));
+  vi.stubGlobal("fetch", fetch);
+  const transport = vi.fn(() => true), conversation = vi.fn();
+  const model = createSessionModel("explain", transport, () => true, undefined, () => "cap");
+  model.setDraft("Keep draft");
+  const page = render(() => <LocalReview model={model} conversation={conversation} />);
+  await page.findByRole("heading", { name: file.path });
+  fireEvent.click(page.getByRole("button", { name: "Group with AI" }));
+  await page.findByRole("button", { name: "Regenerate groups" });
+  fireEvent.click(page.getByRole("button", { name: "Overview" })); flush();
+  const calls = () => fetch.mock.calls.filter(([, init]) => JSON.parse(init.body as string).explain);
+  expect(calls()).toHaveLength(0);
+  fireEvent.click(page.getByRole("button", { name: "Explain this group" }));
+  await page.findByText("Replaces the old expression.");
+  expect(calls()).toHaveLength(1);
+  expect(page.getByText(/AI interpretation—not verified facts/)).toBeTruthy();
+  fireEvent.click(page.getByRole("button", { name: "Hide explanation" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Show explanation" })); flush();
+  expect(calls()).toHaveLength(1);
+  fireEvent.click(page.getByRole("button", { name: `${file.path} · diff 6–7` }));
+  await waitFor(() => expect(page.container.querySelectorAll("[data-review-evidence]")).toHaveLength(2));
+  expect(model.draft()).toBe("Keep draft"); expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
+  expect(model.review.isReviewed(file)).toBe(false);
+});
+
+it("does not bind a separately reviewed patch to an earlier matching metadata identity", async () => {
+  const other = { ...file, path: "src/other.ts", fingerprint: "other" };
+  let version = file;
+  const review = createLocalReview(async request => request.path
+    ? snapshot([request.path === file.path ? version : other])
+    : { ...snapshot([file, other].map(item => ({ ...item, patch: null, fingerprint: null }))), snapshotKey: "a".repeat(64) });
+  await review.refresh(); flush();
+  await review.setSelected(other.path); flush();
+  version = { ...file, patch: file.patch.replace("-old", "-version-b"), fingerprint: "version-b" };
+  await review.setSelected(file.path); flush();
+  // Force a fresh captured B patch instead of the earlier cached A patch.
+  await review.refresh(); flush();
+  review.mark(review.snapshot()!.files.find(item => item.path === file.path)!, true); flush();
+  await review.setSelected(other.path); flush();
+  version = file;
+  await review.refresh(); flush();
+  const pending = review.snapshot()!.files.find(item => item.path === file.path)!;
+  expect(review.historyReview.reviewedFingerprint(file.path)).toBe("version-b");
+  expect(review.isReviewed(pending)).toBe(false);
+  expect(review.historyReview.status(pending)).toBe("pending");
+  await review.setSelected(file.path); flush();
+  expect(review.historyReview.status(review.snapshot()!.files.find(item => item.path === file.path)!)).toBe("changed");
+});
+
+it("highlights later edits against the last manual review and preserves unchanged marks", async () => {
+  let current = file;
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot([current])))));
+  const model = createSessionModel("incremental", () => true, () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("button", { name: "Select new line 2" });
+  fireEvent.click(page.getByRole("checkbox", { name: "Reviewed" })); flush();
+  await model.review.refresh(); flush();
+  expect(model.review.isReviewed(file)).toBe(true);
+  current = { ...file, fingerprint: "later", patch: file.patch.replace("+<script>alert(1)</script>", "+return 42") };
+  await model.review.refresh(); flush();
+  expect(page.getByRole("region", { name: "Changes since last review" })).toBeTruthy();
+  expect(page.container.querySelectorAll(".diff-since-review")).toHaveLength(1);
+  expect(page.container.querySelector(".diff-since-review code")?.textContent).toBe("return 42");
+  fireEvent.click(page.getByRole("button", { name: "Previously reviewed rows replaced or removed" })); flush();
+  expect(page.getByText("+<script>alert(1)</script>")).toBeTruthy();
+  fireEvent.click(page.getByRole("checkbox", { name: "Reviewed" })); flush();
+  expect(page.queryByRole("region", { name: "Changes since last review" })).toBeNull();
+  fireEvent.click(page.getByRole("checkbox", { name: "Needs review only" })); flush();
+  expect(page.queryByRole("button", { name: `${file.path} — modified — reviewed` })).toBeNull();
+});
 
 it("lets grouping use a separate model and shows measured usage without changing chat", async () => {
   const cheap = { provider: "test", id: "small", name: "Small", images: false };
@@ -21,7 +319,7 @@ it("lets grouping use a separate model and shows measured usage without changing
   const model = createSessionModel("cost-ui", () => true, () => true, undefined, () => "cap");
   model.receive({ v: 1, sessionId: "cost-ui", epoch: "epoch", body: { type: "hello", project: "fixture", process: "ready" } });
   model.receive({ v: 1, sessionId: "cost-ui", epoch: "epoch", body: { type: "settings", settings: { models: [chat, cheap], model: chat, thinkingLevel: "off", thinkingLevels: ["off"], codexFast: null } } }); flush();
-  const settings = render(() => <SettingsPage model={model} conversation="Cost test" theme="system" setTheme={() => {}} />);
+  const settings = render(() => <SettingsPage model={model} grouping={{ options: model.review.grouping.options, setOptions: model.review.grouping.setOptions, disabled: () => false, status: () => "Saved" }} theme="system" setTheme={() => {}} />);
   fireEvent.keyDown(settings.getByRole("button", { name: /^Grouping model/ }), { key: "Enter" }); flush();
   fireEvent.click(screen.getByRole("option", { name: "Small · test" })); flush();
   expect(fetch).not.toHaveBeenCalled(); settings.unmount();
@@ -35,7 +333,7 @@ it("lets grouping use a separate model and shows measured usage without changing
   expect(model.state.settings.model?.id).toBe("large");
   const request = fetch.mock.calls.find(([url]) => url.endsWith("/groups"))!;
   expect(JSON.parse(request[1].body as string).model).toEqual({ provider: "test", id: "small" });
-  expect(page.getByRole("button", { name: "Regenerate (ignore saved result)" })).toBeTruthy();
+  expect(page.getByRole("button", { name: "Regenerate groups" })).toBeTruthy();
 });
 
 it("opens an overview without AI calls and follows purpose evidence into the same diff", async () => {
@@ -53,7 +351,7 @@ it("opens an overview without AI calls and follows purpose evidence into the sam
   fireEvent.click(views.getByRole("button", { name: "Overview" })); flush();
   const overview = within(page.getByRole("region", { name: "Change overview" }));
   expect(page.queryByRole("region", { name: "Unified diff" })).toBeNull();
-  expect(overview.getByText(/Test results are not available/)).toBeTruthy();
+  expect(overview.getByText(/Tests are not run here/)).toBeTruthy();
   expect(overview.getByText(/Filename hints, not a security assessment/)).toBeTruthy();
   expect(fetch.mock.calls.some(([url]) => url.endsWith("/groups"))).toBe(false);
   fireEvent.click(page.getByRole("button", { name: "Group with AI" }));
@@ -62,6 +360,10 @@ it("opens an overview without AI calls and follows purpose evidence into the sam
   fireEvent.click(overview.getByRole("button", { name: "Review Sign-in validation" }));
   await page.findByRole("heading", { name: "src/auth.ts" });
   expect(views.getByRole("button", { name: "Files" }).getAttribute("aria-pressed")).toBe("true");
+  const picker = within(page.getByRole("navigation", { name: "Changed files" }));
+  expect(picker.getByRole("button", { name: /Review group.*Sign-in validation/ })).toBeTruthy();
+  expect(picker.queryByRole("button", { name: "src/a.ts — modified" })).toBeNull();
+  expect(picker.getAllByRole("button", { name: / — modified$/ }).map(button => button.getAttribute("aria-label"))).toEqual(["src/auth.ts — modified", "test/auth.test.ts — modified"]);
   await waitFor(() => expect(document.activeElement).toBe(page.getByRole("article", { name: "Diff for src/auth.ts" })));
   fireEvent.click(page.getByRole("button", { name: "Next unreviewed" }));
   await page.findByRole("heading", { name: "test/auth.test.ts" });
@@ -76,8 +378,38 @@ it("opens an overview without AI calls and follows purpose evidence into the sam
   expect(updated.getByText("1/2 reviewed")).toBeTruthy();
   fireEvent.click(updated.getByRole("button", { name: "Review Sign-in validation" }));
   await page.findByRole("heading", { name: "test/auth.test.ts" });
+  expect(page.getByRole("button", { name: "Next unreviewed" }).hasAttribute("disabled")).toBe(true);
+  fireEvent.click(page.getByRole("button", { name: "Show all files" })); flush();
+  expect(within(page.getByRole("navigation", { name: "Changed files" })).getByRole("button", { name: "src/a.ts — modified" })).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Next unreviewed" }));
   await page.findByRole("heading", { name: "src/a.ts" });
+});
+
+it("keeps group order in the dialog picker and resets focus when that group disappears", async () => {
+  const files = [file, { ...file, path: "src/z.ts" }, { ...file, path: "src/b.ts" }];
+  let grouping = [{ title: "Ordered", reason: "", paths: ["src/z.ts", file.path] }, { title: "Other", reason: "", paths: ["src/b.ts"] }];
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/groups") ? { groups: grouping } : snapshot(files)))));
+  const model = createSessionModel("group-order", () => true, () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("heading", { name: file.path });
+  fireEvent.click(page.getByRole("button", { name: "Group with AI" }));
+  await page.findByRole("button", { name: "Regenerate groups" });
+  fireEvent.click(page.getByRole("button", { name: "Overview" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Review Ordered" }));
+  await page.findByRole("heading", { name: "src/z.ts" });
+  fireEvent.click(page.getByRole("button", { name: "Files (3)" })); flush();
+  const dialog = within(screen.getByRole("dialog"));
+  expect(dialog.getAllByRole("button", { name: / — modified$/ }).map(button => button.getAttribute("aria-label"))).toEqual(["src/z.ts — modified", "src/a.ts — modified"]);
+  fireEvent.keyDown(dialog.getByRole("button", { name: /Review group/ }), { key: "Enter" }); flush();
+  fireEvent.click(screen.getByRole("option", { name: "Other (1)" })); flush();
+  await page.findByRole("heading", { name: "src/b.ts" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(page.getByRole("button", { name: "Next unreviewed" }).hasAttribute("disabled")).toBe(true);
+  grouping = [{ title: "Combined", reason: "", paths: files.map(item => item.path) }];
+  fireEvent.click(page.getByRole("button", { name: "Regenerate groups" }));
+  await page.findByRole("heading", { name: "Combined" });
+  expect(page.queryByRole("button", { name: "Show all files" })).toBeNull();
+  expect(within(page.getByRole("navigation", { name: "Changed files" })).getAllByRole("button", { name: / — modified$/ })).toHaveLength(3);
 });
 
 it("loads 1000 metadata entries in pages and fetches only selected patches", async () => {
@@ -181,6 +513,9 @@ it("keeps compact file controls named and preserves review, navigation and draft
     expect(button.querySelector("svg[aria-hidden=true]")).toBeTruthy();
     expect(button.getAttribute("title")).toBeTruthy();
   }
+  expect(header.getByRole("button", { name: "Next unreviewed" }).textContent).toBe("Next");
+  expect(header.getByRole("button", { name: "Ask Pi about file" }).textContent).toBe("Ask Pi");
+  expect(header.getByRole("button", { name: "Files (2)" }).textContent).toBe("Files (2)");
   expect(header.getByRole("button", { name: "Text" }).getAttribute("aria-pressed")).toBe("true");
   expect(page.getByTitle("Mark file as reviewed")).toBeTruthy();
   fireEvent.click(header.getByRole("checkbox", { name: "Reviewed" })); flush();
@@ -206,16 +541,19 @@ it("shows scope-wide line totals without loading all patches and refreshes them 
   vi.stubGlobal("fetch", request);
   const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
-  await page.findByText("575 lines changed");
+  await page.findByText("+500 added");
   expect(page.getByText("+500 added")).toBeTruthy(); expect(page.getByText("−75 deleted")).toBeTruthy();
-  expect(page.getByText("2 files without line counts (binary or untracked)")).toBeTruthy();
+  expect(page.queryByText(/files without line counts/)).toBeNull();
+  expect(page.queryByText(/Snapshot:/)).toBeNull();
+  expect(page.queryByText("575 lines changed")).toBeNull();
   await page.findByLabelText("Reviewed");
   expect(request).toHaveBeenCalledTimes(2);
   fireEvent.click(page.getByLabelText("Reviewed")); flush();
-  expect(page.getByText("575 lines changed")).toBeTruthy();
+  expect(page.getByText("+500 added")).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Staged" }));
-  await page.findByText("0 lines changed");
-  expect(page.queryByText("575 lines changed")).toBeNull();
+  await page.findByText("+0 added");
+  expect(page.getByText("−0 deleted")).toBeTruthy();
+  expect(page.queryByText("+500 added")).toBeNull();
   expect(page.queryByText(/files without line counts/)).toBeNull();
 });
 
@@ -849,7 +1187,7 @@ it("toggles Reviewed through the shared checkbox control and label", async () =>
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await waitFor(() => { flush(); expect(page.getByRole("checkbox", { name: "Reviewed" })).toBeTruthy(); });
   const input = page.getByRole("checkbox", { name: "Reviewed" }) as HTMLInputElement;
-  const control = page.container.querySelector(".checkbox-control");
+  const control = page.container.querySelector(".review-reviewed .checkbox-control");
   expect(control).not.toBeNull();
   expect(input.checked).toBe(false);
   fireEvent.click(control!); flush();
@@ -951,4 +1289,31 @@ it("aborts the snapshot request when leaving changes", async () => {
   await waitFor(() => expect(request).toHaveBeenCalledOnce());
   const signal = (request.mock.calls as unknown as [string, RequestInit][])[0][1].signal!;
   page.unmount(); expect(signal.aborted).toBe(true);
+});
+
+it("shows metadata file counts and retains them after selected patch loads", async () => {
+  const entries = [
+    { ...file, lineStats: { added: 12, removed: 3 }, patch: null, fingerprint: null },
+    { ...file, path: "other.ts", lineStats: { added: 0, removed: 5 }, patch: null, fingerprint: null },
+    { ...file, path: "binary", patch: null, fingerprint: null },
+  ];
+  const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+    const request = JSON.parse(init.body as string);
+    return new Response(JSON.stringify(request.path ? snapshot([{ ...file, path: request.path }]) : snapshot(entries)));
+  });
+  vi.stubGlobal("fetch", fetch);
+  const model = createSessionModel("file-counts", () => true, () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  const first = await page.findByRole("button", { name: "src/a.ts — modified — 12 added, 3 deleted" });
+  await page.findByRole("heading", { name: file.path });
+  expect(first.textContent).toContain("+12"); expect(first.textContent).toContain("−3");
+  expect(page.getByRole("button", { name: "other.ts — modified — 0 added, 5 deleted" }).textContent).toContain("+0");
+  expect(page.getByRole("button", { name: "binary — modified" }).querySelector(".review-file-counts")).toBeNull();
+  expect(fetch.mock.calls.filter(([, init]) => JSON.parse(init.body as string).path)).toHaveLength(1);
+});
+
+
+it.each([null, {}, { added: -1, removed: 0 }, { added: 1.5, removed: 0 }, { added: 0, removed: "1" }, { added: Number.MAX_SAFE_INTEGER, removed: 1 }])("rejects invalid file line counts", async lineStats => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...snapshot(), files: [{ ...file, lineStats }] }))));
+  await expect(fetchReview("s", { scope: "unstaged" }, new AbortController().signal, "cap")).rejects.toThrow("Invalid file line counts.");
 });

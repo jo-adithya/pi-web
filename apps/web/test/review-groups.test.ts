@@ -44,6 +44,21 @@ it("groups 1000 files globally without eagerly loading patches", async () => {
   expect(review.selected()).toBe("0.ts");
 });
 
+it("applies updated preferences to future runs without changing a running budget", async () => {
+  const infer = vi.fn(async (request: GroupRequest) => merged(request));
+  const groups = createReviewGroups(infer);
+  groups.setOptions({ ...groups.options(), maxCalls: 1 }); flush();
+  let ready!: (files: GroupInput[]) => void;
+  const run = groups.run(() => new Promise(resolve => { ready = resolve; })); flush();
+  groups.setOptions({ ...groups.options(), maxCalls: 10 }); flush();
+  expect(groups.options().maxCalls).toBe(10);
+  ready(oversized()); await run; flush();
+  expect(infer).toHaveBeenCalledTimes(1);
+  expect(groups.error()).toContain("budget");
+  await groups.run(async () => files); flush();
+  expect(groups.error()).toBe("");
+});
+
 it("stops before exceeding the configured paid-call budget", async () => {
   const infer = vi.fn(async (request: GroupRequest) => merged(request));
   const groups = createReviewGroups(infer);

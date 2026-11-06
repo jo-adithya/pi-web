@@ -94,11 +94,12 @@ a:hover { color: var(--foreground); }
 .session-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .87rem; font-weight: 500; }
 .session-info small { display: block; font-size: .72rem; color: var(--muted-foreground); margin-top: .1rem; }
 .sidebar-footer { border-top: 1px solid var(--border); padding: 1rem .65rem 0; margin-top: .75rem; }
-.sidebar-settings { display: flex; align-items: center; gap: .6rem; width: 100%; margin-top: 1rem; text-align: left; }
+.sidebar-settings { margin-left: auto; width: 1.8rem; height: 1.8rem; padding: .35rem; }
+.sidebar-settings .icon { width: 1rem; height: 1rem; }
 .shared-project { font-size: .78rem; font-weight: 500; margin: 0 0 1.1rem; }
 .shared-project span { display: block; font-size: .74rem; color: var(--muted-foreground); font-weight: 400; line-height: 1.5; margin-top: .2rem; }
 .theme-picker { display: flex; align-items: center; justify-content: space-between; gap: .5rem; font-size: .78rem; font-weight: 400; }
-.theme-picker .select-trigger { min-width: 0; width: auto; max-width: 8rem; font-size: .78rem; border-color: var(--border); padding: .35rem .45rem; }
+.theme-picker .select-trigger { min-width: 0; width: auto; max-width: 8rem; height: 1.8rem; font-size: .78rem; border-color: var(--border); padding: .2rem .45rem; }
 
 /* Chat chrome stays quiet, with a readable center column and floating composer. */
 .chat-panel { --header-height: 3.4rem; min-width: 0; flex: 1; display: flex; flex-direction: column; background: var(--card); }

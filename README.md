@@ -205,16 +205,52 @@ a Git working tree (including a Git-colocated jj repository).
 - **Overview** and **Files** are two views inside Changes; Files remains the default.
   Overview reuses AI group titles/reasons as suggested purpose and behavior explanations,
   with exact file links and a suggested review order. **Review [purpose]** opens the
-  first unreviewed file in that group and makes **Next unreviewed** follow group order.
+  first unreviewed file in that group, focuses the file picker on that group, and makes
+  **Next unreviewed** follow the same file order within it. Use **Review group** to
+  switch groups or **Show all files** to return to the complete list. Regrouping
+  falls back to all files if the focused group's membership changes.
   Filename-based risk prompts and changed test files are navigation aids, not a security
   assessment or proof of coverage. Test execution results are not available here.
   Opening Overview never calls a model, changes the draft, or marks files reviewed.
+- **Explain this group** explicitly requests one isolated AI explanation using the AI review
+  model selected in Settings. Observations, inferred intent, and possible risks link to
+  validated, supplied diff rows; these links establish evidence membership, not correctness.
+  No test execution or coverage analysis is added. Explanations include up to eight eligible
+  files, each limited to 6 KiB / 120 complete diff rows, and disclose omitted context.
+  The configured per-run request-data limit also caps each explanation; each click is a
+  separate run, not part of a shared spending allowance. Up to four exact evidence/model-keyed
+  results are cached in memory. Refresh hides old explanations; reopening unchanged evidence
+  can reuse the cache. Citation navigation rejects changed fingerprints rather than jumping
+  to unrelated code. Captures remain best-effort, not atomic.
+- **Needs review only** filters out verified, unchanged review marks. Marking a file Reviewed
+  keeps a bounded in-memory baseline (up to 64 patches / 1 MiB). Later edits lose the mark
+  and show new or modified rows, with replaced or removed baseline rows available separately.
+  Matching leading and trailing rows are excluded; the middle is conservatively highlighted,
+  not a semantic diff. Missing or evicted baselines are disclosed. Scope changes reset marks;
+  reload discards them. After refresh, unloaded files remain pending until their patch
+  fingerprint is checked—even if the whole-snapshot identity repeats, because metadata
+  and patch captures are not atomic.
+- Selected diff lines offer **Explain this**, **What could break?**, **Check edge cases**,
+  and **Compare with existing code**. Each action adds a focused question and the selected
+  excerpt to the existing unsent chat draft. Nothing is sent automatically.
+- **Ask about this change** provides visible shortcuts for explanations, regressions,
+  edge cases, security, simplification, and comparing patterns. They use selected
+  lines when present, otherwise the current file. A **skill** badge means a matching
+  review skill is advertised by this conversation; its `/skill:name` command is
+  placed before the preserved draft. Without a match, the shortcut uses a plain
+  review question. Pending chat quotes are preserved and use plain questions, since
+  quoted text precedes the draft when sent. Existing leading slash commands are kept,
+  never replaced or nested. These prompts request review-only work; they do not restrict
+  the chat agent's tools. Quotes, context and commands count toward the 32 KiB message limit.
 - **Group with AI** is optional; folder grouping remains the default. Clicking it
   sends the displayed file names and bounded diff snippets to the conversation’s
   current Pi provider/model by default. Open **Settings → AI review** from the
   Settings button at the bottom of the sidebar to choose a separate grouping model and run limits without
-  changing chat. These preferences belong to the selected conversation and last until
-  reload. **Settings → Appearance** saves your color scheme in this browser. Provider charges may apply. It uses a separate,
+  changing chat. AI review preferences are shared across this server’s workspaces,
+  conversations, and devices, and saved in the private registry’s `grouping-settings.json`.
+  Updates apply immediately to connected clients and new runs without a restart;
+  active runs keep their starting settings. Concurrent edits use last-write-wins.
+  **Settings → Appearance** saves your color scheme in this browser. Provider charges may apply. It uses a separate,
   ephemeral session with tools, extensions and MCP disabled; it does not send a
   message in your conversation or change its draft. The conversation must be open
   and idle with an available model; extension-only or project-only model configurations

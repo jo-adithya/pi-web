@@ -226,7 +226,31 @@ export type CatalogItem = { workspaceId: string, sessionId: string, title: strin
 
 export type WorkspaceItem = { workspaceId: string, name: string, path: string, };
 
-export type WorkspaceAction = { "type": "list" } | { "type": "create" } | { "type": "create_in", workspaceId: string, } | { "type": "add_workspace", path: string, confirmed: boolean, } | { "type": "select_workspace", workspaceId: string, } | { "type": "delete_workspace", workspaceId: string, 
+/**
+ * Provider and model identifiers for grouping requests.
+ */
+
+export type GroupModel = { provider: string, id: string, };
+
+/**
+ * Global defaults captured by clients when starting a grouping job.
+ */
+
+export type GroupingSettings = { 
+/**
+ * Null selects the client's current conversation model.
+ */
+model: GroupModel | null, 
+/**
+ * Maximum calls per job, inclusive range 1..100.
+ */
+maxCalls: number, 
+/**
+ * Maximum request bytes per job, inclusive range 1024..16777216.
+ */
+maxRequestBytes: number, includeGenerated: boolean, };
+
+export type WorkspaceAction = { "type": "list" } | { "type": "set_grouping_settings", settings: GroupingSettings, } | { "type": "create" } | { "type": "create_in", workspaceId: string, } | { "type": "add_workspace", path: string, confirmed: boolean, } | { "type": "select_workspace", workspaceId: string, } | { "type": "delete_workspace", workspaceId: string, 
 /**
  * Approved conversation IDs mapped to runtime epochs, or null for stopped conversations.
  */
@@ -246,5 +270,5 @@ target: string | null,
 /**
  * Current workspace selection; periodic snapshots may change this independently.
  */
-selected: string, sessions: Array<CatalogItem>, workspaces: Array<WorkspaceItem>, selectedWorkspace: string, };
+selected: string, sessions: Array<CatalogItem>, workspaces: Array<WorkspaceItem>, selectedWorkspace: string, groupingSettings: GroupingSettings, };
 

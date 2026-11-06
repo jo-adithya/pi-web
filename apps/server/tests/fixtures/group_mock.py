@@ -48,12 +48,21 @@ for line in sys.stdin:
             text = json.dumps({"readDiffs": [{"path": files[-1]["id"], "startLine": 1}]})
         if mode == "global":
             text = json.dumps({"groups": [{"title": "Feature", "reason": "Related across manifest", "paths": [files[0]["id"], files[-1]["id"]]}]})
+        if mode.startswith("explain"):
+            citation = {"path": files[0]["id"], "startLine": 2, "endLine": 3}
+            if mode == "explain-unknown":
+                citation["path"] = "9999"
+            if mode == "explain-outside":
+                citation["endLine"] = 4
+            if mode == "explain-malformed":
+                citation["startLine"] = "2"
+            text = json.dumps({"explanation": {"observations": [{"text": "Adds captured lines", "citations": [citation]}], "inferences": [], "risks": [], "limitations": ["Only supplied context; no tests run"]}})
         if mode == "invalid-json":
             text = "Here are the groups: " + text
         message = {"role": "assistant", "stopReason": "error" if mode == "error" else "stop", "content": [{"type": "text", "text": text}]}
-        if mode.startswith("usage"):
+        if mode.startswith("usage") or mode == "explain-usage":
             message["usage"] = {"input": 120, "output": 30, "cacheRead": 40, "cacheWrite": 5, "totalTokens": 195}
-            if mode == "usage":
+            if mode in ("usage", "explain-usage"):
                 message["usage"]["cost"] = {"input": 0.01, "output": 0.002, "cacheRead": 0, "cacheWrite": 0, "total": 0.012}
             if mode == "usage-invalid-cost":
                 message["usage"]["cost"] = {"total": -1}

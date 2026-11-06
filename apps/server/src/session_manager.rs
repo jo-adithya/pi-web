@@ -18,6 +18,8 @@ use std::{
 };
 use tokio::sync::{Mutex, watch};
 
+mod grouping_settings;
+
 pub const MAX_ACTIVE: usize = 4;
 const CACHE_BYTES: usize = 512 * 1024;
 #[derive(Clone)]
@@ -26,6 +28,7 @@ struct Inner {
     config: Config,
     push: Option<crate::push::PushService>,
     registry_store: MetadataStore,
+    grouping_changed: watch::Sender<()>,
     owners: Ownership,
     state: Mutex<State>,
 }
@@ -43,6 +46,7 @@ struct Project {
     catalog: Catalog,
 }
 struct State {
+    grouping_settings: GroupingSettings,
     registry: Registry,
     projects: BTreeMap<String, Project>,
     active: BTreeMap<String, Active>,
@@ -62,6 +66,7 @@ impl SessionManager {
         push: Option<crate::push::PushService>,
     ) -> io::Result<Self> {
         let registry_store = MetadataStore::open(&config.registry_dir)?;
+        let grouping_settings = GroupingSettings::load(&registry_store)?;
         let mut registry = Registry::load(&registry_store)?;
         if config.explicit_cwd || registry.entries.is_empty() {
             let cwd = canonical_folder(&config.cwd)?;
@@ -124,8 +129,10 @@ impl SessionManager {
             config,
             push,
             registry_store,
+            grouping_changed: watch::channel(()).0,
             owners,
             state: Mutex::new(State {
+                grouping_settings,
                 registry,
                 projects,
                 active,
@@ -304,6 +311,11 @@ impl SessionManager {
             .find(|project| project.catalog.entries.iter().any(|entry| entry.id == id))
             .map(|project| project.config.cwd.clone())
     }
+    /// Subscribes to successfully persisted global settings changes.
+    /// Subscribe before taking a snapshot to avoid missing an intervening update.
+    pub fn grouping_changes(&self) -> watch::Receiver<()> {
+        self.0.grouping_changed.subscribe()
+    }
     pub async fn snapshot(&self) -> WorkspaceReply {
         let state = self.0.state.lock().await;
         Self::reply(&state, None, true, "catalog")
@@ -311,6 +323,7 @@ impl SessionManager {
     fn reply(state: &State, request_id: Option<String>, ok: bool, code: &str) -> WorkspaceReply {
         WorkspaceReply {
             v: 2,
+            grouping_settings: state.grouping_settings.clone(),
             request_id,
             ok,
             code: code.into(),
@@ -362,6 +375,7 @@ impl SessionManager {
                 .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
             && match &command.action {
                 WorkspaceAction::List | WorkspaceAction::Create => true,
+                WorkspaceAction::SetGroupingSettings { settings } => settings.valid(),
                 WorkspaceAction::CreateIn { workspace_id }
                 | WorkspaceAction::SelectWorkspace { workspace_id } => valid_id(workspace_id),
                 WorkspaceAction::DeleteWorkspace { workspace_id, expected_sessions, .. } => {
@@ -426,6 +440,7 @@ impl SessionManager {
                     sessions: vec![],
                     workspaces: vec![],
                     selected_workspace: String::new(),
+                    grouping_settings: self.snapshot().await.grouping_settings,
                 };
             }
         }
@@ -475,11 +490,28 @@ impl SessionManager {
         // Serialize mutations until removal commits to prevent new runtimes or selection races.
         if state.removing_workspace && !matches!(command.action,
             WorkspaceAction::List | WorkspaceAction::Subscribe { .. } | WorkspaceAction::Unsubscribe { .. }
+                | WorkspaceAction::SetGroupingSettings { .. }
         ) {
             return Self::reply(&state, id, false, "workspace_busy");
         }
         match &command.action {
             WorkspaceAction::List => Self::reply(&state, id, true, "catalog"),
+            WorkspaceAction::SetGroupingSettings { settings } => {
+                if settings.save(&self.0.registry_store).is_err() {
+                    // A directory flush can fail after replacement; keep live values aligned
+                    // with the record that a restart would load, without claiming durability.
+                    if let Ok(saved) = GroupingSettings::load(&self.0.registry_store) {
+                        if saved != state.grouping_settings {
+                            state.grouping_settings = saved;
+                            self.0.grouping_changed.send_replace(());
+                        }
+                    }
+                    return Self::reply(&state, id, false, "grouping_settings_write_failed");
+                }
+                state.grouping_settings = settings.clone();
+                self.0.grouping_changed.send_replace(());
+                Self::reply(&state, id, true, "grouping_settings_updated")
+            },
             WorkspaceAction::DeleteWorkspace { workspace_id, expected_sessions, confirmed } => {
                 if !confirmed {
                     return Self::reply(&state, id, false, "confirmation_required");

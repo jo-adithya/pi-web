@@ -14,7 +14,8 @@ import { decodeWorkspace } from "./workspace-state";
 import { createSessionModel, type SessionModel } from "./session-model";
 import { SessionView } from "./SessionView";
 import { LocalReview } from "./LocalReview";
-import { SettingsPage } from "./SettingsPage";
+import { SettingsPage, type GroupingPreferences } from "./SettingsPage";
+import type { GroupOptions } from "./review-costs";
 import { createCompletionNotifications } from "./notifications";
 import { createPhonePush } from "./phone-push";
 import { listenForSidebarSwipes, type SidebarDrag } from "./sidebar-swipe";
@@ -52,6 +53,18 @@ export default function App() {
   const [loginLink, setLoginLink] = createSignal("");
   const [reloadConfirmation, setReloadConfirmation] = createSignal<{ returnFocus: Element | null } | null>(null);
   const [notice, setNotice] = createSignal(""); const [managementPending, setManagementPending] = createSignal(0);
+  const [groupingSettings, setGroupingSettings] = createSignal<GroupOptions>();
+  const [groupingSave, setGroupingSave] = createSignal<string>();
+  const [groupingError, setGroupingError] = createSignal("");
+  const groupingPreferences: GroupingPreferences = {
+    options: () => groupingSettings()!,
+    disabled: () => connection() !== "Connected" || !!groupingSave(),
+    status: () => groupingError() || (connection() !== "Connected" ? "Reconnect to update settings." : groupingSave() ? "Saving settings…" : "Saved on this server. AI runs only when you ask it to group files in Changes."),
+    setOptions: next => {
+      const id = command({ type: "set_grouping_settings", settings: { ...next, model: next.model ?? null } });
+      if (id) { setGroupingError(""); setGroupingSave(id); }
+    },
+  };
   const models = new Map<string, SessionModel>(); const subscriptions = new Set<string>(); const blocked = new Set<string>();
   const pending = new Map<string, WorkspaceAction>(); let selectionRequest: string | undefined;
   let capability: string | null = null;
@@ -60,7 +73,11 @@ export default function App() {
   const transport = (message: BrowserMessage) => { if (socket?.readyState !== WebSocket.OPEN) return false; socket.send(JSON.stringify(message)); return true; };
   function modelFor(id: string) {
     let model = models.get(id);
-    if (!model) { model = createSessionModel(id, transport, () => connection() === "Connected", notifications.completed, () => capability); models.set(id, model); }
+    if (!model) {
+      model = createSessionModel(id, transport, () => connection() === "Connected", notifications.completed, () => capability);
+      if (groupingSettings()) model.review.grouping.setOptions(groupingSettings()!);
+      models.set(id, model);
+    }
     return model;
   }
   const entry = createMemo(() => catalog().find(item => item.sessionId === selected()));
@@ -90,8 +107,10 @@ export default function App() {
     if (command({ type: "subscribe", sessionId: id })) subscriptions.add(id);
   }
   function disconnectModels() {
+    if (groupingSave()) setGroupingError("Connection lost while saving. Reconnect to check the server’s current settings.");
+    setGroupingSave(undefined);
     for (const model of models.values()) model.disconnected();
-    if ([...pending.values()].some(action => ["create", "create_in", "add_workspace", "select_workspace", "open", "stop", "delete", "delete_workspace", "rename"].includes(action.type))) setNotice("A workspace operation may have completed. Inspect the catalog before retrying; nothing was replayed.");
+    if ([...pending.values()].some(action => ["create", "create_in", "add_workspace", "select_workspace", "open", "stop", "delete", "delete_workspace", "rename", "set_grouping_settings"].includes(action.type))) setNotice("A workspace operation may have completed. Inspect the catalog before retrying; nothing was replayed.");
     pending.clear(); setManagementPending(0); subscriptions.clear(); blocked.clear(); selectionRequest = undefined;
   }
   function connect() {
@@ -115,6 +134,13 @@ export default function App() {
           for (const item of reply.sessions) {
             const model = modelFor(item.sessionId);
             if (item.lifecycle === "stopped") { model.stopped(); subscriptions.delete(item.sessionId); blocked.delete(item.sessionId); }
+          }
+          const preferences: GroupOptions = { ...reply.groupingSettings, model: reply.groupingSettings.model ?? undefined };
+          setGroupingSettings(preferences);
+          for (const model of models.values()) model.review.grouping.setOptions(preferences);
+          if (reply.requestId === groupingSave()) {
+            setGroupingSave(undefined);
+            setGroupingError(reply.ok ? "" : "Settings could not be saved reliably. Shown values reflect the server’s current settings; check before retrying.");
           }
           setWorkspaces(reply.workspaces);
           setCatalog(reply.sessions);
@@ -302,7 +328,7 @@ export default function App() {
         <DismissibleAlert class="workspace-notice" message={notice()} />
         <DismissibleAlert class="workspace-notice" message={phonePush.message()} />
         <DismissibleAlert class="workspace-notice" message={notifications.message()} />
-        <Show when={view() === "settings" && !loginOpen()}><SettingsPage model={current()} conversation={entry()?.title ?? ""} theme={theme.preference()} setTheme={theme.setPreference} /></Show>
+        <Show when={view() === "settings" && !loginOpen()}><SettingsPage model={current()} grouping={groupingSettings() ? groupingPreferences : undefined} theme={theme.preference()} setTheme={theme.setPreference} /></Show>
         <div style={{ display: view() === "settings" ? "none" : "contents" }}>
         <Show when={(view() !== "settings" || settingsReview() === current()?.id) && connection() !== "Authentication required" && !loginOpen()}><Show when={current()} keyed>{model => <Show when={view() === "conversation"} fallback={<LocalReview model={model} conversation={() => setView("conversation")} />}><Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
           <Show when={entry()?.lifecycle === "stopped"}><Button disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => command({ type: "open", sessionId: model.id })}>Reopen conversation</Button></Show>
@@ -311,17 +337,17 @@ export default function App() {
         <Show when={(view() !== "settings" && connection() === "Authentication required") || loginOpen()}>
           <section class="empty workspace-empty">
             <span class="empty-mark">π</span><h2>Connect to Pi Web</h2>
-            <p>Paste this server’s current terminal link to sign in. Your login stays in this window.</p>
+            <p>Paste this server’s login link, #cap=… fragment, or token to sign in. Your login stays in this window.</p>
             <TextField as="form" class="login-form" required value={loginLink()} onChange={value => { setLoginLink(value); flush(); }} onSubmit={event => {
               event.preventDefault();
               const input = event.currentTarget.elements.namedItem("login-link") as HTMLInputElement;
               const candidate = capabilityFromLink(input.value); input.value = ""; setLoginLink("");
-              if (!candidate) { setNotice("Paste the complete login link for this server, including #cap=…."); return; }
+              if (!candidate) { setNotice("Paste this server’s login link, #cap=… fragment, or 64-character token."); return; }
               void authenticate(candidate);
             }}>
               <TextField.Label>Terminal login link</TextField.Label>
               <TextField.Input name="login-link" type="password" autocomplete="off" autocapitalize="off" spellcheck={false} />
-              <TextField.Description as="p">Treat this link like a password. It grants access to your coding agent.</TextField.Description>
+              <TextField.Description as="p">Accepts the full link, #cap=… fragment, or token alone. Keep it private like a password—it grants access to your coding agent.</TextField.Description>
               <div class="dialog-actions">
                 <Show when={loginOpen()}><Button type="button" onClick={() => { setLoginLink(""); setLoginOpen(false); }}>Cancel</Button></Show>
                 <Button type="submit">Connect</Button>

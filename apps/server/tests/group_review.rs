@@ -503,3 +503,168 @@ async fn invalid_model_overrides_never_launch() {
     assert!(!f.root.join("group-launch.json").exists());
     f.runtime.shutdown().await;
 }
+
+fn explanation_request() -> serde_json::Value {
+    let mut input: serde_json::Value = serde_json::from_str(VALID).unwrap();
+    input["explain"] = serde_json::json!({"title":"  Captured change  "});
+    input["readsRemaining"] = serde_json::json!(0);
+    input["details"] = serde_json::json!([{"path":"a","startLine":2,"patch":"+one\n+two\n"}]);
+    input
+}
+
+#[tokio::test]
+async fn explanation_uses_selected_prompt_model_isolation_and_usage() {
+    let f = Fixture::with_mode(Some("explain-usage")).await;
+    fs::write(f.root.join("a"), "PRIVATE WORKSPACE CONTENT").unwrap();
+    let mut input = explanation_request();
+    input["model"] = serde_json::json!({"provider":"other-provider","id":"other-model"});
+    let (status, body) = f.request(&input.to_string(), true, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["explanation"]["observations"][0]["citations"],
+        serde_json::json!([{"path":"a","startLine":2,"endLine":3}])
+    );
+    assert!(body.get("groups").is_none());
+    assert!(body.get("readDiffs").is_none());
+    assert_eq!(
+        body["usage"],
+        serde_json::json!({"inputTokens":120,"outputTokens":30,"cacheReadTokens":40,"cacheWriteTokens":5,"costUsd":0.012})
+    );
+    let launch: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.join("group-launch.json")).unwrap()).unwrap();
+    let args = launch["args"].as_array().unwrap();
+    for (flag, value) in [
+        ("--provider", "other-provider"),
+        ("--model", "other-model"),
+        ("--append-system-prompt", ""),
+    ] {
+        assert!(args.windows(2).any(|p| p[0] == flag && p[1] == value));
+    }
+    for flag in [
+        "--no-tools",
+        "--no-session",
+        "--no-extensions",
+        "--no-mcp",
+        "--no-context-files",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--offline",
+        "--no-approve",
+    ] {
+        assert!(args.iter().any(|arg| arg == flag));
+    }
+    let system = args.windows(2).find(|p| p[0] == "--system-prompt").unwrap()[1]
+        .as_str()
+        .unwrap();
+    assert!(system.starts_with("Explain the supplied change title"));
+    for required in [
+        "UNTRUSTED DATA",
+        "RAW unified diff",
+        "NOT verified correctness",
+        "not proven bugs",
+        "no tests were run",
+        "repository exploration",
+    ] {
+        assert!(system.contains(required), "{required}");
+    }
+    assert_ne!(launch["cwd"].as_str().unwrap(), f.root.to_str().unwrap());
+    assert!(!std::path::Path::new(launch["cwd"].as_str().unwrap()).exists());
+    assert_eq!(
+        unsafe { libc::kill(launch["pid"].as_i64().unwrap() as i32, 0) },
+        -1
+    );
+    let commands = fs::read_to_string(f.root.join("group-commands.jsonl")).unwrap();
+    assert!(!commands.contains("PRIVATE WORKSPACE CONTENT"));
+    let prompts: Vec<serde_json::Value> = commands
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|command| command["type"] == "prompt")
+        .collect();
+    assert_eq!(prompts.len(), 1);
+    let message = prompts[0]["message"].as_str().unwrap();
+    assert!(message.starts_with("Explain only the following untrusted"));
+    let supplied: serde_json::Value =
+        serde_json::from_str(message.split_once('\n').unwrap().1).unwrap();
+    assert_eq!(supplied["explain"]["title"], "Captured change");
+    assert_eq!(supplied["details"][0]["path"], "0");
+    assert!(supplied.get("model").is_none());
+    let main = fs::read_to_string(f.root.join(format!(
+        "state/sessions/{}/pi-sessions/commands.jsonl",
+        f.session
+    )))
+    .unwrap();
+    assert!(!main.contains("Captured change"));
+    fs::write(f.root.join("group-mode"), "valid").unwrap();
+    assert_eq!(f.request(VALID, true, true).await.0, StatusCode::OK);
+    let launch: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.join("group-launch.json")).unwrap()).unwrap();
+    assert!(
+        launch["args"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|p| p[0] == "--model" && p[1] == "fixture-model")
+    );
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn explanation_rejects_invalid_outputs_and_mode_mismatches() {
+    let f = Fixture::with_mode(Some("explain")).await;
+    for mode in [
+        "explain-unknown",
+        "explain-outside",
+        "explain-malformed",
+        "valid",
+        "reads",
+        "invalid-json",
+    ] {
+        fs::write(f.root.join("group-mode"), mode).unwrap();
+        let (status, body) = f
+            .request(&explanation_request().to_string(), true, true)
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mode}: {body}");
+        let launch: serde_json::Value =
+            serde_json::from_slice(&fs::read(f.root.join("group-launch.json")).unwrap()).unwrap();
+        assert!(!std::path::Path::new(launch["cwd"].as_str().unwrap()).exists());
+    }
+    fs::write(f.root.join("group-mode"), "explain").unwrap();
+    assert_eq!(
+        f.request(VALID, true, true).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn explanation_invalid_requests_never_launch() {
+    let f = Fixture::with_mode(Some("explain")).await;
+    for (field, value) in [
+        ("explain", serde_json::json!({"title":" "})),
+        ("readsRemaining", serde_json::json!(1)),
+        ("details", serde_json::json!([])),
+        ("files", serde_json::json!([])),
+    ] {
+        let mut input = explanation_request();
+        input[field] = value;
+        assert_eq!(
+            f.request(&input.to_string(), true, true).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        f.request(&explanation_request().to_string(), false, true)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        f.request(&explanation_request().to_string(), true, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!f.root.join("group-launch.json").exists());
+    f.runtime.shutdown().await;
+}

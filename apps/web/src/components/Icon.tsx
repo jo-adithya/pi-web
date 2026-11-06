@@ -10,6 +10,7 @@ const paths = {
   reply: "m9 14-5-5 5-5M4 9h10a6 6 0 0 1 6 6v5",
   chevronDown: "m6 9 6 6 6-6",
   next: "m5 5 7 7-7 7m7-14 7 7-7 7",
+  refresh: "M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.5-2L20 8M4 16l2.4 3A7 7 0 0 0 17.9 17",
   code: "m8 5-6 7 6 7m8-14 6 7-6 7",
   structure: "M9 3h6v5H9ZM3 16h6v5H3Zm12 0h6v5h-6ZM12 8v4M6 16v-4h12v4",
   stop: "M6 6h12v12H6Z",

@@ -10,7 +10,7 @@ export interface IntentGroup { title: string; reason: string; paths: string[] }
 interface FileOverview { path: string; status: string; patch: string | null; added: number; removed: number; patchLines: number | null; sampled: boolean }
 interface DiffRead { path: string; startLine: number }
 interface DiffDetail extends DiffRead { patch: string }
-export interface GroupRequest { files: FileOverview[]; details: DiffDetail[]; readsRemaining: number; model?: GroupModel }
+export interface GroupRequest { files: FileOverview[]; details: DiffDetail[]; readsRemaining: number; model?: GroupModel; explain?: { title: string } }
 export interface GroupRun { cacheKey?: string; force?: boolean; model?: GroupModel; verify?: (signal: AbortSignal) => Promise<boolean> }
 export interface GroupCoverage { files: number; sampled: number; unavailable: number; metadata: number; reads: number; bytes: number }
 const overviewLimit = 24 * 1024, contextLimit = 48 * 1024;
@@ -124,8 +124,10 @@ export function createReviewGroups(load: GroupLoader, cacheNamespace?: string) {
   const [options, updateOptions] = createSignal<GroupOptions>({ maxCalls: 6, maxRequestBytes: 512 * 1024, includeGenerated: false });
   const [usage, setUsage] = createSignal(emptyUsage());
   const [stale, setStale] = createSignal(false);
+  /** Updates future runs; an active run retains its captured settings. */
   function setOptions(next: GroupOptions) {
-    if (busy()) return;
+    const previous = options();
+    if (previous.maxCalls === next.maxCalls && previous.maxRequestBytes === next.maxRequestBytes && previous.includeGenerated === next.includeGenerated && previous.model?.provider === next.model?.provider && previous.model?.id === next.model?.id) return;
     updateOptions(next);
     if (value()) { setStale(true); setNotice("Grouping settings changed. Update groups when ready; no AI call has been made."); }
   }
@@ -168,7 +170,8 @@ export function createReviewGroups(load: GroupLoader, cacheNamespace?: string) {
     }
   }
   async function run(prepare: GroupPreparation, read?: GroupReader, reuse: GroupRun = {}) {
-    const settings = { ...options(), model: reuse.model ?? options().model };
+    const configured = options();
+    const settings = { ...configured, model: reuse.model ?? configured.model };
     reset(); setUsage(emptyUsage()); const current = new AbortController(); active = current; setBusy(true); setProgress("Preparing file overview…");
     let timer = setTimeout(() => current.abort(), 90000), calls = 0, reconciled = false;
     const totals: GroupCoverage = { files: 0, sampled: 0, unavailable: 0, metadata: 0, reads: 0, bytes: 0 };
@@ -305,7 +308,13 @@ export function createReviewGroups(load: GroupLoader, cacheNamespace?: string) {
       setNotice(`${totals.files} files · ${totals.metadata} metadata-only · ${totals.sampled} sampled · ${totals.unavailable} without diff · ${totals.reads} requested excerpts.${reconciled ? " Globally reconciled from bounded summaries; summary context is limited." : ""} Best-effort mutable snapshot. Suggestions, not a correctness review.`);
     } catch (reason) {
       if (active === current) setError(current.signal.aborted ? "AI grouping timed out. Try again." : reason instanceof Error ? reason.message : "AI grouping failed.");
-    } finally { clearTimeout(timer); if (active === current) { active = undefined; setBusy(false); setProgress(""); } }
+    } finally {
+      clearTimeout(timer);
+      if (active === current) {
+        if (options() !== configured) { setStale(true); setNotice("Global grouping settings changed during this run. This run used its starting settings; update groups to use the new settings."); }
+        active = undefined; setBusy(false); setProgress("");
+      }
+    }
   }
 
   return { value, mode, setMode, busy, error, notice, progress, coverage, details, options, setOptions, usage, stale, reconcile, run, cancel, reset, observe };

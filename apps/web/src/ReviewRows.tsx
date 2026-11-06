@@ -5,9 +5,10 @@ const PAGE_SIZE = 500;
 
 /** Bounds mounted diff rows without introducing a nested scroller or estimated row heights.
  * Pagination is explicit so wrapped lines and keyboard navigation retain natural document flow.
+ * A new focus token opens its row's page; subsequent manual paging remains available.
  */
-export function ReviewRows<T>(props: { rows: T[]; identity: string; jump: () => void; weight?: (row: T) => number; children: (row: T) => Element }) {
-  const [selection, setSelection] = createSignal({ identity: "", page: 0 });
+export function ReviewRows<T>(props: { rows: T[]; identity: string; jump: () => void; weight?: (row: T) => number; focus?: { index: number; token: object }; children: (row: T) => Element }) {
+  const [selection, setSelection] = createSignal<{ identity: string; page: number; focus?: object }>({ identity: "", page: 0 });
   const ranges = createMemo(() => {
     const result: { start: number; end: number }[] = [];
     let start = 0, weight = 0;
@@ -21,10 +22,14 @@ export function ReviewRows<T>(props: { rows: T[]; identity: string; jump: () => 
     result.push({ start, end: props.rows.length }); return result;
   });
   const pages = () => ranges().length;
-  const page = () => selection().identity === props.identity ? Math.min(selection().page, pages() - 1) : 0;
+  const page = () => {
+    const focus = props.focus;
+    if (focus && focus.token !== selection().focus) return Math.max(0, ranges().findIndex(range => focus.index >= range.start && focus.index < range.end));
+    return selection().identity === props.identity ? Math.min(selection().page, pages() - 1) : 0;
+  };
   const range = () => ranges()[page()];
   const visible = createMemo(() => props.rows.slice(range().start, range().end));
-  const move = (delta: number) => { setSelection({ identity: props.identity, page: page() + delta }); props.jump(); };
+  const move = (delta: number) => { setSelection({ identity: props.identity, page: page() + delta, focus: props.focus?.token }); props.jump(); };
   const controls = () => <Show when={pages() > 1}><div class="review-pages" role="group" aria-label="Diff pages">
     <Button type="button" disabled={page() === 0} onClick={() => move(-1)}>Previous rows</Button>
     <span>Rows {range().start + 1}–{range().end} of {props.rows.length}</span>

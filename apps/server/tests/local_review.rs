@@ -154,6 +154,13 @@ async fn line_totals_cover_the_scope_without_loading_patches() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["lineStats"], serde_json::json!({"added":2,"removed":1,"unavailableFiles":2}));
     assert!(body["files"].as_array().unwrap().iter().all(|file| file["patch"].is_null()));
+    for file in body["files"].as_array().unwrap() {
+        if file["path"] == "file.txt" {
+            assert_eq!(file["lineStats"], serde_json::json!({"added":2,"removed":1}));
+        } else {
+            assert!(file.get("lineStats").is_none());
+        }
+    }
     let (_, staged) = f.request(r#"{"scope":"staged"}"#, true, true).await;
     assert_eq!(staged["lineStats"], serde_json::json!({"added":0,"removed":0,"unavailableFiles":0}));
     let (_, selected) = f.request(r#"{"scope":"unstaged","path":"file.txt"}"#, true, true).await;
@@ -180,13 +187,18 @@ async fn line_totals_include_renames_large_patches_and_files_beyond_display_limi
     assert!(staged["nextCursor"].is_string());
     let expected = serde_json::json!({"added":40105,"removed":0,"unavailableFiles":0});
     assert_eq!(staged["lineStats"], expected);
+    let (_, next) = f.request(&serde_json::json!({"scope":"staged","cursor":staged["nextCursor"]}).to_string(), true, true).await;
+    let renamed = next["files"].as_array().unwrap().iter().find(|file| file["path"] == "renamed\tfile\n.txt").unwrap();
+    assert_eq!(renamed["lineStats"], serde_json::json!({"added":0,"removed":0}));
     let (_, selected) = f.request(r#"{"scope":"staged","path":"large"}"#, true, true).await;
     assert_eq!(selected["files"][0]["patch"], "Patch exceeds 64 KiB; content omitted.\n");
     f.git(&["commit", "-qm", "changes"]);
     let (_, branch) = f.request(r#"{"scope":"branch","base":"base"}"#, true, true).await;
     assert_eq!(branch["lineStats"], expected);
+    assert_eq!(branch["files"][0]["lineStats"], serde_json::json!({"added":40000,"removed":0}));
     let (_, commit) = f.request(&format!(r#"{{"scope":"commit","commit":"{}"}}"#, f.oid("HEAD")), true, true).await;
     assert_eq!(commit["lineStats"], expected);
+    assert_eq!(commit["files"][0]["lineStats"], serde_json::json!({"added":40000,"removed":0}));
     let (_, root) = f.request(&format!(r#"{{"scope":"commit","commit":"{}"}}"#, f.oid("base")), true, true).await;
     assert_eq!(root["lineStats"], serde_json::json!({"added":2,"removed":0,"unavailableFiles":0}));
     f.runtime.shutdown().await;
@@ -1416,6 +1428,7 @@ async fn thousand_file_review_pages_each_file_once_and_loads_last_patch() {
         assert!(serde_json::to_vec(&body).unwrap().len() <= 1024 * 1024);
         for file in files {
             assert!(file["patch"].is_null());
+            assert_eq!(file["lineStats"], serde_json::json!({"added":1,"removed":0}));
             assert!(paths.insert(file["path"].as_str().unwrap().to_owned()));
         }
         if pages == 0 {
@@ -1478,6 +1491,9 @@ async fn review_cursors_reject_invalid_changed_and_cross_scope_listings() {
         assert_eq!(status, StatusCode::OK, "{second}");
         assert_eq!(second["files"].as_array().unwrap().len(), 2);
         assert!(second.get("nextCursor").is_none());
+        for file in second["files"].as_array().unwrap() {
+            assert_eq!(file["lineStats"], serde_json::json!({"added":1,"removed":0}));
+        }
         if request["scope"] == "branch" {
             // Empty commits preserve name-status output but change the resolved HEAD.
             f.git(&["commit", "--allow-empty", "-qm", "new tip"]);

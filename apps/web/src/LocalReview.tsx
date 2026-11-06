@@ -2,9 +2,15 @@ import { TextField } from "@kobalte/core/text-field";
 import { SelectField } from "./components/SelectField";
 import { ProgressBar } from "./components/ProgressBar";
 import { Button } from "@kobalte/core/button";
+import { DropdownMenu } from "@kobalte/core/dropdown-menu";
+import { Collapsible } from "@kobalte/core/collapsible";
+import { reviewLineKey } from "./review-history";
+import { formatReply } from "./reply-quote";
+import type { EvidenceCitation, ExplanationEvidence } from "./review-explanations";
+import type { ReviewQuestion } from "./local-review";
 import { createEffect, createMemo, createSignal, flush, For, onSettled, Show } from "solid-js";
 import { Checkbox } from "@kobalte/core/checkbox";
-import { hasPatch, reviewDraft, type ReviewScope } from "./local-review";
+import { hasPatch, reviewDraft, reviewScopeDraft, reviewQuestionPresets, reviewQuestionSkill, type ReviewScope } from "./local-review";
 import { ReviewRows } from "./ReviewRows";
 import { ReviewOverview } from "./ReviewOverview";
 import { groupingUsageLabel } from "./review-costs";
@@ -28,8 +34,14 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   const structural = review.structural, context = review.context;
   const [notice, setNotice] = createSignal("");
   const [filter, setFilter] = createSignal("");
+  const [needsReview, setNeedsReview] = createSignal(false);
+  const [groupKey, setGroupKey] = createSignal("");
+  const activeGroup = createMemo(() => review.grouping.mode() === "intent" ? review.grouping.value()?.find(group => JSON.stringify(group.paths) === groupKey()) : undefined);
+  const [evidence, setEvidence] = createSignal<{ path: string; fingerprint: string; keys: Set<string>; headers: Set<string> }>();
   const [filesOpen, setFilesOpen] = createSignal(false);
   const [view, setView] = createSignal<"overview" | "files">("files");
+  const [questionsOpen, setQuestionsOpen] = createSignal(false);
+  const [questionScope, setQuestionScope] = createSignal<"all" | "file" | "selection">("file");
   const [commitQuery, setCommitQuery] = createSignal("");
   const [manualBase, setManualBase] = createSignal(false);
   const branchValue = createMemo(() => manualBase() ? "manual" : review.base());
@@ -87,6 +99,11 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   const selectedLines = createMemo(() => {
     const value = selection();
     return value ? value.lines.slice(Math.min(value.anchor, value.end), Math.max(value.anchor, value.end) + 1).filter(line => line.kind !== "header") : [];
+  });
+  // A new line selection focuses questions on that excerpt; clearing it restores file scope.
+  createEffect(() => selectedLines(), lines => {
+    if (lines.length) setQuestionScope("selection");
+    else if (questionScope() === "selection") setQuestionScope("file");
   });
   const isSelected = (line: HighlightedLine) => {
     const value = selection(), index = lineIndices().get(line)!;
@@ -147,7 +164,19 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   }));
   const fragmented = () => structural.result()?.lines.some(line => line.segments.length > 256);
   const counts = createMemo(() => ({ added: diff().lines.filter(line => line.kind === "add").length, removed: diff().lines.filter(line => line.kind === "remove").length }));
-  const visibleFiles = createMemo(() => (review.snapshot()?.files ?? []).filter(file => file.path.toLowerCase().includes(filter().trim().toLowerCase())));
+  const incremental = createMemo(() => { const selected = loadedFile(); return selected ? review.historyReview.comparison(selected) : undefined; });
+  const evidenceMatches = (row: Row) => {
+    const value = evidence(), selected = loadedFile();
+    return !!value && value.path === selected?.path && value.fingerprint === selected.fingerprint && (row.kind === "line" ? value.keys.has(reviewLineKey(row.line)) : !!row.header && value.headers.has(row.header));
+  };
+  const evidenceFocus = createMemo(() => { const index = diff().rows.findIndex(evidenceMatches), token = evidence(); return index >= 0 && token ? { index, token } : undefined; });
+  // The picker and Next share the group's supplied order, independently of text/review filters.
+  const orderedFiles = createMemo(() => {
+    const files = review.snapshot()?.files ?? [], byPath = new Map(files.map(file => [file.path, file]));
+    const paths = activeGroup()?.paths ?? (review.grouping.mode() === "intent" ? review.grouping.value()?.flatMap(group => group.paths) : undefined);
+    return paths ? paths.flatMap(path => byPath.has(path) ? [byPath.get(path)!] : []) : files;
+  });
+  const visibleFiles = createMemo(() => orderedFiles().filter(file => (!needsReview() || !review.isReviewed(file)) && file.path.toLowerCase().includes(filter().trim().toLowerCase())));
   const groups = createMemo(() => {
     const intents = review.grouping.value();
     if (review.grouping.mode() === "intent" && intents) {
@@ -163,10 +192,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     return [...groups].map(([directory, files]) => ({ title: directory === "." ? "Repository root" : directory, reason: "", files }));
   });
   const nextUnreviewed = createMemo(() => {
-    const snapshot = review.snapshot()?.files ?? [];
-    const byPath = new Map(snapshot.map(file => [file.path, file]));
-    const files = review.grouping.mode() === "intent" && review.grouping.value()
-      ? review.grouping.value()!.flatMap(group => group.paths.flatMap(path => byPath.has(path) ? [byPath.get(path)!] : [])) : snapshot;
+    const files = orderedFiles();
     const index = files.findIndex(file => file.path === review.selected());
     return [...files.slice(index + 1), ...files.slice(0, index)].find(file => !review.isReviewed(file));
   });
@@ -185,7 +211,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     if (scope === "branch" && !review.branches.value()) void review.branches.refresh();
   }
   function changeScope(scope: ReviewScope) {
-    setNotice(""); setFilter(""); review.setScope(scope); loadScope(scope);
+    setNotice(""); setFilter(""); setGroupKey(""); setEvidence(undefined); review.setScope(scope); loadScope(scope);
   }
   function selectBase(value: string) {
     setManualBase(value === "manual");
@@ -196,6 +222,13 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     const list = await review.history.refresh();
     if (review.scope() === "commit" && !review.commit() && list?.commits[0]) selectCommit(list.commits[0].id);
   }
+  /** Focus a group's picker and navigation on its first remaining file; clear conflicting filters. */
+  function startGroup(paths: string[]) {
+    review.grouping.setMode("intent"); setGroupKey(JSON.stringify(paths)); setFilter(""); setNeedsReview(false);
+    const unreviewed = new Set((review.snapshot()?.files ?? []).filter(file => !review.isReviewed(file)).map(file => file.path));
+    const first = paths.find(path => unreviewed.has(path)) ?? paths[0];
+    if (first) select(first);
+  }
   /** Jump after layout settles; the document's CSS respects reduced motion. */
   function jumpTo(target: () => HTMLElement | undefined) {
     if (jumpFrame !== undefined) cancelAnimationFrame(jumpFrame);
@@ -205,19 +238,37 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     });
   }
   function select(path: string) {
-    setView("files"); review.setSelected(path); setNotice(""); setFilesOpen(false); jumpTo(() => detail);
+    setEvidence(undefined); setView("files"); review.setSelected(path); setNotice(""); setFilesOpen(false); jumpTo(() => detail);
+  }
+  /** Verify the captured fingerprint before navigating to supplied evidence, including paginated rows. */
+  async function openEvidence(citation: EvidenceCitation, captured: ExplanationEvidence) {
+    if (review.busy()) return;
+    setEvidence(undefined); setGroupKey(""); setFilter(""); setNeedsReview(false); setView("files"); setFilesOpen(false); setNotice(""); structural.reset();
+    await review.setSelected(citation.path);
+    const selected = loadedFile();
+    if (!selected || selected.path !== citation.path || selected.fingerprint !== captured.fingerprint) { setNotice("This evidence no longer matches the loaded diff. Refresh and explain the group again."); return; }
+    const rows = captured.rows.slice(citation.startLine - 1, citation.endLine);
+    setEvidence({ path: citation.path, fingerprint: captured.fingerprint, keys: new Set(rows.map(reviewLineKey)), headers: new Set(rows.filter(row => row.kind === "header").map(row => row.text)) });
+    jumpTo(() => detail?.querySelector<HTMLElement>("[data-review-evidence]") ?? detail);
   }
   /** Shared searchable file list for the desktop sidebar and mobile modal. */
   function FilePicker() {
     return <nav id={`review-files-${props.model.id}`} class="review-files" tabindex={-1} aria-label="Changed files">
+            <Show when={review.grouping.mode() === "intent" && review.grouping.value()}>
+              <SelectField class="review-group-picker" label="Review group" visibleLabel value={activeGroup() ? String(review.grouping.value()!.indexOf(activeGroup()!)) : ""} options={[{ value: "", label: "All groups" }, ...(review.grouping.value() ?? []).map((group, index) => ({ value: String(index), label: `${group.title} (${group.paths.length})` }))]} change={key => { const group = key === "" ? undefined : review.grouping.value()?.[Number(key)]; if (group) startGroup(group.paths); else setGroupKey(""); }} />
+              <Show when={activeGroup()}><Button type="button" onClick={() => { setGroupKey(""); setFilter(""); setNeedsReview(false); }}>Show all files</Button></Show>
+            </Show>
             <div class="review-filter"><TextField value={filter()} onChange={value => { setFilter(value); flush(); }}><TextField.Input type="search" aria-label="Filter files" placeholder="Filter files…" /></TextField><Show when={filter()}><Button type="button" onClick={() => setFilter("")} aria-label="Clear filter">×</Button></Show></div>
+            <Checkbox class="review-needs-filter" checked={needsReview()} onChange={setNeedsReview}><Checkbox.Input /><Checkbox.Control class="checkbox-control"><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control><Checkbox.Label>Needs review only</Checkbox.Label></Checkbox>
+            <Show when={needsReview()}><p class="review-group-status">Unloaded files stay visible until their fingerprints are checked.</p></Show>
             <Show when={visibleFiles().length} fallback={<p class="review-filter-empty">No files match your filter.</p>}>
               <For each={groups()}>{group => <section>
                 <div class="review-group-heading"><h3>{group.title}</h3><span title="Reviewed / visible files in this group">{group.files.filter(review.isReviewed).length}/{group.files.length}</span></div>
                 <Show when={group.reason}><p class="review-group-reason">{group.reason}</p></Show>
-                <For each={group.files}>{item => <Button type="button" aria-label={`${item.path} — ${item.status}${review.isReviewed(item) ? " — reviewed" : ""}`} aria-pressed={review.selected() === item.path ? "true" : "false"} onClick={() => select(item.path)} title={item.path}>
+                <For each={group.files}>{item => <Button type="button" aria-label={`${item.path} — ${item.status}${item.lineStats ? ` — ${item.lineStats.added} added, ${item.lineStats.removed} deleted` : ""}${review.isReviewed(item) ? " — reviewed" : ""}`} aria-pressed={review.selected() === item.path ? "true" : "false"} onClick={() => select(item.path)} title={item.path}>
                   <span class={`review-file-status status-${item.status}`} aria-hidden="true">{review.isReviewed(item) ? "✓" : item.status === "untracked" ? "?" : item.status[0].toUpperCase()}</span>
                   <span class="review-file-name">{review.grouping.mode() === "intent" ? item.path : item.path.slice(item.path.lastIndexOf("/") + 1)}</span>
+                  <Show when={item.lineStats}>{stats => <span class="review-file-counts" aria-hidden="true"><span class="review-added">+{stats().added}</span><span class="review-removed">−{stats().removed}</span></span>}</Show>
                 </Button>}</For>
               </section>}</For>
             </Show>
@@ -231,11 +282,48 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     const selected = loadedFile(), target = review.target();
     if (selected && target && !review.busy()) void context.expand(selected, target, id, direction);
   }
-  function ask(onlySelection = false) {
+  // Reply quotes precede the draft at submission, so they require a plain question rather than a skill command.
+  const questionCommands = () => props.model.quote() ? [] : props.model.state.commands;
+  function ask(onlySelection = false, question?: ReviewQuestion) {
     const selected = loadedFile(), target = review.target();
     if (!selected || !target || (onlySelection && !selectedLines().length)) return;
-    try { props.model.setDraft(reviewDraft(props.model.draft(), selected, target, onlySelection ? selectedLines() : undefined)); props.conversation(); }
+    try {
+      const draft = reviewDraft(props.model.draft(), selected, target, onlySelection ? selectedLines() : undefined, question, questionCommands());
+      if (new TextEncoder().encode(formatReply(draft, props.model.quote())).length > 32768) throw new Error("This patch, quote and your draft exceed the message limit. Select fewer lines or shorten your draft or quote.");
+      props.model.setDraft(draft); props.conversation();
+    }
     catch (error) { setNotice(error instanceof Error ? error.message : "Could not add review context."); }
+  }
+  /** Prepare a question for the complete snapshot, regardless of file filters or selection. */
+  function askOverall(question: ReviewQuestion) {
+    const snapshot = review.snapshot(), target = review.target();
+    if (!snapshot || !target || review.busy()) return;
+    try {
+      const draft = reviewScopeDraft(props.model.draft(), snapshot, target, question, questionCommands());
+      if (new TextEncoder().encode(formatReply(draft, props.model.quote())).length > 32768) throw new Error("This review context, quote and your draft exceed the message limit. Shorten your draft or quote.");
+      props.model.setDraft(draft); props.conversation();
+    }
+    catch (error) { setNotice(error instanceof Error ? error.message : "Could not add review context."); }
+  }
+  /** Question cards state their target and prepare editable drafts without sending messages. */
+  function QuestionPanel() {
+    return <section id={`review-questions-${props.model.id}`} class="review-questions" aria-label="Ask">
+      <div class="review-questions-heading"><strong><Icon name="chat" />Ask</strong><span class="review-question-scope">{questionScope() === "all" ? `${review.snapshot()?.files.length ?? 0} files · ${review.target()?.scope ?? ""} scope` : questionScope() === "selection" ? `${selectedLines().length} selected ${selectedLines().length === 1 ? "line" : "lines"} · ${file()?.path ?? ""}` : `Whole file · ${file()?.path ?? "No file selected"}`}</span></div>
+      <div class="review-question-scopes review-engines" role="group" aria-label="Question scope">
+        <Button type="button" aria-pressed={questionScope() === "all" ? "true" : "false"} onClick={() => setQuestionScope("all")}>All changes</Button>
+        <Button type="button" aria-pressed={questionScope() === "file" ? "true" : "false"} disabled={!loadedFile()} onClick={() => setQuestionScope("file")}>This file</Button>
+        <Button type="button" aria-pressed={questionScope() === "selection" ? "true" : "false"} disabled={!loadedFile() || !selectedLines().length} onClick={() => setQuestionScope("selection")}>Selected lines</Button>
+      </div>
+      <p class="review-question-intro">Choose a starting point. You can edit the question in chat before sending.</p>
+      <p class="review-question-context">{questionScope() === "all" ? "Includes the file list and comparison scope, not patches. Pi will inspect the diffs when you send." : questionScope() === "selection" ? "Only the selected lines will be included." : loadedFile() ? "The current file’s diff will be included. Select lines to ask a more focused question." : "Choose a file with an available diff, or ask about all changes."}</p>
+      <div class="review-question-buttons"><For each={reviewQuestionPresets}>{preset => {
+        const skill = () => reviewQuestionSkill(preset.question, questionCommands(), props.model.draft());
+        return <Button type="button" aria-label={preset.label} title={skill() ? `Use /${skill()} — prepares a review-only draft` : "Prepare a review-only question without adding a skill command"} disabled={review.busy() || (questionScope() !== "all" && !loadedFile()) || (questionScope() === "selection" && !selectedLines().length)} onClick={() => questionScope() === "all" ? askOverall(preset.question) : ask(questionScope() === "selection", preset.question)}><span class="review-question-label">{preset.label}<span aria-hidden="true">↗</span></span><span class="review-question-description">{preset.description}</span></Button>;
+      }}</For></div>
+      <p class="review-question-note">Nothing is sent automatically. Your existing draft is kept.</p>
+      <Show when={props.model.quote()}><p class="review-question-note">Your chat quote is kept; questions use plain prompts instead of skill commands.</p></Show>
+      <Show when={props.model.draft().trimStart().startsWith("/")}><p class="review-question-note">Your existing slash command will be kept; no skill command is added.</p></Show>
+    </section>;
   }
   return <section class="local-review" aria-label="Local changes" aria-busy={review.busy() ? "true" : "false"}>
     <form class="review-toolbar" onSubmit={event => { event.preventDefault(); setNotice(""); void review.refresh(); }}>
@@ -265,7 +353,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
           ]} />
         <Button type="button" disabled={review.busy() || review.history.busy()} onClick={() => void reloadCommits()}>Reload commits</Button>
       </Show>
-      <Button class="review-refresh" type="submit" disabled={review.busy() || (review.scope() === "branch" && !review.base().trim())}>{review.busy() ? "Loading…" : review.scope() === "branch" ? "Compare" : "Refresh"}</Button>
+      <Button class={review.scope() === "branch" ? "review-refresh" : "review-refresh review-refresh-icon"} type="submit" aria-label={review.busy() ? "Loading…" : review.scope() === "branch" ? "Compare" : "Refresh"} title={review.busy() ? "Loading…" : review.scope() === "branch" ? "Compare" : "Refresh"} disabled={review.busy() || (review.scope() === "branch" && !review.base().trim())}><Show when={review.scope() === "branch"} fallback={<Icon name="refresh" />}>{review.busy() ? "Loading…" : "Compare"}</Show></Button>
       <span class="review-readonly">Read-only</span>
     </form>
     <Show when={review.scope() === "branch"}>
@@ -290,43 +378,43 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
       <div class="review-summary" role="status">
         <span class="review-progress"><Show when={snapshot().files.length}><ProgressBar label="Review progress" max={snapshot().files.length} value={snapshot().files.filter(review.isReviewed).length} /></Show><span>{snapshot().files.filter(review.isReviewed).length} / {snapshot().files.length} files reviewed</span></span>
         <Show when={snapshot().lineStats} fallback={<span>Line totals unavailable</span>}>{stats => <span class="review-line-stats" role="group" aria-label="Line changes" title="Totals for this scope, including files omitted by display limits. Refresh after edits.">
-          <span>{(stats().added + stats().removed).toLocaleString()} lines changed</span>
           <span class="review-added">+{stats().added.toLocaleString()} added</span>
           <span class="review-removed">−{stats().removed.toLocaleString()} deleted</span>
-          <Show when={stats().unavailableFiles}><span>{stats().unavailableFiles.toLocaleString()} files without line counts (binary or untracked)</span></Show>
         </span>}</Show>
-        <span>Snapshot: {review.target()?.scope}{review.target()?.commit ? ` ${review.target()?.commit?.slice(0, 10)} · first parent` : review.target()?.base ? ` against ${review.target()?.base}` : ""}</span>
       </div>
       <Show when={snapshot().truncated}><p class="review-warning">{snapshot().note ?? "Some changes were omitted by review limits."}</p></Show>
       <Show when={snapshot().files.length} fallback={<p class="review-empty">No changes in this scope.</p>}>
-        <div class="review-view-switch" role="group" aria-label="Review view">
-          <Button type="button" aria-pressed={view() === "overview" ? "true" : "false"} onClick={() => setView("overview")}>Overview</Button>
-          <Button type="button" aria-pressed={view() === "files" ? "true" : "false"} onClick={() => setView("files")}>Files</Button>
+        <div class="review-view-toolbar">
+          <div class="review-view-switch" role="group" aria-label="Review view">
+            <Button type="button" aria-pressed={view() === "overview" ? "true" : "false"} onClick={() => setView("overview")}>Overview</Button>
+            <Button type="button" aria-pressed={view() === "files" ? "true" : "false"} onClick={() => setView("files")}>Files</Button>
+          </div>
+          <div class="review-view-actions">
+            <Button type="button" class="review-icon-action" aria-expanded={questionsOpen() ? "true" : "false"} aria-controls={`review-questions-${props.model.id}`} onClick={() => { if (!questionsOpen() && view() === "overview" && questionScope() === "file") setQuestionScope("all"); setQuestionsOpen(!questionsOpen()); }}><Icon name="chat" />Ask<Icon name="chevronDown" /></Button>
+            <Button class="review-group-action" type="button" disabled={review.busy() || review.grouping.busy()} onClick={() => void review.groupWithAI()}>{review.grouping.busy() ? "Grouping…" : review.grouping.stale() ? "Update groups with AI" : review.grouping.value() ? "Check saved groups" : "Group with AI"}</Button>
+          </div>
         </div>
+        <Show when={questionsOpen()}><QuestionPanel /></Show>
+        <Show when={review.grouping.value() || review.grouping.busy() || review.grouping.usage().calls || review.grouping.usage().reused || review.grouping.progress() || review.grouping.notice()}>
         <section class="review-organize" aria-label="Organize changed files">
           <div class="review-organize-heading">
-            <h2>Review by purpose</h2>
             <div class="review-group-controls">
               <Show when={review.grouping.value()}><div class="review-engines" role="group" aria-label="File grouping">
                 <Button type="button" aria-pressed={review.grouping.mode() === "folders" ? "true" : "false"} onClick={() => review.grouping.setMode("folders")}>Folders</Button>
                 <Button type="button" aria-pressed={review.grouping.mode() === "intent" ? "true" : "false"} onClick={() => review.grouping.setMode("intent")}>By purpose</Button>
               </div></Show>
-              <Button class="review-group-action" type="button" disabled={review.busy() || review.grouping.busy()} onClick={() => void review.groupWithAI()}>{review.grouping.busy() ? "Grouping…" : review.grouping.stale() ? "Update groups with AI" : review.grouping.value() ? "Reuse / check groups" : "Group with AI"}</Button>
+              <Show when={review.grouping.value()}><Button type="button" title="Ignore the saved result and make a new AI request" disabled={review.busy() || review.grouping.busy()} onClick={() => void review.groupWithAI(true)}>Regenerate groups</Button></Show>
               <Show when={review.grouping.busy()}><Button type="button" onClick={review.grouping.cancel}>Cancel grouping</Button></Show>
             </div>
           </div>
-          <Show when={review.grouping.value()}><Button type="button" disabled={review.busy() || review.grouping.busy()} onClick={() => void review.groupWithAI(true)}>Regenerate (ignore saved result)</Button></Show>
           <Show when={review.grouping.usage().calls || review.grouping.usage().reused}>
             <p class="review-group-status" aria-label="Grouping usage">{groupingUsageLabel(review.grouping.usage())}</p>
           </Show>
           <div role="status" aria-live="polite"><Show when={review.grouping.progress() || review.grouping.notice()}><p class="review-group-status">{review.grouping.progress() || review.grouping.notice()}</p></Show></div>
         </section>
+        </Show>
         <Show when={view() === "overview"}>
-          <ReviewOverview files={snapshot().files} groups={review.grouping.value()} reviewed={review.isReviewed} open={path => { setFilter(""); select(path); }} startGroup={paths => {
-            const unreviewed = new Set(snapshot().files.filter(file => !review.isReviewed(file)).map(file => file.path));
-            const first = paths.find(path => unreviewed.has(path)) ?? paths[0];
-            if (first) { review.grouping.setMode("intent"); setFilter(""); select(first); }
-          }} />
+          <ReviewOverview files={snapshot().files} groups={review.grouping.value()} explanations={review.explanations} openEvidence={openEvidence} explanationDisabled={review.busy() || review.grouping.busy() || review.grouping.stale()} reviewed={review.isReviewed} open={path => { setGroupKey(""); setFilter(""); setNeedsReview(false); select(path); }} startGroup={startGroup} />
         </Show>
         <Show when={view() === "files"}>
         <div class="review-layout">
@@ -349,10 +437,18 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
                   <Button class="review-icon-action" type="button" aria-pressed={structural.mode() === "structural" ? "true" : "false"} disabled={!loadedFile() || review.busy() || structural.busy()} title="Structural diff — compare syntax. Requires Difftastic 0.72.0." onClick={compareStructure}><Icon name="structure" /><span class="review-action-label">Structural</span></Button>
                 </div>
                 <Button class="review-files-toggle review-icon-action" type="button" aria-expanded={filesOpen() ? "true" : "false"} aria-controls={`review-files-${props.model.id}`} aria-haspopup="dialog" title={`Choose file (${snapshot().files.length} changed)`} onClick={() => setFilesOpen(true)}><Icon name="folder" /><span class="review-action-label">Files ({snapshot().files.length})</span></Button>
-                <Button class="review-icon-action" type="button" title="Next unreviewed" disabled={!nextUnreviewed()} onClick={() => { const next = nextUnreviewed(); if (next) { setFilter(""); select(next.path); } }}><Icon name="next" /><span class="review-action-label">Next unreviewed</span></Button>
-                <Button class="review-ask review-icon-action" type="button" disabled={!loadedFile() || review.busy()} title="Ask Pi about file — add this diff to your draft. Nothing is sent automatically." onClick={() => ask()}><Icon name="chat" /><span class="review-action-label">Ask Pi about file</span></Button>
+                <Button class="review-icon-action" type="button" title="Next unreviewed" aria-label="Next unreviewed" disabled={!nextUnreviewed()} onClick={() => { const next = nextUnreviewed(); if (next) { setFilter(""); select(next.path); } }}><Icon name="next" /><span class="review-action-label">Next</span></Button>
+                <Button class="review-ask review-icon-action" type="button" disabled={!loadedFile() || review.busy()} aria-label="Ask Pi about file" title="Ask Pi about file — add this diff to your draft. Nothing is sent automatically." onClick={() => ask()}><Icon name="chat" /><span class="review-action-label">Ask Pi</span></Button>
               </div>
             </header>
+            <Show when={loadedFile() && review.historyReview.status(selected()) === "changed"}><section class="review-since" aria-label="Changes since last review">
+              <strong>Changed since you marked this file reviewed</strong>
+              <Show when={incremental()} fallback={<p>The earlier diff is no longer retained. Review the full current diff.</p>}>{changes => <>
+                <p>{changes().changed.size ? "Highlighted rows differ within the edited region. Unchanged edges are not emphasized." : "No changed source rows in the captured patch; metadata or coordinates may have changed."} This is a conservative comparison with your last manual mark, not a new Git diff.</p>
+                <Show when={structural.result()}><p>Switch to Text to see incremental highlights.</p></Show>
+                <Show when={changes().previous.length}><Collapsible><Collapsible.Trigger>Previously reviewed rows replaced or removed</Collapsible.Trigger><Collapsible.Content><pre>{changes().previous.join("\n")}</pre><Show when={changes().limited}><p>Earlier rows truncated to 200.</p></Show></Collapsible.Content></Collapsible></Show>
+              </>}</Show>
+            </section></Show>
             <Show when={review.patchBusy()}><p class="review-empty" role="status">Loading patch…</p></Show>
             <Show when={review.patchError()}><p class="review-warning" role="alert">{review.patchError()} <Button type="button" onClick={() => void review.loadPatch()}>Retry patch</Button></p></Show>
             <Show when={loadedFile()}>
@@ -360,14 +456,14 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
             <Show when={structural.reason()}><p class="review-warning" role="status">{structural.reason()} Showing text diff.</p></Show>
             <Show when={!structural.result() && context.error()}><p class="review-warning" role="alert">{context.error()}</p></Show>
             <Show when={structural.result()} fallback={<div class="review-diff" tabindex={0} role="region" aria-label="Unified diff" aria-busy={context.busy() ? "true" : "false"} onKeyDown={dismissFloating}>
-              <ReviewRows rows={diff().rows} identity={`${review.target()?.scope}:${selected().path}:${selected().fingerprint}`} jump={() => jumpTo(() => detail)}>{row => row.kind === "gap" ? <div class="diff-line diff-hunk review-context">
+              <ReviewRows rows={diff().rows} focus={evidenceFocus()} identity={`${review.target()?.scope}:${selected().path}:${selected().fingerprint}`} jump={() => jumpTo(() => detail)}>{row => row.kind === "gap" ? <div class={`diff-line diff-hunk review-context${evidenceMatches(row) ? " diff-evidence" : ""}`} data-review-evidence={evidenceMatches(row) ? "true" : undefined} tabindex={evidenceMatches(row) ? -1 : undefined}>
                 <div class="review-context-gutter">
                   <For each={(["below", "above"] as const).filter(direction => row.gap[direction])}>{direction => <Button type="button" class={`review-expand review-expand-${direction}`} aria-label={`Expand ${Math.min(20, row.gap.remaining ?? 20)} lines ${direction}`} title={`Expand ${Math.min(20, row.gap.remaining ?? 20)} lines ${direction}`} disabled={context.busy() || review.busy()} onClick={() => expandContext(row.gap.id, direction)}>
                     <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 2h12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray=".1 3" /><path d="M7 5h2v5h3l-4 4-4-4h3z" fill="currentColor" /></svg>
                   </Button>}</For>
                 </div>
                 <Show when={row.header} fallback={<span class="review-context-label">More context</span>}>{header => <code>{header()}</code>}</Show>
-              </div> : <div class={`diff-line diff-${row.line.kind}${row.line.kind === "header" && row.line.text.startsWith("@@") ? " diff-hunk" : ""}${row.line.kind !== "header" && isSelected(row.line) ? " diff-selected" : ""}`} onPointerEnter={event => dragOver(event, row.line)}>
+              </div> : <div class={`diff-line diff-${row.line.kind}${row.line.kind === "header" && row.line.text.startsWith("@@") ? " diff-hunk" : ""}${row.line.kind !== "header" && isSelected(row.line) ? " diff-selected" : ""}${incremental()?.changed.has(reviewLineKey(row.line)) ? " diff-since-review" : ""}${evidenceMatches(row) ? " diff-evidence" : ""}`} data-review-evidence={evidenceMatches(row) ? "true" : undefined} tabindex={evidenceMatches(row) ? -1 : undefined} onPointerEnter={event => dragOver(event, row.line)}>
                 <Show when={row.line.kind !== "header"} fallback={<><span class="diff-number" /><span class="diff-number" /></>}>
                   <Button type="button" class="diff-select" disabled={review.busy()} title={extending() ? "Choose the end of your selection" : "Select a line; drag or Shift-click for a range"} aria-label={`Select ${[row.line.old !== undefined ? `old line ${row.line.old}` : "", row.line.next !== undefined ? `new line ${row.line.next}` : ""].filter(Boolean).join(", ")}`} aria-pressed={isSelected(row.line) ? "true" : "false"}
                     onPointerDown={event => startDrag(event, row.line)} onClick={event => { if (!suppressClick || event.detail === 0) selectLine(row.line, event.shiftKey || extending()); suppressClick = false; }}>
@@ -376,6 +472,9 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
                 </Show><code><Show when={row.line.tokens} fallback={(row.line.kind === "header" ? row.line.text : row.line.text.slice(1)) || " "}>{tokens => <For each={tokens()} fallback={" "}>{token => <span class={token.className}>{token.text}</span>}</For>}</Show></code>
                 <Show when={floatingLine() === row.line}><div class="review-floating-actions" role="group" aria-label="Selected lines actions">
                   <Button class="review-floating-ask" type="button" aria-label="Ask Pi about selected lines" title="Add selected lines to your draft." onClick={() => ask(true)}><Icon name="reply" />Ask Pi <span aria-hidden="true">· {selectedLines().length} {selectedLines().length === 1 ? "line" : "lines"}</span></Button>
+                  <DropdownMenu placement="bottom-end" modal={false}><DropdownMenu.Trigger aria-label="Focused questions" title="Prepare a question about these lines; nothing is sent">Questions</DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content class="session-menu review-question-menu">
+                    <For each={[["explain", "Explain this"], ["risks", "What could break?"], ["edges", "Check edge cases"], ["compare", "Compare with existing code"]] as const}>{([question, label]) => <DropdownMenu.Item onSelect={() => ask(true, question)}>{label}</DropdownMenu.Item>}</For>
+                  </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu>
                   <Button type="button" aria-pressed={extending() ? "true" : "false"} onClick={() => setExtending(!extending())}>Choose end line</Button>
                   <Button type="button" onClick={clearSelection}>Clear selection</Button>
                   <Button class="review-floating-dismiss" type="button" aria-label="Dismiss selection actions" title="Dismiss (Escape)" onClick={dismissFloating}><Icon name="close" /></Button>
