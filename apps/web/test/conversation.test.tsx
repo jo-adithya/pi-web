@@ -5,6 +5,20 @@ import { MessageList } from "../src/Conversation";
 import { initialState } from "../src/client-state";
 
 afterEach(cleanup);
+it("previews only completed, untruncated assistant artifacts", () => {
+  const text = "```html preview\n<div>Visual</div>\n```";
+  const value = initialState(); value.order = ["artifact"];
+  value.messages.artifact = { id: "artifact", role: "user", blocks: [{ kind: "text", text }], complete: true, error: null, truncated: false };
+  const [state, setState] = createStore(value);
+  const view = render(() => <MessageList state={state} />); flush();
+  expect(view.container.querySelector("iframe")).toBeNull();
+  setState(draft => { draft.messages.artifact.role = "assistant"; draft.messages.artifact.complete = false; }); flush();
+  expect(view.container.querySelector("iframe")).toBeNull();
+  setState(draft => { draft.messages.artifact.complete = true; draft.messages.artifact.truncated = true; }); flush();
+  expect(view.container.querySelector("iframe")).toBeNull();
+  setState(draft => { draft.messages.artifact.truncated = false; }); flush();
+  expect(view.container.querySelector("iframe")).not.toBeNull();
+});
 it("mounts only 100 messages and preserves revealed history across streaming and epoch changes", async () => {
   const value = initialState(); value.epoch = "first";
   for (let i = 0; i < 500; i++) { const id = String(i); value.order.push(id); value.messages[id] = { id, role: "user", blocks: [], complete: true, error: null, truncated: false }; }

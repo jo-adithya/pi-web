@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener =
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.port)).await?;
     let port = listener.local_addr()?.port();
-    let capability = config::capability()?;
+    let capability = config::persistent_capability(&config.registry_dir.join("auth"))?;
     let (stop, stopping) = tokio::sync::watch::channel(false);
     let browser_origin = config.remote_origin.as_ref().map_or_else(
         || format!("http://127.0.0.1:{port}"),

@@ -119,6 +119,33 @@ it.each(["none", "current", "other"])("reloads the app with draft protection for
   expect(socket.send).not.toHaveBeenCalled();
 });
 
+it.each([
+  ["Changes", a, "open"],
+  ["Changes", b, "open"],
+  ["Settings", a, "open"],
+  ["Settings", b, "open"],
+  ["Changes", b, "stopped"],
+] as const)("opens Conversation from %s when selecting sidebar session %s (%s)", async (view, target, lifecycle) => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url === "/auth"
+    ? new Response(null, { status: 204 })
+    : new Response(JSON.stringify({ files: [], truncated: false, note: null }))));
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.();
+  socket.emit({ ...catalog(), sessions: [item(a, "Conversation 1"), { ...item(b, "Conversation 2"), lifecycle, runtime: lifecycle === "stopped" ? null : item(b, "Conversation 2").runtime }] });
+  for (const frame of [...frames(a), ...(lifecycle === "open" ? frames(b) : [])]) socket.emit(frame);
+  fireEvent.click(page.getByRole("button", { name: view })); flush();
+  expect(page.getByRole("button", { name: view }).getAttribute("aria-pressed")).toBe("true");
+  socket.send.mockClear();
+  fireEvent.click(page.getByRole("button", { name: target === a ? /^Conversation 1,/ : /^Conversation 2,/ })); flush();
+  expect(page.getByRole("button", { name: "Conversation" }).getAttribute("aria-pressed")).toBe("true");
+  if (lifecycle === "stopped") {
+    expect(page.getByText("Session stopped")).toBeTruthy();
+    expect(socket.send.mock.calls.map(([message]) => JSON.parse(message).action.type)).not.toContain("open");
+  } else expect(page.getByLabelText("Message Pi")).toBeTruthy();
+});
+
 it("opens local changes for a stopped session without starting Pi", async () => {
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const request = vi.fn(async (url: string) => url === "/auth" ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ files: [], truncated: false, note: null })));

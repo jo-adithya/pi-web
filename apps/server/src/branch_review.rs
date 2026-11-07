@@ -4,16 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 use tokio::{sync::oneshot, time::Instant};
 
-pub(crate) struct Request {}
+pub(crate) struct Request {
+    query: String,
+}
 
 impl<'de> Deserialize<'de> for Request {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let fields =
-            std::collections::BTreeMap::<String, serde::de::IgnoredAny>::deserialize(deserializer)?;
-        if !fields.is_empty() {
-            return Err(serde::de::Error::custom("Expected an empty JSON object"));
+        let mut fields = std::collections::BTreeMap::<String, String>::deserialize(deserializer)?;
+        let query = fields.remove("query").unwrap_or_default();
+        if !fields.is_empty() || query.len() > 256 || query.chars().any(char::is_control) {
+            return Err(serde::de::Error::custom("Expected a branch query of up to 256 bytes"));
         }
-        Ok(Self {})
+        Ok(Self { query })
     }
 }
 
@@ -32,6 +34,7 @@ pub(crate) struct Review {
 }
 
 /// Lists up to 100 local and remote-tracking branches in refname order.
+/// A trimmed, case-insensitive literal ref substring filters all refs before the limit.
 /// Symbolic aliases are excluded; refs incompatible with branch review are omitted
 /// with `truncated` set. Repositories without branch refs return an empty list.
 /// JSON is capped at 64 KiB, with Git output capped at 1 MiB within ten seconds.
@@ -39,7 +42,7 @@ pub(crate) struct Review {
 /// Git before the caller releases admission. Repository and Git failures return errors.
 pub(crate) async fn review(
     root: &Path,
-    _request: Request,
+    request: Request,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<Review, &'static str> {
     let mut git = Git {
@@ -61,6 +64,7 @@ pub(crate) async fn review(
             1024 * 1024,
         )
         .await?;
+    let query = request.query.trim().to_lowercase();
     let mut result = Review {
         branches: Vec::new(),
         truncated: false,
@@ -78,6 +82,9 @@ pub(crate) async fn review(
             result.truncated = true;
             continue;
         };
+        if !reference.to_lowercase().contains(&query) {
+            continue;
+        }
         // Existing Git refs already satisfy check-ref-format; these are the
         // additional restrictions imposed by the branch review base contract.
         if reference.len() > 256

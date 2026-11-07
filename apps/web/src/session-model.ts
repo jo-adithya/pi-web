@@ -20,7 +20,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     (request, signal) => fetchContextReview(id, request, signal, capability()),
     signal => fetchCommits(id, signal, capability()),
     (request, signal) => fetchReviewGroups(id, request, signal, capability()),
-    signal => fetchBranches(id, signal, capability()),
+    (signal, query) => fetchBranches(id, signal, capability(), query),
     { model: () => state.settings.model ? { provider: state.settings.model.provider, id: state.settings.model.id } : null, cacheNamespace: id },
   );
   const [state, setState] = createStore(initialState());

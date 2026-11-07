@@ -201,9 +201,9 @@ export default function App() {
     window.addEventListener("hashchange", changed); void start();
     return () => { disposed = true; for (const model of models.values()) model.dispose(); notifications.dispose(); window.removeEventListener("hashchange", changed); clearTimeout(timer); socket?.close(); };
   });
-  /** Remember the chosen folder without launching a stopped conversation. */
+  /** Show the chosen conversation and remember its folder, keeping stopped sessions stopped. */
   function choose(item: CatalogItem) {
-    selectionRequest = undefined; setSelected(item.sessionId);
+    selectionRequest = undefined; setSelected(item.sessionId); setView("conversation");
     if (item.lifecycle === "open") command({ type: "open", sessionId: item.sessionId });
     else {
       command({ type: "select_workspace", workspaceId: item.workspaceId });

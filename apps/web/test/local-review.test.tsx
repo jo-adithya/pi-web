@@ -305,8 +305,18 @@ it("highlights later edits against the last manual review and preserves unchange
   expect(page.getByText("+<script>alert(1)</script>")).toBeTruthy();
   fireEvent.click(page.getByRole("checkbox", { name: "Reviewed" })); flush();
   expect(page.queryByRole("region", { name: "Changes since last review" })).toBeNull();
-  fireEvent.click(page.getByRole("checkbox", { name: "Needs review only" })); flush();
+  const allFiles = page.getByRole("button", { name: "All files" });
+  const unreviewed = page.getByRole("button", { name: "Unreviewed" });
+  expect(allFiles.getAttribute("aria-pressed")).toBe("true");
+  expect(unreviewed.getAttribute("aria-pressed")).toBe("false");
+  fireEvent.click(unreviewed); flush();
+  expect(unreviewed.getAttribute("aria-pressed")).toBe("true");
+  expect(allFiles.getAttribute("aria-pressed")).toBe("false");
   expect(page.queryByRole("button", { name: `${file.path} — modified — reviewed` })).toBeNull();
+  fireEvent.click(allFiles); flush();
+  expect(page.getByRole("button", { name: `${file.path} — modified — reviewed` })).toBeTruthy();
+  expect(allFiles.getAttribute("aria-pressed")).toBe("true");
+  expect(unreviewed.getAttribute("aria-pressed")).toBe("false");
 });
 
 it("lets grouping use a separate model and shows measured usage without changing chat", async () => {

@@ -82,7 +82,14 @@ Tailscale settings are installed or changed by pi-web.
 4. Privately transfer the **complete URL printed by pi-web**, including `/#cap=…`,
    to your phone and open it in the browser. The capability is a password granting
    access to your coding agent: do not share it or paste it into logs or screenshots.
-   A bare hostname is insufficient for a new tab. Restarting pi-web rotates the secret.
+   A bare hostname is insufficient for a new tab. The password survives server restarts.
+It is stored in `auth/capability.json` under the workspace registry, in a private 0700
+directory with a 0600 file. By default this is
+`~/Library/Application Support/pi-web/workspaces/auth/capability.json`; with
+`--state-dir PATH`, it is `PATH/workspaces/auth/capability.json`. All workspaces in
+that registry share the password. Invalid or insecure stored credentials fail startup.
+To rotate it, stop pi-web, delete only that file, and restart; then use the newly
+printed URL to sign in again. Treat backups of this file as passwords too.
 
 The proxy preserves Host and Origin; pi-web checks both against the configured
 origin and still requires the capability for authentication and WebSockets.
@@ -115,9 +122,10 @@ An installed window may not share the original tab’s login. Use **Terminal log
 to paste the complete current `https://…/#cap=…` link printed by the server. Only links
 for the current origin are accepted, and only the credential is posted to `/auth`.
 The link is cleared from the input immediately; login remains session-storage-only,
-not a saved device credential. Paste a fresh link after a server restart or when a
-new window requests authentication. If an open app is reconnecting after a restart,
-choose **Update login link** to sign in again without losing your drafts.
+not a saved device credential. Paste the login link when a new window requests
+authentication or after deliberately rotating the server password. Ordinary server
+restarts retain the password. Choose **Update login link** to sign in again without
+losing your drafts.
 The manifest and launch URL never contain the secret.
 
 This is an **online-only app**: the computer, Pi Web server, and private network must
@@ -135,8 +143,8 @@ a Git working tree (including a Git-colocated jj repository).
 - **Unstaged** compares tracked files with the index. Untracked filenames are listed,
   but their contents are not read. **Staged** compares the index with HEAD.
 - **Branch** lists up to 100 local and locally stored remote-tracking branches on
-  demand; choose a base and click **Compare**. **Enter a branch or tag** also accepts
-  a tag or full ref. The comparison is merge-base → committed HEAD: changes since
+  demand; search to narrow the list and choose a base to compare immediately.
+  **Compare** reruns the selected comparison. The comparison is merge-base → committed HEAD: changes since
   the branches diverged, not a tip-to-tip comparison. **Reload branches** only rereads
   local refs; remote-tracking refs may be stale. It excludes staged/unstaged edits.
   GitHub URLs, fetching, staging, committing, and publishing are not supported.
@@ -445,8 +453,52 @@ Markdown protect browser boundaries; they do not make transcript secrets public-
 Provider credentials stay with Pi. The browser capability is readable by this origin's
 JavaScript, so trusted application assets and the strict CSP remain important. It is
 never put in query strings or logs. Loopback HTTP does not provide transport secrecy.
-Raw HTML, executable/file links and remote Markdown images are disabled. No automatic
-extension approvals or installations.
+Raw HTML in ordinary Markdown, executable/file links and remote Markdown images are disabled.
+No automatic extension approvals or installations.
+
+### HTML visual previews
+
+Ask Pi for a visual diagram or styled comparison. Pi Web explicitly supplies the
+bundled [`pi-web-visuals` skill](apps/server/pi/skills/pi-web-visuals/SKILL.md) to each
+newly launched main Pi process, independently of the conversation's project folder.
+Only a short routing hint is appended to the system prompt; Pi advertises the skill's
+name, description, and path, and the agent reads its full guidance when creating a
+visual. Skill selection is model-driven rather than a guaranteed application hook.
+No global skill installation is needed. The explicit bundled skill also remains
+available in `--isolated` mode, which disables discovery of other skills.
+
+The skill documents an explicit, top-level `html preview` fence:
+
+````markdown
+```html preview
+<style>.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+.card { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }</style>
+<div class="cards"><section class="card"><h2>Before</h2><p>Repeated work</p></section>
+<section class="card"><h2>After</h2><p>One clear step</p></section></div>
+```
+````
+
+Completed, untruncated assistant replies render these blocks as static HTML/CSS/inline
+SVG previews, with **Preview**, **Source**, and **Expand** controls. Streaming, user
+messages, unclosed/nested fences and ordinary `html` fences remain escaped text/code.
+The existing 64 KiB message limit applies; large visuals should be simplified.
+
+Previews follow Pi Web's resolved light/dark theme, including live changes and
+full-screen views. Use inherited CSS variables (`--background`, `--foreground`,
+`--card`, `--card-foreground`, `--muted`, `--muted-foreground`, `--border`,
+`--primary`, `--primary-foreground`, `--accent`, `--accent-foreground`,
+`--secondary`, `--secondary-foreground`) instead of fixed surface/text colors.
+The root `.dark` class and `color-scheme` are synchronized too. Explicit colors in
+older artifacts are preserved rather than automatically inverted.
+
+Each preview uses an opaque-origin sandbox and a separate CSP. Only a fixed,
+hash-authorized message receiver runs; generated scripts, handlers, forms,
+navigation, embedded pages and resource/network requests are disabled. The receiver
+accepts sanitized markup only from its parent; no capability is sent to the frame.
+Artifact CSS stays inside the frame, while the main application's script/style CSP
+remains strict. External fonts, images, JavaScript libraries and interactive apps
+are not supported. The data-free `/artifact-preview` document stores no artifacts;
+visuals are reconstructed from retained message text.
 
 ## Optional phone push
 

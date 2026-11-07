@@ -1318,6 +1318,23 @@ async fn branches_empty_unborn_and_entry_limit() {
     assert_eq!(limited["branches"].as_array().unwrap().len(), 100);
     assert_eq!(limited["truncated"], true);
     assert_eq!(limited["branches"][0]["name"], "choice-000");
+    for query in ["x".repeat(257), "é".repeat(129)] {
+        let body = serde_json::json!({ "query": query }).to_string();
+        assert_eq!(f.branches(&f.session, &body, true, origin, json).await.0, StatusCode::BAD_REQUEST);
+    }
+    f.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let (status, searched) = f
+        .branches(&f.session, r#"{"query":" ORIGIN/MAIN "}"#, true, origin, json)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{searched}");
+    assert_eq!(searched, serde_json::json!({"branches":[
+        {"ref":"refs/remotes/origin/main","name":"origin/main","kind":"remote"}
+    ],"truncated":false}));
+    let (status, missing) = f
+        .branches(&f.session, r#"{"query":"missing*"}"#, true, origin, json)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{missing}");
+    assert_eq!(missing, serde_json::json!({"branches":[],"truncated":false}));
     f.runtime.shutdown().await;
 }
 
@@ -1360,7 +1377,7 @@ async fn branches_enforce_browser_and_request_boundaries() {
             .0,
         StatusCode::UNSUPPORTED_MEDIA_TYPE
     );
-    for body in [r#"{"unknown":1}"#, "null", "[]", ""] {
+    for body in [r#"{"unknown":1}"#, r#"{"query":null}"#, r#"{"query":12}"#, r#"{"query":"a\nb"}"#, "null", "[]", ""] {
         assert_eq!(
             f.branches(&f.session, body, true, origin, json).await.0,
             StatusCode::BAD_REQUEST,

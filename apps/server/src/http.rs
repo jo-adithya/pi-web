@@ -140,6 +140,7 @@ pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(asset))
+        .route("/artifact-preview", get(artifact_preview))
         .route("/auth", post(auth))
         .route("/sw.js", get(service_worker))
         .route("/push", post(push_request))
@@ -185,6 +186,7 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
             .headers()
             .get("sec-fetch-dest")
             .is_some_and(|v| v == "document");
+    let artifact = request.uri().path() == "/artifact-preview";
     let mut response = if !valid_host
         || !valid_origin
         || (cross_site && !public_navigation)
@@ -205,7 +207,13 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
         next.run(request).await
     };
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; worker-src 'self'; manifest-src 'self'; style-src 'self'; connect-src 'self' {}; img-src 'self' blob:; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", state.socket_origin)).unwrap());
+    // A separate document policy keeps artifact styles out of the privileged application.
+    // The hash permits only the fixed receiver; generated scripts remain blocked.
+    if artifact {
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'sha256-um6pYV0dGZcLpyFqSoU2qP4/WthQw/cWTUR1as7UpMU='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts;"));
+    } else {
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; worker-src 'self'; manifest-src 'self'; style-src 'self'; connect-src 'self' {}; img-src 'self' blob:; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", state.socket_origin)).unwrap());
+    }
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -221,6 +229,11 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
     );
     response
 }
+/// Serves a fixed, data-free viewer. Its only input arrives from the embedding parent.
+async fn artifact_preview() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("artifact-preview.html"))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthRequest {

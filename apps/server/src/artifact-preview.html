@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTML artifact preview</title>
+<style>html { color-scheme: light; background: var(--background, white); color: var(--foreground, #17202a); font: 14px system-ui, sans-serif; } body { margin: 0; padding: 16px; overflow-wrap: anywhere; } svg { max-width: 100%; }</style>
+<body>
+<script>
+// This fixed receiver is the only script permitted by the response's hash-based CSP.
+// Generated markup is sanitized by the parent before reaching this opaque-origin frame.
+let hasArtifact = false;
+function receiveArtifact(event) {
+  if (event.source !== parent) return;
+  if (event.data?.type === "pi-web-artifact-theme") {
+    if (typeof event.data.dark !== "boolean") return;
+    const root = document.documentElement;
+    root.classList.toggle("dark", event.data.dark);
+    root.style.colorScheme = event.data.dark ? "dark" : "light";
+    const colors = event.data.colors;
+    if (colors && typeof colors === "object") {
+      for (const name of "background foreground card card-foreground muted muted-foreground primary primary-foreground border accent accent-foreground secondary secondary-foreground".split(" ")) {
+        if (typeof colors[name] === "string" && colors[name].length <= 256) root.style.setProperty(`--${name}`, colors[name]);
+      }
+    }
+    return;
+  }
+  if (hasArtifact || event.data?.type !== "pi-web-artifact" || typeof event.data.html !== "string" || event.data.html.length > 524288) return;
+  hasArtifact = true;
+  const content = document.createElement("div");
+  content.innerHTML = event.data.html;
+  document.body.replaceChildren(content);
+}
+window.addEventListener("message", receiveArtifact);
+</script>

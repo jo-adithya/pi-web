@@ -64,6 +64,59 @@ async fn setup_options(origin: Option<&str>, images: bool) -> (Fixture, Router, 
     (Fixture(root), http::router(state.with_push(push)), runtime)
 }
 #[tokio::test]
+async fn artifact_viewer_has_its_own_opaque_sandbox_and_restricted_script_policy() {
+    let (_fixture, router, runtime) = setup().await;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/artifact-preview")
+                .header("host", "127.0.0.1:9876")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let csp = response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("sandbox allow-scripts;"));
+    assert!(!csp.contains("allow-same-origin"));
+    assert!(csp.contains("script-src 'sha256-"));
+    assert!(!csp.contains("script-src 'self'"));
+    assert!(csp.contains("style-src 'unsafe-inline';"));
+    assert!(csp.contains("default-src 'none';"));
+    assert!(csp.contains("frame-ancestors 'self';"));
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("event.source !== parent")
+    );
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("host", "127.0.0.1:9876")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csp = response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("frame-src 'self';"));
+    assert!(csp.contains("style-src 'self';"));
+    assert!(!csp.contains("unsafe-inline"));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn private_https_origin_authenticates_with_capability() {
     let (_fixture, router, runtime) = setup_origin(Some("https://desktop.tail123.ts.net")).await;
     let response = router

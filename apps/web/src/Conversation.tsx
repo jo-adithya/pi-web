@@ -20,7 +20,7 @@ function Message(props: { message: DisplayMessage; loadImage?: (id: string) => P
   const visible = () => props.message.role === "user" || props.message.blocks.some(block => block.kind !== "thinking") || props.message.error || props.message.truncated;
   return <Show when={visible()}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`} data-reply-author={props.message.role === "assistant" ? "Pi" : "You"}><h2>{props.message.role === "assistant" ? "Pi" : props.message.role}</h2>
     <For each={props.message.blocks}>{block => <Show when={block.kind !== "thinking"}>
-      <Show when={block.kind === "text"} fallback={<Show when={block.kind === "image"} fallback={<pre class="block-notice">{block.text}</pre>}><ImagePreview id={block.text} load={props.loadImage} /></Show>}><div class="message-text"><Markdown text={block.text} complete={props.message.complete} /></div></Show>
+      <Show when={block.kind === "text"} fallback={<Show when={block.kind === "image"} fallback={<pre class="block-notice">{block.text}</pre>}><ImagePreview id={block.text} load={props.loadImage} /></Show>}><div class="message-text"><Markdown text={block.text} complete={props.message.complete} allowArtifacts={props.message.role === "assistant" && !props.message.truncated} /></div></Show>
     </Show>}</For>
     <Show when={props.message.error}><p class="warning">{props.message.error}</p></Show><Show when={props.message.truncated}><p class="truncated">Preview truncated. The full content remains with Pi.</p></Show>
   </article></Show>;

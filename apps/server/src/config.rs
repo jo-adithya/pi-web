@@ -269,6 +269,26 @@ pub fn capability() -> io::Result<String> {
         .collect())
 }
 
+/// Reuses the browser password in a private authentication directory, creating it
+/// atomically on first startup. Corrupt or insecure stored credentials fail startup.
+/// Stop the server and delete `capability.json` in this directory to rotate it.
+pub fn persistent_capability(root: &std::path::Path) -> io::Result<String> {
+    let store = crate::metadata::MetadataStore::open(root)?;
+    if let Some(token) = store.load_record::<String>("capability.json")? {
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(invalid("invalid stored browser capability"));
+        }
+        return Ok(token);
+    }
+    let token = capability()?;
+    store.save_record("capability.json", &token)?;
+    Ok(token)
+}
+
 /// Generates independent RFC4122 version-4 identities for app sessions and epochs.
 pub fn identity() -> io::Result<String> {
     let mut bytes = random_bytes::<16>()?;

@@ -43,8 +43,10 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   const [questionsOpen, setQuestionsOpen] = createSignal(false);
   const [questionScope, setQuestionScope] = createSignal<"all" | "file" | "selection">("file");
   const [commitQuery, setCommitQuery] = createSignal("");
-  const [manualBase, setManualBase] = createSignal(false);
-  const branchValue = createMemo(() => manualBase() ? "manual" : review.base());
+  const matchingBranches = createMemo(() => {
+    const query = review.branches.query().trim().toLowerCase();
+    return (review.branches.value()?.branches ?? []).filter(branch => branch.ref.toLowerCase().includes(query));
+  });
   const matchingCommits = createMemo(() => {
     const query = commitQuery().trim().toLowerCase();
     return (review.history.value()?.commits ?? []).filter(commit => `${commit.subject} ${commit.id}`.toLowerCase().includes(query));
@@ -213,9 +215,10 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   function changeScope(scope: ReviewScope) {
     setNotice(""); setFilter(""); setGroupKey(""); setEvidence(undefined); review.setScope(scope); loadScope(scope);
   }
+  /** Apply a picked branch immediately. */
   function selectBase(value: string) {
-    setManualBase(value === "manual");
-    if (value !== "manual") review.setBase(value);
+    review.setBase(value); setNotice(""); setFilter(""); flush();
+    void review.refresh("branch");
   }
   function selectCommit(id: string) { review.setCommit(id); setNotice(""); setFilter(""); void review.refresh("commit", id); }
   async function reloadCommits() {
@@ -259,7 +262,10 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
               <Show when={activeGroup()}><Button type="button" onClick={() => { setGroupKey(""); setFilter(""); setNeedsReview(false); }}>Show all files</Button></Show>
             </Show>
             <div class="review-filter"><TextField value={filter()} onChange={value => { setFilter(value); flush(); }}><TextField.Input type="search" aria-label="Filter files" placeholder="Filter files…" /></TextField><Show when={filter()}><Button type="button" onClick={() => setFilter("")} aria-label="Clear filter">×</Button></Show></div>
-            <Checkbox class="review-needs-filter" checked={needsReview()} onChange={setNeedsReview}><Checkbox.Input /><Checkbox.Control class="checkbox-control"><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Control><Checkbox.Label>Needs review only</Checkbox.Label></Checkbox>
+            <div class="review-needs-filter" role="group" aria-label="Filter by review status">
+        <Button type="button" aria-pressed={!needsReview() ? "true" : "false"} onClick={() => setNeedsReview(false)}>All files</Button>
+        <Button type="button" aria-pressed={needsReview() ? "true" : "false"} onClick={() => setNeedsReview(true)}>Unreviewed</Button>
+      </div>
             <Show when={needsReview()}><p class="review-group-status">Unloaded files stay visible until their fingerprints are checked.</p></Show>
             <Show when={visibleFiles().length} fallback={<p class="review-filter-empty">No files match your filter.</p>}>
               <For each={groups()}>{group => <section>
@@ -333,20 +339,19 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
         }</For>
       </div>
       <Show when={review.scope() === "branch"}>
-        <SelectField class="review-base" label="Compare against" visibleLabel value={branchValue()} change={selectBase}
+        <SelectField class="review-base" label="Compare against" value={review.base()} change={selectBase}
           placeholder={review.branches.busy() ? "Loading branches…" : "Choose a base branch"}
+          search={{ value: review.branches.query(), change: value => { void review.branches.refresh(value); flush(); }, label: "Find a branch", placeholder: "Search local or remote branches", empty: matchingBranches().length ? undefined : review.branches.busy() ? "Searching branches…" : review.branches.query().trim() && !review.branches.error() ? "No matching branches." : undefined }}
           options={[
-            ...(!manualBase() && review.base() && !review.branches.value()?.branches.some(branch => branch.ref === review.base()) ? [{ value: review.base(), label: `Selected: ${review.base()}` }] : []),
-            ...(review.branches.value()?.branches ?? []).map(branch => ({ value: branch.ref, label: `${branch.name} · ${branch.kind === "local" ? "Local" : "Remote (stored locally)"}` })),
-            { value: "manual", label: "Enter a branch or tag…" },
+            ...(review.base() && !matchingBranches().some(branch => branch.ref === review.base()) ? [{ value: review.base(), label: `Selected: ${review.base()}` }] : []),
+            ...matchingBranches().map(branch => ({ value: branch.ref, label: `${branch.name} · ${branch.kind === "local" ? "Local" : "Remote (stored locally)"}` })),
           ]} />
-        <Show when={manualBase()}><TextField class="review-base" value={review.base()} onChange={value => { review.setBase(value); flush(); }}><TextField.Label>Branch, tag, or full ref</TextField.Label><TextField.Input placeholder="main, v1.2, refs/remotes/origin/main" maxlength={256} /></TextField></Show>
         <Button type="button" disabled={review.branches.busy()} onClick={() => void review.branches.refresh()}>Reload branches</Button>
       </Show>
       <Show when={review.scope() === "commit"}>
-        <TextField class="review-commit-search" value={commitQuery()} onChange={value => { setCommitQuery(value); flush(); }}><TextField.Label>Find a commit</TextField.Label><TextField.Input type="search" placeholder="Search message or hash" /></TextField>
-        <SelectField class="review-commit" label="Commit" visibleLabel value={review.commit()} change={selectCommit} disabled={review.history.busy()}
+        <SelectField class="review-commit" label="Commit" value={review.commit()} change={selectCommit} disabled={review.history.busy()}
           placeholder={review.history.busy() ? "Loading commits…" : "Choose a commit"}
+          search={{ value: commitQuery(), change: value => { setCommitQuery(value); flush(); }, label: "Find a commit", placeholder: "Search message or hash", empty: commitQuery().trim() && !matchingCommits().length ? "No matching commits." : undefined }}
           options={[
             ...(review.commit() && !matchingCommits().some(commit => commit.id === review.commit()) ? [{ value: review.commit(), label: `Selected: ${selectedCommit()?.subject || review.commit().slice(0, 10)}` }] : []),
             ...matchingCommits().map(commit => ({ value: commit.id, label: `${commit.subject || "(no subject)"} · ${commit.id.slice(0, 10)}` })),
@@ -357,17 +362,14 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
       <span class="review-readonly">Read-only</span>
     </form>
     <Show when={review.scope() === "branch"}>
-      <p class="review-help">Committed changes since divergence; excludes uncommitted edits. Remote refs may be stale (no fetch).</p>
       <Show when={review.snapshot() && (review.target()?.scope !== "branch" || review.target()?.base !== review.base().trim())}><p class="review-help" role="status">Comparison not applied. The files below still show the previous snapshot.</p></Show>
-      <Show when={review.branches.error()}><p class="review-warning" role="alert">{review.branches.error()} You can still enter a branch or tag.</p></Show>
-      <Show when={review.branches.value()?.truncated}><p class="review-help">Some branches are omitted (up to 100 shown). You can enter a supported full ref manually.</p></Show>
-      <Show when={review.branches.value()?.branches.length === 0 && !review.branches.busy()}><p class="review-help">No local or stored remote branches found. Enter a known tag or reference to compare.</p></Show>
+      <Show when={review.branches.error()}><p class="review-warning" role="alert">{review.branches.error()} Reload branches to try again.</p></Show>
+      <Show when={review.branches.value()?.truncated}><p class="review-help">Some branches are omitted (up to 100 shown). Search to narrow the list.</p></Show>
+      <Show when={review.branches.value()?.branches.length === 0 && !review.branches.query().trim() && !review.branches.busy()}><p class="review-help">No local or stored remote branches found.</p></Show>
     </Show>
     <Show when={review.scope() === "commit"}>
       <Show when={review.history.error()}><p class="review-warning" role="alert">{review.history.error()}</p></Show>
       <Show when={review.history.value()?.truncated}><p class="review-help">Showing the 100 most recent commits.</p></Show>
-      <Show when={commitQuery().trim() && !matchingCommits().length && !review.history.busy()}><p class="review-help" role="status">No matching commits.</p></Show>
-      <Show when={review.commit()}><p class="review-commit-context"><strong>{selectedCommit()?.subject || "Selected commit"}</strong><code>{review.commit()}</code></p></Show>
       <Show when={review.history.value()?.commits.length === 0 && !review.history.busy()}><p class="review-empty" role="status">No commits in local HEAD history. Reload commits after creating a commit.</p></Show>
     </Show>
     <Show when={review.error()}><p class="review-warning" role="alert">{review.error()}<Show when={review.snapshot()}> Showing the previous snapshot.</Show></p></Show>
@@ -386,8 +388,8 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
       <Show when={snapshot().files.length} fallback={<p class="review-empty">No changes in this scope.</p>}>
         <div class="review-view-toolbar">
           <div class="review-view-switch" role="group" aria-label="Review view">
-            <Button type="button" aria-pressed={view() === "overview" ? "true" : "false"} onClick={() => setView("overview")}>Overview</Button>
-            <Button type="button" aria-pressed={view() === "files" ? "true" : "false"} onClick={() => setView("files")}>Files</Button>
+            <Button type="button" aria-pressed={view() === "overview" ? "true" : "false"} onClick={() => setView("overview")}><Icon name="structure" />Overview</Button>
+            <Button type="button" aria-pressed={view() === "files" ? "true" : "false"} onClick={() => setView("files")}><Icon name="folder" />Files</Button>
           </div>
           <div class="review-view-actions">
             <Button type="button" class="review-icon-action" aria-expanded={questionsOpen() ? "true" : "false"} aria-controls={`review-questions-${props.model.id}`} onClick={() => { if (!questionsOpen() && view() === "overview" && questionScope() === "file") setQuestionScope("all"); setQuestionsOpen(!questionsOpen()); }}><Icon name="chat" />Ask<Icon name="chevronDown" /></Button>

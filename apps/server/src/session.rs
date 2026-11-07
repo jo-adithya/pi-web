@@ -2048,7 +2048,7 @@ fn valid_head(head: &HistoryHead) -> bool {
             .is_none_or(|s| !s.is_empty() && s.len() <= 1024)
         && head.session_file.as_ref().is_none_or(|s| s.len() <= 4096)
 }
-/// Resolves only the operator's executable and constructs argument-array invocation.
+/// Builds a main-session launch with the bundled visual skill and configured adapters.
 fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::ProcessSpec> {
     let executable = resolve_executable(config)?;
     let root = config.state_dir.join("pi-sessions");
@@ -2060,6 +2060,13 @@ fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::Proce
         root.into_os_string(),
         "--extension".into(),
         config.head_adapter.canonicalize()?.into_os_string(),
+        "--skill".into(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("pi/skills/pi-web-visuals/SKILL.md")
+            .canonicalize()?
+            .into_os_string(),
+        "--append-system-prompt".into(),
+        "Pi Web supports HTML previews. Use them proactively for complex explanations or data visualization when clearer than lengthy prose. Read the pi-web-visuals skill first.".into(),
     ];
     if !config.isolated
         && let Ok(adapter) = config.quota_adapter.canonicalize()
@@ -2093,6 +2100,58 @@ fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::Proce
         args,
         cwd: config.cwd.clone(),
     })
+}
+
+#[cfg(test)]
+mod artifact_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn main_session_launch_teaches_the_opt_in_artifact_format() {
+        let root =
+            std::env::temp_dir().join(format!("pi-web-artifact-launch-{}", std::process::id()));
+        for isolated in [false, true] {
+            let mut config = Config::parse(std::iter::empty::<String>())
+                .unwrap()
+                .unwrap();
+            config.pi = "/bin/true".into();
+            config.state_dir = root.clone();
+            config.cwd = root.clone();
+            config.isolated = isolated;
+            let spec = launch_spec(&config, None).unwrap();
+            let prompt = spec
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "--append-system-prompt");
+            let prompt = prompt.expect("main sessions need the visual skill routing hint")[1]
+                .to_string_lossy();
+            assert!(prompt.contains("pi-web-visuals"));
+            assert!(prompt.contains("proactively"));
+            assert!(prompt.contains("data visualization"));
+            assert!(prompt.contains("lengthy prose"));
+            assert!(!prompt.contains("var(--background)"));
+            assert!(!prompt.contains("html preview"));
+            let skill = spec
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "--skill")
+                .expect("main sessions explicitly load the bundled visual skill");
+            let path = PathBuf::from(&skill[1]);
+            assert!(path.is_absolute());
+            assert_eq!(
+                path,
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("pi/skills/pi-web-visuals/SKILL.md")
+                    .canonicalize()
+                    .unwrap()
+            );
+            let instructions = std::fs::read_to_string(path).unwrap();
+            assert!(instructions.starts_with("---\nname: pi-web-visuals\n"));
+            assert!(instructions.contains("html preview"));
+            assert!(instructions.contains("var(--background)"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// Resolves the operator executable identically for main and isolated helper launches.

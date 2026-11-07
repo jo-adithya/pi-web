@@ -2,15 +2,15 @@ import { createSignal } from "solid-js";
 
 export interface LocalBranch { ref: string; name: string; kind: "local" | "remote" }
 export interface BranchList { branches: LocalBranch[]; truncated: boolean }
-export type BranchLoader = (signal: AbortSignal) => Promise<BranchList>;
+export type BranchLoader = (signal: AbortSignal, query: string) => Promise<BranchList>;
 
-/** Lists bounded local refs, including stored remote-tracking refs, without fetching. */
-export async function fetchBranches(id: string, signal: AbortSignal, capability: string | null): Promise<BranchList> {
+/** Searches local and stored remote-tracking refs before the 100-result limit; query is a literal, case-insensitive ref substring. */
+export async function fetchBranches(id: string, signal: AbortSignal, capability: string | null, query = ""): Promise<BranchList> {
   if (!capability) throw new Error("Authentication required. Reopen the current terminal URL.");
   const response = await fetch(`/review/${encodeURIComponent(id)}/branches`, {
     method: "POST", credentials: "omit", redirect: "error", cache: "no-store",
     signal: AbortSignal.any([signal, AbortSignal.timeout(12000)]),
-    headers: { "content-type": "application/json", "x-pi-capability": capability }, body: "{}",
+    headers: { "content-type": "application/json", "x-pi-capability": capability }, body: JSON.stringify(query ? { query } : {}),
   });
   if (response.status === 401 || response.status === 403) throw new Error("Authentication required. Reopen the current terminal URL.");
   if (response.status === 429) throw new Error("Review workers are busy. Try again shortly.");
@@ -32,20 +32,23 @@ export async function fetchBranches(id: string, signal: AbortSignal, capability:
   return { branches, truncated: value.truncated };
 }
 
-/** Session-local branch choices. Failed reloads retain choices; cancelled replies are ignored. */
+/** Session-local search and branch choices. Retains choices during requests and ignores cancelled replies. */
 export function createBranchList(load: BranchLoader) {
   const [value, setValue] = createSignal<BranchList>();
+  const [query, setQuery] = createSignal("");
   const [busy, setBusy] = createSignal(false), [error, setError] = createSignal("");
   let active: AbortController | undefined;
   function cancel() { active?.abort(); active = undefined; setBusy(false); }
-  async function refresh(): Promise<void> {
-    cancel(); setError(""); const current = new AbortController(); active = current; setBusy(true);
+  async function refresh(search = query()): Promise<void> {
+    cancel();
+    setQuery(search);
+    setError(""); const current = new AbortController(); active = current; setBusy(true);
     try {
-      const result = await load(current.signal);
+      const result = await load(current.signal, search);
       if (active === current) setValue(result);
     } catch (reason) {
       if (active === current) setError(reason instanceof Error ? reason.message : "Could not load local branches.");
     } finally { if (active === current) { active = undefined; setBusy(false); } }
   }
-  return { value, busy, error, refresh, cancel };
+  return { value, query, busy, error, refresh, cancel };
 }
