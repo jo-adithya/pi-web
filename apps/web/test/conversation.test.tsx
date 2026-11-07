@@ -5,6 +5,28 @@ import { MessageList } from "../src/Conversation";
 import { initialState } from "../src/client-state";
 
 afterEach(cleanup);
+it("keeps compaction summaries collapsed, readable on demand, and separate from replies", async () => {
+  const state = initialState(); state.order = ["summary"];
+  state.messages.summary = { id: "summary", role: "compactionSummary", complete: true, truncated: true, error: null,
+    blocks: [{ kind: "text", text: "## Decisions\nKeep the existing API." }] };
+  const view = render(() => <MessageList state={state} />); flush();
+  expect(view.getByText("Context compacted")).toBeTruthy();
+  expect(view.queryByText("compactionSummary")).toBeNull();
+  expect(view.queryByText("Keep the existing API.")).toBeNull();
+  expect(view.container.querySelector("[data-reply-author]")).toBeNull();
+  const details = view.container.querySelector("details")!;
+  expect(details).not.toBeNull();
+  expect(details.open).toBe(false);
+  details.open = true;
+  await fireEvent(details, new Event("toggle")); flush();
+  expect(view.getByRole("heading", { name: "Decisions" })).toBeTruthy();
+  expect(view.getByText("Keep the existing API.")).toBeTruthy();
+  expect(view.getByText(/Preview truncated/)).toBeTruthy();
+  expect(view.container.querySelector("iframe")).toBeNull();
+  details.open = false;
+  await fireEvent(details, new Event("toggle")); flush();
+  expect(view.queryByText("Keep the existing API.")).toBeNull();
+});
 it("previews only completed, untruncated assistant artifacts", () => {
   const text = "```html preview\n<div>Visual</div>\n```";
   const value = initialState(); value.order = ["artifact"];

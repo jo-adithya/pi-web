@@ -42,6 +42,15 @@ it("successful mixed prompts clear only submitted attachments and text; unsuppor
   model.receive(frame({ type: "settings", settings: initialState().settings })); flush();
   await model.addImages([new File(["image"], "picture.png")]); flush(); expect(model.attachments()).toHaveLength(0); expect(model.notice()).toContain("does not support");
 });
+it("keeps composer attachments out of standalone review questions and retains them after acknowledgement", async () => {
+  const { model, sent } = setup();
+  await model.addImages([new File(["image"], "picture.png")]); flush();
+  expect(model.submitReview("Review this excerpt")).toBe(true); flush();
+  expect(sent[0].action).toEqual({ type: "prompt", text: "Review this excerpt", images: [] });
+  model.receive(frame({ type: "result", result: { requestId: sent[0].requestId, ok: true, code: "accepted", recoveredDraft: null, disposition: null } })); flush();
+  expect(model.attachments()).toHaveLength(1);
+  expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+});
 it("does not load conversation images until requested and releases the blob on hide", async () => {
   vi.stubGlobal("URL", class extends URL { static createObjectURL = vi.fn(() => "blob:display"); static revokeObjectURL = vi.fn(); });
   const load = vi.fn().mockResolvedValue(new Blob(["image"], { type: "image/png" }));

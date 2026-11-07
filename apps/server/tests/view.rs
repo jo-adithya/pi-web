@@ -26,6 +26,51 @@ fn final_messages_replace_deltas_and_agent_end_is_not_settlement() {
     assert_eq!(state.activity, Activity::Idle);
 }
 #[test]
+fn compaction_end_clears_indicator_without_declaring_settlement() {
+    for end in [
+        json!({"type":"compaction_end","aborted":false,"willRetry":false,"result":{}}),
+        json!({"type":"compaction_end","aborted":true,"willRetry":false}),
+        json!({"type":"compaction_end","aborted":false,"willRetry":false,"errorMessage":"failed"}),
+        json!({"type":"compaction_end","aborted":false,"willRetry":true,"result":{}}),
+    ] {
+        let mut state = ViewState::default();
+        state.apply(&json!({"type":"compaction_start"}));
+        let expected = if end["willRetry"] == true { Activity::Running } else { Activity::Reconciling };
+        assert_eq!(state.apply(&end), vec![ViewPatch::Activity { activity: expected.clone() }]);
+        assert_eq!(state.activity, expected);
+        state.apply(&json!({"type":"agent_settled","aborted":false}));
+        assert_eq!(state.activity, Activity::Idle);
+    }
+    for activity in [Activity::Cancelling, Activity::Failed, Activity::AwaitingInput] {
+        let mut state = ViewState::default();
+        state.activity = activity.clone();
+        assert!(state.apply(&json!({"type":"compaction_end"})).is_empty());
+        assert_eq!(state.activity, activity);
+    }
+}
+
+#[test]
+fn next_turn_after_compaction_restores_running_until_settlement() {
+    let mut state = ViewState::default();
+    state.apply(&json!({"type":"agent_start"}));
+    state.apply(&json!({"type":"compaction_start","reason":"threshold"}));
+    state.apply(&json!({"type":"compaction_end","reason":"threshold","willRetry":false,"aborted":false}));
+    assert_eq!(state.activity, Activity::Reconciling);
+
+    // Between-turn compaction resumes with turn_start, without another agent_start.
+    assert_eq!(
+        state.apply(&json!({"type":"turn_start"})),
+        vec![ViewPatch::Activity { activity: Activity::Running }]
+    );
+    assert_eq!(state.activity, Activity::Running);
+    assert!(state.apply(&json!({"type":"turn_start"})).is_empty());
+    state.apply(&json!({"type":"agent_end","willRetry":false}));
+    assert_eq!(state.activity, Activity::Running);
+    state.apply(&json!({"type":"agent_settled","aborted":false}));
+    assert_eq!(state.activity, Activity::Idle);
+}
+
+#[test]
 fn strips_hidden_provider_data_and_bounds_preview_blocks_and_utf8() {
     assert!(
         normalize_message(

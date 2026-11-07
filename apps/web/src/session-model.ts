@@ -2,7 +2,8 @@ import { createSignal, createStore } from "solid-js";
 import type { BrowserAction, BrowserMessage, ServerMessage, ThinkingLevel, RunOutcome } from "./generated/protocol";
 import { imageRequest, prepareImage, IMAGE_BYTES, type Attachment } from "./images";
 import { searchWorkspaceFiles } from "./workspace-files";
-import { createLocalReview, fetchReview } from "./local-review";
+import { createLocalReview, fetchReview, type ReviewLoadRequest, type ReviewFile } from "./local-review";
+import { createReviewCards } from "./review-cards";
 import { fetchStructuralReview } from "./structural-review";
 import { fetchContextReview } from "./context-review";
 import { fetchCommits } from "./commit-review";
@@ -23,6 +24,11 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     (signal, query) => fetchBranches(id, signal, capability(), query),
     { model: () => state.settings.model ? { provider: state.settings.model.provider, id: state.settings.model.id } : null, cacheNamespace: id },
   );
+  const reviewCards = createReviewCards(id);
+  const loadReviewPreview = async (request: ReviewLoadRequest & { path: string }, signal: AbortSignal): Promise<ReviewFile> => {
+    const snapshot = await fetchReview(id, request, signal, capability());
+    return snapshot.files[0] as ReviewFile; // Selected-path responses are validated by fetchReview.
+  };
   const [state, setState] = createStore(initialState());
   const [draft, setDraft] = createSignal(""); const [notice, setNotice] = createSignal("");
   const [quote, setQuote] = createSignal<ReplyQuote | undefined>(undefined);
@@ -51,7 +57,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
   let disposed = false;
   const [uploading, setUploading] = createSignal(false);
-  let prompt: { id: string; text: string; quote: ReplyQuote | undefined; images: string[] } | undefined; let epoch = ""; let attachmentNotice = false;
+  let prompt: { id: string; text: string; quote: ReplyQuote | undefined; images: string[]; standalone?: boolean } | undefined; let epoch = ""; let attachmentNotice = false;
   function send(action: BrowserAction): string | undefined {
     if (!connected() || !epoch || (!state.synced && action.type !== "attach")) return;
     const requestId = crypto.randomUUID();
@@ -99,13 +105,28 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   async function loadImage(imageId: string): Promise<Blob> { return (await imageRequest(id, imageId, undefined, capability())).blob(); }
   const canSend = () => canConfigure() && !settingsRequest && (!!draft().trim() || attachments().length > 0) && !uploading() && (!attachments().length || !!state.settings.model?.images) && new TextEncoder().encode(formatReply(draft(), quote())).length <= 32_768;
   function submit() {
-    if (!canSend()) return;
+    if (prompt || !canSend()) return;
     const text = draft(); const submittedQuote = quote(); const images = attachments().map(image => image.id); const requestId = send({ type: "prompt", text: formatReply(text, submittedQuote), images });
     if (requestId) { prompt = { id: requestId, text, quote: submittedQuote, images }; setPending(true); setNotice(""); setStick(true); }
   }
+  /** Sends an explicit review question independently of the composer. Returns transport acceptance.
+   * Failed or uncertain delivery restores the question to the draft for manual recovery; never replays it.
+   */
+  function submitReview(text: string): boolean {
+    if (disposed || prompt || settingsRequest || !canConfigure() || !text.trim() || new TextEncoder().encode(text).length > 32_768) return false;
+    const requestId = send({ type: "prompt", text, images: [] });
+    if (!requestId) return false;
+    prompt = { id: requestId, text, quote: undefined, images: [], standalone: true };
+    setPending(true); setNotice(""); setStick(true);
+    return true;
+  }
+  function preserveReviewQuestion(text: string) { setDraft(previous => previous ? `${previous}\n\n${text}` : text); }
   function disconnected() {
     setState(value => { value.synced = false; value.dialogs = []; });
-    if (prompt) { setNotice("Prompt delivery is uncertain. Inspect the transcript before sending your preserved draft again."); }
+    if (prompt) {
+      if (prompt.standalone) preserveReviewQuestion(prompt.text);
+      setNotice("Prompt delivery is uncertain. Inspect the transcript before sending your preserved draft again.");
+    }
     prompt = undefined; setPending(false);
     settingsRequest = undefined; setSettingsPending(false);
   }
@@ -145,11 +166,12 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
       const result = message.body.result;
       if (settingsRequest === result.requestId && result.code !== "pending") { settingsRequest = undefined; setSettingsPending(false); }
       if (prompt?.id === result.requestId && result.code !== "pending") {
-        if (result.ok) {
+        if (result.ok && !prompt.standalone) {
           if (draft() === prompt.text) setDraft("");
           if (quote() === prompt.quote) clearQuote();
           for (const image of prompt.images) removeImage(image);
         }
+        if (!result.ok && prompt.standalone && !result.recoveredDraft) preserveReviewQuestion(prompt.text);
         setPending(false); prompt = undefined;
       }
       if (result.recoveredDraft) setDraft(previous => previous ? `${previous}\n\n${result.recoveredDraft}` : result.recoveredDraft!);
@@ -157,6 +179,6 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     }
     return true;
   }
-  return { id, dispose, review, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, receive, disconnected, stopped, scroll: 0 };
+  return { id, dispose, review, reviewCards, loadReviewPreview, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, submitReview, receive, disconnected, stopped, scroll: 0 };
 }
 export type SessionModel = ReturnType<typeof createSessionModel>;

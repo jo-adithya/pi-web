@@ -1019,6 +1019,73 @@ async fn context_usage_refreshes_and_replays_without_private_stats() {
     assert!(handle.shutdown().await);
 }
 
+/// Compaction refreshes usage before another message or settlement arrives.
+#[tokio::test]
+async fn compaction_end_refreshes_context_and_manual_command_returns_idle() {
+    use pi_web::view::Activity;
+    for prompt in ["compact-overflow", "/compact"] {
+        let fixture = Fixture::new();
+        let handle = session::start(fixture.config()).unwrap();
+        let mut connection = handle.connect("client".into()).await.unwrap();
+        let identity = ready(&mut connection).await;
+        send(&handle, &identity, "context-attach", BrowserAction::Attach);
+        until(&mut connection, |m| matches!(&m.body, ServerBody::ContextUsage { usage: Some(u) } if u.tokens == Some(12500))).await;
+        send(&handle, &identity, "compact", BrowserAction::Prompt { text: prompt.into(), images: vec![] });
+        let expected = if prompt == "/compact" { Activity::Idle } else { Activity::Running };
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut refreshed = false;
+            let mut completed = false;
+            while !refreshed || !completed {
+                match next(&mut connection).await.body {
+                    ServerBody::ContextUsage { usage: Some(u) } => refreshed |= u.tokens == Some(4000),
+                    ServerBody::Event { status, .. } => completed |= status.activity == expected,
+                    _ => {}
+                }
+            }
+        }).await;
+        assert!(handle.shutdown().await);
+        outcome.expect("compaction must refresh context and leave the compaction phase");
+    }
+}
+
+/// Standalone extension compaction has no subsequent prompt acknowledgement or settlement.
+#[tokio::test]
+async fn compaction_reconciles_idle_and_active_runs_without_another_event() {
+    use pi_web::view::{Activity, ViewPatch};
+    for (prompt, expected) in [
+        ("compact-after-settlement", Activity::Idle),
+        ("compact-active", Activity::Running),
+    ] {
+        let fixture = Fixture::new();
+        let handle = session::start(fixture.config()).unwrap();
+        let mut connection = handle.connect("client".into()).await.unwrap();
+        let identity = ready(&mut connection).await;
+        send(&handle, &identity, "compact", BrowserAction::Prompt { text: prompt.into(), images: vec![] });
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut saw_compaction = false;
+            let mut refreshed = false;
+            let mut activity = Activity::Idle;
+            loop {
+                match next(&mut connection).await.body {
+                    ServerBody::ContextUsage { usage: Some(u) } => refreshed |= u.tokens == Some(4000),
+                    ServerBody::Event { status, patches, .. } => {
+                        saw_compaction |= patches.iter().any(|p| matches!(p, ViewPatch::Activity { activity: Activity::Compacting }));
+                        activity = status.activity;
+                    }
+                    _ => {}
+                }
+                if saw_compaction && refreshed && activity == expected { break; }
+            }
+            send(&handle, &identity, "next", BrowserAction::Prompt { text: "/handled".into(), images: vec![] });
+            let receipt = result(&mut connection, "next").await;
+            if expected == Activity::Idle { assert!(receipt.ok, "{receipt:?}"); }
+            else { assert_eq!(receipt.code, "busy"); }
+        }).await;
+        assert!(handle.shutdown().await);
+        outcome.unwrap_or_else(|_| panic!("{prompt} did not reconcile to {expected:?}"));
+    }
+}
+
 #[tokio::test]
 async fn unavailable_context_does_not_fail_the_session() {
     for marker in ["unsupported-context", "unknown-context"] {

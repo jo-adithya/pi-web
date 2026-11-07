@@ -1,16 +1,37 @@
 import { readFileSync } from "node:fs";
 import { expect, it, vi } from "vitest";
+import fixtures from "./fixtures/artifact-images.json";
 
 function viewer() {
   const document = globalThis.document.implementation.createHTMLDocument();
-  const parent = {};
-  const events = { addEventListener: vi.fn(), removeEventListener: vi.fn() };
+  const parent = { postMessage: vi.fn() };
+  const events = { dispatchEvent: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn() };
   const html = readFileSync("../server/src/artifact-preview.html", "utf8");
   const script = html.match(/<script>([\s\S]*?)<\/script>/)![1];
   new Function("window", "document", "parent", script)(events, document, parent);
   const receive = events.addEventListener.mock.calls[0][1] as (event: { source: object; data: unknown }) => void;
-  return { document, send: (data: unknown, source = parent) => receive({ data, source }) };
+  return { document, send: (data: unknown, source: object = parent) => receive({ data, source }) };
 }
+
+it.each(["png", "jpeg"] as const)("materializes an accepted parent %s image as a local blob before insertion", type => {
+  const createObjectURL = vi.fn((_blob: Blob) => "blob:null/artifact-image");
+  vi.stubGlobal("URL", { createObjectURL });
+  try {
+    const { document, send } = viewer();
+    const html = `<img src="data:image/${type};base64,${fixtures[type]}" alt="Teal pixel">`;
+    send({ type: "pi-web-artifact", html }, {});
+    expect(createObjectURL).not.toHaveBeenCalled();
+    send({ type: "pi-web-artifact", html });
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    const blob = createObjectURL.mock.calls[0][0] as Blob;
+    expect(blob.type).toBe(`image/${type}`);
+    expect(blob.size).toBe(atob(fixtures[type]).length);
+    expect(document.querySelector("img")?.getAttribute("src")).toBe("blob:null/artifact-image");
+    expect(document.querySelector("img")?.getAttribute("alt")).toBe("Teal pixel");
+    send({ type: "pi-web-artifact", html });
+    expect(createObjectURL).toHaveBeenCalledOnce();
+  } finally { vi.unstubAllGlobals(); }
+});
 
 it("applies parent theme colors live without replacing an existing visual", () => {
   const { document, send } = viewer();
@@ -27,6 +48,17 @@ it("applies parent theme colors live without replacing an existing visual", () =
   expect(document.getElementById("visual")).toBe(visual);
   send({ type: "pi-web-artifact", html: "Replacement" });
   expect(document.getElementById("visual")).toBe(visual);
+});
+
+it("supplies radius as an opt-in token across themes", () => {
+  const { document, send } = viewer();
+  send({ type: "pi-web-artifact", html: '<div id="plain">Square by default</div>', theme: { dark: false, colors: { radius: "0.625rem" } } });
+  expect(document.documentElement.style.getPropertyValue("--radius")).toBe("0.625rem");
+  expect(document.getElementById("plain")?.style.borderRadius).toBe("");
+  send({ type: "pi-web-artifact-theme", dark: true, colors: { radius: "0.75rem" } });
+  expect(document.documentElement.style.getPropertyValue("--radius")).toBe("0.75rem");
+  send({ type: "pi-web-artifact-theme", dark: true, colors: { radius: "9rem" } }, {});
+  expect(document.documentElement.style.getPropertyValue("--radius")).toBe("0.75rem");
 });
 
 it("ignores foreign messages and invalid themes, and accepts only bounded palette entries", () => {

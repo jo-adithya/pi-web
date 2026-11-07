@@ -1,21 +1,22 @@
 import { TextField } from "@kobalte/core/text-field";
 import { SelectField } from "./components/SelectField";
 import { ProgressBar } from "./components/ProgressBar";
+import { ReviewLineTotals } from "./components/ReviewLineTotals";
 import { Button } from "@kobalte/core/button";
 import { DropdownMenu } from "@kobalte/core/dropdown-menu";
 import { Collapsible } from "@kobalte/core/collapsible";
 import { reviewLineKey } from "./review-history";
-import { formatReply } from "./reply-quote";
 import type { EvidenceCitation, ExplanationEvidence } from "./review-explanations";
 import type { ReviewQuestion } from "./local-review";
 import { createEffect, createMemo, createSignal, flush, For, onSettled, Show } from "solid-js";
 import { Checkbox } from "@kobalte/core/checkbox";
-import { hasPatch, reviewDraft, reviewScopeDraft, reviewQuestionPresets, reviewQuestionSkill, type ReviewScope } from "./local-review";
+import { hasPatch, type ReviewScope } from "./local-review";
 import { ReviewRows } from "./ReviewRows";
 import { ReviewOverview } from "./ReviewOverview";
 import { groupingUsageLabel } from "./review-costs";
 import { Icon } from "./components/Icon";
-import { ActionDialog } from "./components/ActionDialog";
+import { ActionDialog, dialogReturnFocus } from "./components/ActionDialog";
+import { AskSelectionDialog, type ReviewSelection } from "./components/AskSelectionDialog";
 import { highlightDiff, type HighlightedLine } from "./review-highlight";
 import type { ContextGap } from "./context-review";
 import type { SessionModel } from "./session-model";
@@ -28,7 +29,7 @@ const scopeHelp = {
   commit: "The selected commit against its first parent; root commits against an empty tree. Uncommitted edits are excluded.",
 };
 
-/** Read-only workspace snapshot browser. Ask Pi only appends to the session draft. */
+/** Read-only workspace snapshot browser with explicit questions about selected code. */
 export function LocalReview(props: { model: SessionModel; conversation: () => void }) {
   const review = props.model.review;
   const structural = review.structural, context = review.context;
@@ -40,8 +41,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   const [evidence, setEvidence] = createSignal<{ path: string; fingerprint: string; keys: Set<string>; headers: Set<string> }>();
   const [filesOpen, setFilesOpen] = createSignal(false);
   const [view, setView] = createSignal<"overview" | "files">("files");
-  const [questionsOpen, setQuestionsOpen] = createSignal(false);
-  const [questionScope, setQuestionScope] = createSignal<"all" | "file" | "selection">("file");
+  const [selectionQuestion, setSelectionQuestion] = createSignal<ReviewSelection>();
   const [commitQuery, setCommitQuery] = createSignal("");
   const matchingBranches = createMemo(() => {
     const query = review.branches.query().trim().toLowerCase();
@@ -101,11 +101,6 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
   const selectedLines = createMemo(() => {
     const value = selection();
     return value ? value.lines.slice(Math.min(value.anchor, value.end), Math.max(value.anchor, value.end) + 1).filter(line => line.kind !== "header") : [];
-  });
-  // A new line selection focuses questions on that excerpt; clearing it restores file scope.
-  createEffect(() => selectedLines(), lines => {
-    if (lines.length) setQuestionScope("selection");
-    else if (questionScope() === "selection") setQuestionScope("file");
   });
   const isSelected = (line: HighlightedLine) => {
     const value = selection(), index = lineIndices().get(line)!;
@@ -288,50 +283,13 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     const selected = loadedFile(), target = review.target();
     if (selected && target && !review.busy()) void context.expand(selected, target, id, direction);
   }
-  // Reply quotes precede the draft at submission, so they require a plain question rather than a skill command.
-  const questionCommands = () => props.model.quote() ? [] : props.model.state.commands;
-  function ask(onlySelection = false, question?: ReviewQuestion) {
+  function ask(onlySelection = false, question?: ReviewQuestion, returnFocus?: Element) {
     const selected = loadedFile(), target = review.target();
-    if (!selected || !target || (onlySelection && !selectedLines().length)) return;
-    try {
-      const draft = reviewDraft(props.model.draft(), selected, target, onlySelection ? selectedLines() : undefined, question, questionCommands());
-      if (new TextEncoder().encode(formatReply(draft, props.model.quote())).length > 32768) throw new Error("This patch, quote and your draft exceed the message limit. Select fewer lines or shorten your draft or quote.");
-      props.model.setDraft(draft); props.conversation();
-    }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Could not add review context."); }
-  }
-  /** Prepare a question for the complete snapshot, regardless of file filters or selection. */
-  function askOverall(question: ReviewQuestion) {
-    const snapshot = review.snapshot(), target = review.target();
-    if (!snapshot || !target || review.busy()) return;
-    try {
-      const draft = reviewScopeDraft(props.model.draft(), snapshot, target, question, questionCommands());
-      if (new TextEncoder().encode(formatReply(draft, props.model.quote())).length > 32768) throw new Error("This review context, quote and your draft exceed the message limit. Shorten your draft or quote.");
-      props.model.setDraft(draft); props.conversation();
-    }
-    catch (error) { setNotice(error instanceof Error ? error.message : "Could not add review context."); }
-  }
-  /** Question cards state their target and prepare editable drafts without sending messages. */
-  function QuestionPanel() {
-    return <section id={`review-questions-${props.model.id}`} class="review-questions" aria-label="Ask">
-      <div class="review-questions-heading"><strong><Icon name="chat" />Ask</strong><span class="review-question-scope">{questionScope() === "all" ? `${review.snapshot()?.files.length ?? 0} files · ${review.target()?.scope ?? ""} scope` : questionScope() === "selection" ? `${selectedLines().length} selected ${selectedLines().length === 1 ? "line" : "lines"} · ${file()?.path ?? ""}` : `Whole file · ${file()?.path ?? "No file selected"}`}</span></div>
-      <div class="review-question-scopes review-engines" role="group" aria-label="Question scope">
-        <Button type="button" aria-pressed={questionScope() === "all" ? "true" : "false"} onClick={() => setQuestionScope("all")}>All changes</Button>
-        <Button type="button" aria-pressed={questionScope() === "file" ? "true" : "false"} disabled={!loadedFile()} onClick={() => setQuestionScope("file")}>This file</Button>
-        <Button type="button" aria-pressed={questionScope() === "selection" ? "true" : "false"} disabled={!loadedFile() || !selectedLines().length} onClick={() => setQuestionScope("selection")}>Selected lines</Button>
-      </div>
-      <p class="review-question-intro">Choose a starting point. You can edit the question in chat before sending.</p>
-      <p class="review-question-context">{questionScope() === "all" ? "Includes the file list and comparison scope, not patches. Pi will inspect the diffs when you send." : questionScope() === "selection" ? "Only the selected lines will be included." : loadedFile() ? "The current file’s diff will be included. Select lines to ask a more focused question." : "Choose a file with an available diff, or ask about all changes."}</p>
-      <div class="review-question-buttons"><For each={reviewQuestionPresets}>{preset => {
-        const skill = () => reviewQuestionSkill(preset.question, questionCommands(), props.model.draft());
-        return <Button type="button" aria-label={preset.label} title={skill() ? `Use /${skill()} — prepares a review-only draft` : "Prepare a review-only question without adding a skill command"} disabled={review.busy() || (questionScope() !== "all" && !loadedFile()) || (questionScope() === "selection" && !selectedLines().length)} onClick={() => questionScope() === "all" ? askOverall(preset.question) : ask(questionScope() === "selection", preset.question)}><span class="review-question-label">{preset.label}<span aria-hidden="true">↗</span></span><span class="review-question-description">{preset.description}</span></Button>;
-      }}</For></div>
-      <p class="review-question-note">Nothing is sent automatically. Your existing draft is kept.</p>
-      <Show when={props.model.quote()}><p class="review-question-note">Your chat quote is kept; questions use plain prompts instead of skill commands.</p></Show>
-      <Show when={props.model.draft().trimStart().startsWith("/")}><p class="review-question-note">Your existing slash command will be kept; no skill command is added.</p></Show>
-    </section>;
+    if (!selected || !target || review.busy() || (onlySelection && !selectedLines().length)) return;
+    setSelectionQuestion({ file: selected, target, lines: onlySelection ? selectedLines() : undefined, question, returnFocus: returnFocus ?? dialogReturnFocus() ?? undefined });
   }
   return <section class="local-review" aria-label="Local changes" aria-busy={review.busy() ? "true" : "false"}>
+    <Show when={selectionQuestion()} keyed>{selection => <AskSelectionDialog selection={selection} model={props.model} close={() => setSelectionQuestion(undefined)} conversation={props.conversation} />}</Show>
     <form class="review-toolbar" onSubmit={event => { event.preventDefault(); setNotice(""); void review.refresh(); }}>
       <div class="review-scopes" role="group" aria-label="Change scope">
         <For each={[["unstaged", "Unstaged"], ["staged", "Staged"], ["branch", "Branch"], ["commit", "Commit"]] as const}>{([scope, label]) =>
@@ -379,10 +337,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     <Show when={review.snapshot()}>{snapshot => <>
       <div class="review-summary" role="status">
         <span class="review-progress"><Show when={snapshot().files.length}><ProgressBar label="Review progress" max={snapshot().files.length} value={snapshot().files.filter(review.isReviewed).length} /></Show><span>{snapshot().files.filter(review.isReviewed).length} / {snapshot().files.length} files reviewed</span></span>
-        <Show when={snapshot().lineStats} fallback={<span>Line totals unavailable</span>}>{stats => <span class="review-line-stats" role="group" aria-label="Line changes" title="Totals for this scope, including files omitted by display limits. Refresh after edits.">
-          <span class="review-added">+{stats().added.toLocaleString()} added</span>
-          <span class="review-removed">−{stats().removed.toLocaleString()} deleted</span>
-        </span>}</Show>
+        <Show when={snapshot().lineStats} fallback={<span>Line totals unavailable</span>}>{stats => <ReviewLineTotals stats={stats()} />}</Show>
       </div>
       <Show when={snapshot().truncated}><p class="review-warning">{snapshot().note ?? "Some changes were omitted by review limits."}</p></Show>
       <Show when={snapshot().files.length} fallback={<p class="review-empty">No changes in this scope.</p>}>
@@ -392,11 +347,9 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
             <Button type="button" aria-pressed={view() === "files" ? "true" : "false"} onClick={() => setView("files")}><Icon name="folder" />Files</Button>
           </div>
           <div class="review-view-actions">
-            <Button type="button" class="review-icon-action" aria-expanded={questionsOpen() ? "true" : "false"} aria-controls={`review-questions-${props.model.id}`} onClick={() => { if (!questionsOpen() && view() === "overview" && questionScope() === "file") setQuestionScope("all"); setQuestionsOpen(!questionsOpen()); }}><Icon name="chat" />Ask<Icon name="chevronDown" /></Button>
             <Button class="review-group-action" type="button" disabled={review.busy() || review.grouping.busy()} onClick={() => void review.groupWithAI()}>{review.grouping.busy() ? "Grouping…" : review.grouping.stale() ? "Update groups with AI" : review.grouping.value() ? "Check saved groups" : "Group with AI"}</Button>
           </div>
         </div>
-        <Show when={questionsOpen()}><QuestionPanel /></Show>
         <Show when={review.grouping.value() || review.grouping.busy() || review.grouping.usage().calls || review.grouping.usage().reused || review.grouping.progress() || review.grouping.notice()}>
         <section class="review-organize" aria-label="Organize changed files">
           <div class="review-organize-heading">
@@ -440,7 +393,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
                 </div>
                 <Button class="review-files-toggle review-icon-action" type="button" aria-expanded={filesOpen() ? "true" : "false"} aria-controls={`review-files-${props.model.id}`} aria-haspopup="dialog" title={`Choose file (${snapshot().files.length} changed)`} onClick={() => setFilesOpen(true)}><Icon name="folder" /><span class="review-action-label">Files ({snapshot().files.length})</span></Button>
                 <Button class="review-icon-action" type="button" title="Next unreviewed" aria-label="Next unreviewed" disabled={!nextUnreviewed()} onClick={() => { const next = nextUnreviewed(); if (next) { setFilter(""); select(next.path); } }}><Icon name="next" /><span class="review-action-label">Next</span></Button>
-                <Button class="review-ask review-icon-action" type="button" disabled={!loadedFile() || review.busy()} aria-label="Ask Pi about file" title="Ask Pi about file — add this diff to your draft. Nothing is sent automatically." onClick={() => ask()}><Icon name="chat" /><span class="review-action-label">Ask Pi</span></Button>
+                <Button class="review-ask review-icon-action" type="button" disabled={!loadedFile() || review.busy()} aria-label="Ask Pi about file" title="Ask Pi about file — write a question before sending. Your draft stays separate." onClick={() => ask()}><Icon name="chat" /><span class="review-action-label">Ask Pi</span></Button>
               </div>
             </header>
             <Show when={loadedFile() && review.historyReview.status(selected()) === "changed"}><section class="review-since" aria-label="Changes since last review">
@@ -473,7 +426,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
                   </Button>
                 </Show><code><Show when={row.line.tokens} fallback={(row.line.kind === "header" ? row.line.text : row.line.text.slice(1)) || " "}>{tokens => <For each={tokens()} fallback={" "}>{token => <span class={token.className}>{token.text}</span>}</For>}</Show></code>
                 <Show when={floatingLine() === row.line}><div class="review-floating-actions" role="group" aria-label="Selected lines actions">
-                  <Button class="review-floating-ask" type="button" aria-label="Ask Pi about selected lines" title="Add selected lines to your draft." onClick={() => ask(true)}><Icon name="reply" />Ask Pi <span aria-hidden="true">· {selectedLines().length} {selectedLines().length === 1 ? "line" : "lines"}</span></Button>
+                  <Button class="review-floating-ask" type="button" aria-label="Ask Pi about selected lines" title="Ask a question about these lines" onClick={event => ask(true, undefined, event.currentTarget)}><Icon name="reply" />Ask Pi <span aria-hidden="true">· {selectedLines().length} {selectedLines().length === 1 ? "line" : "lines"}</span></Button>
                   <DropdownMenu placement="bottom-end" modal={false}><DropdownMenu.Trigger aria-label="Focused questions" title="Prepare a question about these lines; nothing is sent">Questions</DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content class="session-menu review-question-menu">
                     <For each={[["explain", "Explain this"], ["risks", "What could break?"], ["edges", "Check edge cases"], ["compare", "Compare with existing code"]] as const}>{([question, label]) => <DropdownMenu.Item onSelect={() => ask(true, question)}>{label}</DropdownMenu.Item>}</For>
                   </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu>

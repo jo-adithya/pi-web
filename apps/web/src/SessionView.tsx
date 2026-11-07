@@ -10,6 +10,7 @@ import { CodexUsageFooter } from "./components/CodexUsageFooter";
 import { BackgroundTasks } from "./components/BackgroundTasks";
 import { DismissibleAlert } from "./components/DismissibleAlert";
 import { AgentControls } from "./components/AgentControls";
+import { Toast } from "./components/Toast";
 
 /** Only the selected conversation mounts its transcript and modal dialogs. */
 export function SessionView(props: { model: SessionModel }) {
@@ -77,6 +78,7 @@ export function SessionView(props: { model: SessionModel }) {
     };
   });
   return <>
+    <Toast message={visibleNotice()} dismiss={dismissNotice} />
     <Show when={confirmation()} keyed>{target => <ConfirmationDialog title={target.kind === "terminate" ? "Terminate Pi" : "Restart Pi"} description={target.kind === "terminate" ? "Terminate Pi? This cannot undo file edits and may lose unpersisted output." : "Restart Pi from the persisted session? Partial output may be lost."} action={target.kind === "terminate" ? "Terminate Pi" : "Restart Pi"} disabled={!eligible()} close={() => setConfirmation(null)} confirm={() => {
       if (!eligible()) return;
       send({ type: target.kind, confirmed: true }); setConfirmation(null);
@@ -89,7 +91,7 @@ export function SessionView(props: { model: SessionModel }) {
               <Show when={state.older}><p class="history-marker">Earlier history is not displayed. Pi still owns the full session.</p></Show>
               <DismissibleAlert class="warning" message={state.status.historyWarning} />
               <Show when={!state.order.length}><div class="empty conversation-empty"><span class="empty-mark">π</span><h2>What are we working on?</h2><p>Explore your code, work through an idea, or build something new.</p></div></Show>
-              <MessageList state={state} mobileReplyTarget={replyTarget()} loadImage={model.loadImage} onReply={quote => {
+              <MessageList state={state} reviewCards={model.reviewCards.cards()} loadReviewPreview={model.loadReviewPreview} mobileReplyTarget={replyTarget()} loadImage={model.loadImage} onReply={quote => {
                 if (!model.quoteReply(quote)) return;
                 window.getSelection()?.removeAllRanges(); flush();
                 composer.querySelector("textarea")?.focus();
@@ -109,7 +111,6 @@ export function SessionView(props: { model: SessionModel }) {
             </div></Show>
           </div>
           <DismissibleAlert class="warning" role="alert" message={state.status.error} />
-          <Show when={visibleNotice()}><div class="notice"><p role="status">{visibleNotice()}</p><Button class="icon-button" aria-label="Dismiss notice" title="Dismiss notice" onClick={dismissNotice}><Icon name="close" /></Button></div></Show>
           <Show when={state.status.cancelUnconfirmed}><Button class="danger" onClick={() => { setConfirmation({ kind: "terminate", epoch: state.epoch }); }}>Terminate process…</Button></Show>
           <Show when={state.status.process === "exited" || state.status.process === "failed"}><Button onClick={() => { setConfirmation({ kind: "restart", epoch: state.epoch }); }}>Restart Pi…</Button></Show>
           <Show when={model.attachments().length > 0}>

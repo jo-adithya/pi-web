@@ -5,6 +5,8 @@ import { LocalReview } from "../src/LocalReview";
 import { createSessionModel } from "../src/session-model";
 import { createCommitHistory, fetchCommits } from "../src/commit-review";
 import { createLocalReview } from "../src/local-review";
+import { initialState } from "../src/client-state";
+import type { BrowserMessage } from "../src/generated/protocol";
 
 const latest = "a".repeat(40), older = "b".repeat(40);
 const history = { commits: [{ id: latest, subject: "Latest change" }, { id: older, subject: "<script>Older change</script>" }], truncated: false };
@@ -17,10 +19,10 @@ const snapshot = { files: [{ path: "main.ts", previousPath: null, status: "modif
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-it("loads commits only on demand and pins selection and unsent review context to a full commit ID", async () => {
+it("loads commits only on demand and pins selection and submitted review context to a full commit ID", async () => {
   const request = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/commits") ? history : snapshot)));
   vi.stubGlobal("fetch", request);
-  const transport = vi.fn(() => true);
+  const transport = vi.fn((_message: BrowserMessage) => true);
   const model = createSessionModel("s", transport, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await page.findByRole("article", { name: "Diff for main.ts" });
@@ -36,8 +38,16 @@ it("loads commits only on demand and pins selection and unsent review context to
   await waitFor(() => { flush(); expect(model.review.target()).toEqual({ scope: "commit", commit: older }); });
   expect(page.container.querySelector("script")).toBeNull();
   fireEvent.click(await page.findByRole("button", { name: "Ask Pi about file" })); flush();
-  expect(model.draft()).toContain(older); expect(model.draft()).toContain("first parent");
   expect(transport).not.toHaveBeenCalled();
+  model.receive({ v: 1, sessionId: "s", epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
+  model.receive({ v: 1, sessionId: "s", epoch: "e", body: { type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } } }); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Explain change" })); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Send to Pi" })); flush();
+  const action = transport.mock.calls[0][0].action;
+  expect(action.type).toBe("prompt");
+  if (action.type !== "prompt") throw new Error("Expected prompt");
+  expect(action.text).toContain(older); expect(action.text).toContain("first parent");
+  expect(model.draft()).toBe("");
 });
 
 it("filters commits by message or hash while keeping the reviewed commit pinned", async () => {

@@ -29,7 +29,17 @@ html:has(.review-workspace) { scroll-behavior: smooth; }
 .review-help { margin: .55rem 0 .75rem; }
 .review-help span { white-space: nowrap; }
 .review-summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem; padding: .5rem 0; border-bottom: 1px solid var(--border); }
-.review-line-stats { display: inline-flex; flex-wrap: wrap; gap: .25rem .6rem; font-variant-numeric: tabular-nums; }
+.review-line-stats { display: inline-flex; align-items: center; flex-wrap: wrap; gap: .25rem .6rem; font-variant-numeric: tabular-nums; }
+.review-totals-info { width: 1.6rem; height: 1.6rem; padding: .25rem; border-color: transparent; border-radius: .3rem; background: transparent; color: var(--muted-foreground); }
+.review-totals-info > .icon { width: .9rem; height: .9rem; }
+.review-totals-tooltip { z-index: 60; max-width: min(20rem, calc(100vw - 2rem)); padding: .7rem .85rem; border: 1px solid var(--border); border-radius: .5rem; background: var(--popover); color: var(--popover-foreground); box-shadow: var(--shadow-popover); font-size: .8rem; line-height: 1.5; }
+.review-totals-tooltip table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.review-totals-tooltip caption { text-align: left; font-weight: 600; margin-bottom: .4rem; }
+.review-totals-tooltip th, .review-totals-tooltip td { padding: .2rem .4rem; text-align: right; }
+.review-totals-tooltip th:first-child { text-align: left; padding-left: 0; }
+.review-totals-tooltip thead th { color: var(--muted-foreground); font-size: .7rem; font-weight: 500; border-bottom: 1px solid var(--border); }
+.review-totals-tooltip td:last-child { font-weight: 600; }
+.review-totals-tooltip p { margin: .5rem 0 0; color: var(--muted-foreground); }
 .review-warning { padding: .65rem .75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--secondary); font-size: .8rem; overflow-wrap: anywhere; }
 .review-view-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .5rem; padding: .5rem 0; }
 .review-view-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: .4rem; margin-left: auto; }
@@ -66,21 +76,17 @@ html:has(.review-workspace) { scroll-behavior: smooth; }
 .diff-since-review code { text-decoration: underline dotted var(--ring); text-underline-offset: .25em; }
 .diff-evidence { outline: 2px solid var(--ring); outline-offset: -2px; scroll-margin-top: 8rem; }
 .review-question-menu { max-width: calc(100vw - 1rem); }
-.review-questions { padding: .85rem; border-bottom: 1px solid var(--border); background: var(--card); }
-.local-review > .review-questions { border-bottom: 0; }
-.review-questions-heading { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .65rem; font-size: .8rem; }
-.review-questions-heading strong { display: inline-flex; align-items: center; gap: .4rem; font-weight: 500; }
-.review-question-scopes { margin-top: .65rem; flex-wrap: wrap; }
-.review-question-scope { overflow-wrap: anywhere; min-width: 0; border: 1px solid var(--border); border-radius: 1rem; padding: .1rem .45rem; color: var(--muted-foreground); font-size: .68rem; }
-.review-question-intro { margin: .45rem 0 .2rem; font-size: .75rem; line-height: 1.5; }
-.review-question-context, .review-question-note { margin: .2rem 0 0; font-size: .7rem; line-height: 1.5; color: var(--muted-foreground); }
-.review-question-buttons { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: .4rem; margin: .65rem 0 .5rem; }
-.local-review .review-question-buttons button { display: flex; flex-direction: column; align-items: stretch; justify-content: center; gap: .15rem; padding: .55rem .65rem; text-align: left; background: transparent; border: 1px solid var(--border); }
-.review-question-buttons button:hover:not(:disabled) { background: var(--accent); border-color: var(--ring); }
-.review-question-buttons button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-.review-question-label { display: flex; justify-content: space-between; align-items: center; gap: .5rem; font-size: .75rem; }
-.review-question-label > span { color: var(--muted-foreground); }
-.review-question-description { font-size: .68rem; line-height: 1.4; color: var(--muted-foreground); }
+.action-dialog.review-selection-dialog { width: min(40rem, calc(100vw - 2rem)); padding: 1.25rem; }
+.review-selection-dialog > .preserve { font-size: .85rem; line-height: 1.5; color: var(--muted-foreground); }
+.review-selection-dialog .dialog-actions { position: sticky; bottom: -1.25rem; padding: .8rem 0; background: var(--popover); }
+.review-selection-context { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .5rem; font-size: .8rem; margin-top: 1rem; }
+.review-selection-context strong { min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
+.review-selection-context span { color: var(--muted-foreground); margin-left: auto; }
+.review-selection-preview > .chat-review-code { max-height: 9rem; }
+.review-selection-dialog label { display: block; font-size: .85rem; margin: 1rem 0 .4rem; }
+.review-selection-dialog textarea { min-height: 6rem; max-height: 35dvh; font-size: .9rem; }
+.review-selection-suggestions { display: flex; flex-wrap: wrap; gap: .35rem; margin: .6rem 0 1rem; }
+.review-selection-suggestions button { padding: .3rem .55rem; border-radius: .4rem; background: transparent; color: var(--muted-foreground); font-size: .75rem; }
 .review-overview-all { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: .75rem; font-size: .8rem; }
 .review-overview-all > button { cursor: pointer; }
 .review-overview-all > button::before { content: "▸"; margin-right: .35rem; }

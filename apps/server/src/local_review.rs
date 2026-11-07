@@ -56,12 +56,17 @@ struct ParsedLineStats {
     files: std::collections::HashMap<Vec<u8>, FileLineStats>,
 }
 /// Scope-wide Git line counts, independent of the bounded file list and lazy patches.
+/// Added and removed totals exclude conventional test/generated paths, lockfiles, and .md files.
 /// Binary and untracked files contribute to unavailable_files instead of line counts.
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LineStats {
     added: u64,
+    /// Unfiltered additions across all paths.
+    total_added: u64,
     removed: u64,
+    /// Unfiltered deletions across all paths.
+    total_removed: u64,
     unavailable_files: usize,
 }
 #[derive(Serialize)]
@@ -377,7 +382,31 @@ fn paginate(review: &mut Review, offset: usize, snapshot: u64) -> Result<(), &'s
     Ok(())
 }
 
-/// Totals NUL-delimited numstat records and indexes text counts by destination path.
+/// Recognizes test/generated paths, lockfiles, and .md files without reading contents.
+fn excluded_from_line_totals(path: &[u8]) -> bool {
+    let path = path.to_ascii_lowercase();
+    let components: Vec<_> = path.split(|b| *b == b'/').collect();
+    if components.iter().any(|part| matches!(*part,
+        b"test" | b"tests" | b"__tests__" | b"spec" | b"specs" | b"e2e" |
+        b"generated" | b"__generated__"
+    )) {
+        return true;
+    }
+    let name = components.last().copied().unwrap_or_default();
+    let parts: Vec<_> = name.split(|b| matches!(b, b'.' | b'_' | b'-')).collect();
+    let test_name = parts.iter().enumerate().any(|(index, part)| {
+        index > 0 && index + 1 < parts.len()
+            && matches!(*part, b"test" | b"tests" | b"spec" | b"specs")
+    });
+    name.ends_with(b".md") || name.starts_with(b"test_") || test_name
+        || name.windows(b".generated.".len()).any(|part| part == b".generated.")
+        || name.ends_with(b".lock") || name.ends_with(b".lockb")
+        || matches!(name, b"package-lock.json" | b"npm-shrinkwrap.json" | b"pnpm-lock.yaml")
+        || [b".g.ts".as_slice(), b".g.dart", b".pb.go", b".min.js", b".min.css", b".map"]
+            .iter().any(|suffix| name.ends_with(suffix))
+}
+
+/// Totals NUL-delimited numstat records and indexes unfiltered text counts by destination path.
 /// Paths stay opaque bytes so tabs, newlines and non-UTF-8 names cannot alter counts.
 fn parse_line_stats(bytes: &[u8]) -> Result<ParsedLineStats, &'static str> {
     let mut result = ParsedLineStats::default();
@@ -407,12 +436,20 @@ fn parse_line_stats(bytes: &[u8]) -> Result<ParsedLineStats, &'static str> {
             let added = count(added)?;
             let removed = count(removed)?;
             result.files.insert(path.to_vec(), FileLineStats { added, removed });
-            result.totals.added = result.totals.added
+            result.totals.total_added = result.totals.total_added
                 .checked_add(added)
                 .ok_or("Git line counts exceed limit")?;
-            result.totals.removed = result.totals.removed
+            result.totals.total_removed = result.totals.total_removed
                 .checked_add(removed)
                 .ok_or("Git line counts exceed limit")?;
+            if !excluded_from_line_totals(path) {
+                result.totals.added = result.totals.added
+                    .checked_add(added)
+                    .ok_or("Git line counts exceed limit")?;
+                result.totals.removed = result.totals.removed
+                    .checked_add(removed)
+                    .ok_or("Git line counts exceed limit")?;
+            }
         }
     }
     Ok(result)
@@ -774,6 +811,46 @@ mod tests {
         assert!(parse_line_stats(b"1\t2\t\0old\0").is_err());
         assert!(parse_line_stats(b"-\t2\tfile\0").is_err());
         assert!(parse_line_stats(b"18446744073709551615\t0\ta\x001\t0\tb\0").is_err());
+    }
+
+    #[test]
+    fn line_totals_exclude_test_and_generated_paths_but_keep_file_counts() {
+        let excluded = [
+            "apps/web/test/view.tsx", "src/__tests__/view.ts", "tests/fixture.json",
+            "spec/api.rb", "e2e/login.ts", "src/view.test.tsx", "src/view.spec.ts",
+            "src/test_parser.py", "src/parser_test.go", "src/metadata_tests.rs",
+            "src/generated/protocol.ts", "src/__generated__/api.ts", "api.generated.ts",
+            "api.g.ts", "api.pb.go", "bundle.min.js", "bundle.js.map",
+            "Cargo.lock", "bun.lock", "package-lock.json", "pnpm-lock.yaml",
+        ];
+        let mut records = b"3\t2\tsrc/main.rs\0".to_vec();
+        for path in excluded {
+            records.extend_from_slice(format!("10\t1\t{path}\0").as_bytes());
+        }
+        // Renames use their destination, and opaque bytes still count as source.
+        records.extend_from_slice(b"7\t0\t\0old.ts\0src/generated/new.ts\0");
+        records.extend_from_slice(b"2\t0\t\xff\0");
+        let parsed = parse_line_stats(&records).unwrap();
+        assert_eq!(parsed.totals.added, 5);
+        assert_eq!(serde_json::to_value(&parsed.totals).unwrap()["totalAdded"], 222);
+        assert_eq!(parsed.totals.removed, 2);
+        assert_eq!(serde_json::to_value(&parsed.totals).unwrap()["totalRemoved"], 2 + excluded.len() as u64);
+        for path in excluded {
+            assert_eq!(parsed.files[path.as_bytes()].added, 10);
+            assert_eq!(parsed.files[path.as_bytes()].removed, 1);
+        }
+        assert_eq!(parsed.files[b"src/generated/new.ts".as_slice()].added, 7);
+        let source = parse_line_stats(b"4\t0\tsrc/testimonial.ts\x005\t0\tsrc/generated-helper.ts\0").unwrap();
+        assert_eq!(source.totals.added, 9);
+    }
+
+    #[test]
+    fn markdown_is_excluded_from_shown_totals_only() {
+        let parsed = parse_line_stats(b"10\t4\tREADME.md\x002\t3\tdocs/Guide.MD\x005\t1\tsrc/md/parser.ts\x007\t2\tdocs/page.mdx\0").unwrap();
+        assert_eq!((parsed.totals.added, parsed.totals.removed), (12, 3));
+        assert_eq!((parsed.totals.total_added, parsed.totals.total_removed), (24, 10));
+        assert_eq!((parsed.files[b"README.md".as_slice()].added, parsed.files[b"README.md".as_slice()].removed), (10, 4));
+        assert_eq!((parsed.files[b"docs/Guide.MD".as_slice()].added, parsed.files[b"docs/Guide.MD".as_slice()].removed), (2, 3));
     }
 
     #[test]

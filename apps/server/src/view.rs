@@ -159,7 +159,7 @@ pub enum ViewPatch {
 }
 
 /// Pure event reducer. It retains previews, never RPC envelopes or cumulative
-/// provider snapshots. Completion changes activity only at `agent_settled`.
+/// provider snapshots. Run completion becomes idle only at `agent_settled`.
 pub struct ViewState {
     messages: VecDeque<(DisplayMessage, usize)>,
     // Raw Pi content indices map to compact visible block indices.
@@ -235,12 +235,23 @@ impl ViewState {
     pub fn apply(&mut self, event: &Value) -> Vec<ViewPatch> {
         let mut patches = Vec::new();
         match event["type"].as_str() {
-            Some("agent_start") => self.set_activity(Activity::Running, &mut patches),
+            Some("agent_start" | "turn_start") => self.set_activity(Activity::Running, &mut patches),
             Some("auto_retry_start" | "summarization_retry_scheduled") => {
                 self.set_activity(Activity::Retrying, &mut patches)
             }
             Some("compaction_start" | "summarization_retry_attempt_start") => {
                 self.set_activity(Activity::Compacting, &mut patches)
+            }
+            Some("compaction_end")
+                if matches!(self.activity, Activity::Compacting | Activity::Retrying) =>
+            {
+                // Completion ends the compaction phase, not necessarily the session run.
+                let activity = if event["willRetry"] == true {
+                    Activity::Running
+                } else {
+                    Activity::Reconciling
+                };
+                self.set_activity(activity, &mut patches);
             }
             Some("agent_settled") => {
                 self.current.clear();

@@ -184,8 +184,8 @@ a Git working tree (including a Git-colocated jj repository).
   patches stay plain. Colors use each hunk’s available context, not the entire file.
 - In **Text** mode, **Expand above / below** reveals up to 20 unchanged lines per
   click before, between, or after hunks. Expanded lines retain numbering, wrapping,
-  and the same highlighting limits. They do not change Reviewed marks or the patch
-  sent to your draft. Expansion is on demand and checks the original file fingerprint;
+  and the same highlighting limits. They do not change Reviewed marks or whole-file
+  references sent to your draft. Expansion is on demand and checks the original file fingerprint;
   if the file changed, refresh first. Refresh or selecting another file clears it.
   Verified expanded diffs are cached in server memory (up to 4 entries / 4 MiB).
   Every hit still checks fresh membership and the original/final file fingerprints;
@@ -239,17 +239,15 @@ a Git working tree (including a Git-colocated jj repository).
   fingerprint is checked—even if the whole-snapshot identity repeats, because metadata
   and patch captures are not atomic.
 - Selected diff lines offer **Explain this**, **What could break?**, **Check edge cases**,
-  and **Compare with existing code**. Each action adds a focused question and the selected
-  excerpt to the existing unsent chat draft. Nothing is sent automatically.
-- **Ask about this change** provides visible shortcuts for explanations, regressions,
-  edge cases, security, simplification, and comparing patterns. They use selected
-  lines when present, otherwise the current file. A **skill** badge means a matching
-  review skill is advertised by this conversation; its `/skill:name` command is
-  placed before the preserved draft. Without a match, the shortcut uses a plain
-  review question. Pending chat quotes are preserved and use plain questions, since
-  quoted text precedes the draft when sent. Existing leading slash commands are kept,
-  never replaced or nested. These prompts request review-only work; they do not restrict
-  the chat agent's tools. Quotes, context and commands count toward the 32 KiB message limit.
+  and **Compare with existing code**. Each action opens a focused question dialog with a local code preview.
+  Nothing is sent until you explicitly choose **Send to Pi**.
+- **Ask Pi** remains available on individual files and selected lines; the top-level
+  Ask dropdown is removed. It sends the user’s request and file/line references
+  without adding review-only or read-only instructions.
+  It never auto-attaches review skills; an explicitly chosen focused question still
+  asks that question. Pending chat quotes and existing leading slash commands stay
+  intact. Pi can make changes when requested, subject to its normal permissions.
+  Quotes, context and commands count toward the 32 KiB message limit.
 - **Group with AI** is optional; folder grouping remains the default. Clicking it
   sends the displayed file names and bounded diff snippets to the conversation’s
   current Pi provider/model by default. Open **Settings → AI review** from the
@@ -309,16 +307,28 @@ a Git working tree (including a Git-colocated jj repository).
   The server admits one inference at a time with a 60-second deadline plus supervised
   cleanup; the browser limits each inference unit, including its requested captures, to 90 seconds. Cancel
   stops further captures and inference calls; failed/cancelled runs leave folders available.
-- **Ask Pi** appends the selected file’s patch and scope to your existing draft and
+- **Ask Pi** appends the selected file’s path, changed-line ranges and scope to your existing draft and
   returns to Conversation. It never sends automatically. Oversized context is
   rejected without changing the draft; reopen stopped conversations before sending.
   In Text mode, drag across line numbers to select a range, or select a line then
   Shift-click another. **Choose end line** lets touch and keyboard users choose
   the end of a range. A floating **Ask Pi** action appears beside the range endpoint
   when selection finishes; × or Escape dismisses it without clearing the range.
-  It and **Ask Pi about selection** include only those source rows, with old/new
-  line numbers. Selection clears when the file, scope, snapshot, expanded context
-  or diff mode changes; code text remains selectable for copying.
+  It and **Ask Pi about selection** open a focused question dialog with a preview
+  of those source rows and their old/new line numbers. Write a question or choose
+  a suggestion, then explicitly **Send to Pi** to open the answer in Conversation.
+  Only the question, filename, old/new line references and comparison metadata are sent; existing chat drafts, quotes,
+  and attachments stay untouched. Failed or uncertain delivery preserves the
+  question in the draft for manual recovery. Selection clears when the file, scope,
+  snapshot, expanded context or diff mode changes; code text remains selectable for copying.
+  Review questions render in chat with expandable, syntax-highlighted diff cards.
+  Captured code is browser-only and is never added to the generated prompt; Pi reads
+  the files or scoped diffs itself. References can become stale after edits.
+  All-changes cards list the files; uncaptured files offer **Load current diff**,
+  explicitly labeled as current rather than the original snapshot. Preview reads
+  do not send messages to Pi. Up to 16 cards / 1 MiB per conversation survive reload
+  in this tab’s session storage. Other tabs, expired previews and edited references
+  fall back to the plain references; no code snapshots are stored in Pi’s history.
 - Snapshots are best-effort, not live or atomic: refresh after edits, and coordinate
   concurrent agents. Limits are 100 listed files per page, 64 KiB per selected patch, 1 MiB per JSON response,
   and a ten-second deadline per list or patch request. Omitted content is explicitly marked; binary diffs show
@@ -478,10 +488,20 @@ The skill documents an explicit, top-level `html preview` fence:
 ```
 ````
 
-Completed, untruncated assistant replies render these blocks as static HTML/CSS/inline
-SVG previews, with **Preview**, **Source**, and **Expand** controls. Streaming, user
+Completed, untruncated assistant replies render these blocks as interactive HTML/CSS/inline
+SVG previews inline in the message (including bounded embedded PNG/JPEG images), with **Preview**,
+**Source**, **Collapse**/**Show**, and **Expand** controls in a compact overlay (shown on
+hover or keyboard focus, always available on touch). Inline previews fit their content
+between 80 and 20000 CSS pixels; taller visuals scroll inside the viewer. Full-screen
+previews fill the dialog. Off-screen placeholders retain the last measured height. Collapse releases the viewer;
+Preview or Source reopens the inline content. Full-screen access preserves the inline collapsed state. Streaming, user
 messages, unclosed/nested fences and ordinary `html` fences remain escaped text/code.
 The existing 64 KiB message limit applies; large visuals should be simplified.
+Keep markup compact, reuse CSS classes, and prefer HTML/SVG over base64 images.
+Detailed composition, palette and image guidance is optional and loaded only when needed.
+Viewers run near the viewport or in full-screen, with one shared theme observer.
+Off-screen viewers are released and reconstructed on return, resetting their internal
+scroll position, control values, script state and open `<details>` state; Source/Preview selection is preserved.
 
 Previews follow Pi Web's resolved light/dark theme, including live changes and
 full-screen views. Use inherited CSS variables (`--background`, `--foreground`,
@@ -491,14 +511,66 @@ full-screen views. Use inherited CSS variables (`--background`, `--foreground`,
 The root `.dark` class and `color-scheme` are synchronized too. Explicit colors in
 older artifacts are preserved rather than automatically inverted.
 
-Each preview uses an opaque-origin sandbox and a separate CSP. Only a fixed,
-hash-authorized message receiver runs; generated scripts, handlers, forms,
-navigation, embedded pages and resource/network requests are disabled. The receiver
-accepts sanitized markup only from its parent; no capability is sent to the frame.
-Artifact CSS stays inside the frame, while the main application's script/style CSP
-remains strict. External fonts, images, JavaScript libraries and interactive apps
-are not supported. The data-free `/artifact-preview` document stores no artifacts;
-visuals are reconstructed from retained message text.
+Each preview uses an opaque-origin sandbox (never `allow-same-origin`) and a
+separate CSP. Classic inline scripts run after the initial theme is applied; use
+`addEventListener`, since `on*` attributes are removed. Canvas, buttons, inputs,
+select/option, labels, textareas and outputs are supported with safe attributes
+and `data-*`. Scripts run once per viewer document, not on theme changes. Listen
+for `window`'s `pi-web-theme-change` event to redraw canvas using computed tokens.
+
+Built-in outline icons need no imports: `<span data-icon="check"> Verified</span>`.
+Use purposeful icons paired with labels rather than clutter. Supported names are
+`arrow-right`, `arrow-left`, `check`, `x`, `info`, `warning`, `code`, `search`,
+`settings`, `file`, `folder`, `clock`, `plus`, and `minus`. Only span markers expand,
+on initial render before artifact scripts run (no mutation observer); unknown
+names leave content unchanged. The original 24×24 SVGs inherit text color and
+font size (`currentColor`, `1em`) and are decorative (`aria-hidden="true"`).
+Wrapper text, classes, styles and `aria-label` are preserved; use visible labels
+or `role="img"` with an `aria-label` on an icon-only wrapper.
+
+For bundled Chart.js 4.6.1, request its explicit marker; the library is loaded
+lazily as text and executes only inside the frame, before artifact scripts:
+
+````markdown
+```html preview
+<script data-library="chart.js"></script>
+<canvas id="chart"></canvas>
+<script>
+const chart = new Chart(document.querySelector('#chart'), {
+  type: 'bar', data: { labels: ['Before', 'After'], datasets: [{ label: 'Steps', data: [8, 3] }] }
+});
+window.addEventListener('pi-web-theme-change', () => chart.update());
+</script>
+```
+````
+
+Remote scripts, modules, eval, connections, nested frames, form submission,
+popups and top navigation are blocked. Supplied markup retains static sanitation
+and bounded embedded-image protections; inline handlers and URL attributes are
+removed. External fonts/styles/images are unsupported. This is not an absolute
+no-network guarantee: scripts can navigate their own frame. There is no CPU quota;
+untrusted scripts can stall the browser. The parent accepts no artifact commands
+and sends content only once to the initial viewer document. No capability is sent
+to the frame. The main application's CSP stays restrictive. The data-free
+`/artifact-preview` document stores no artifacts; visuals are reconstructed from
+retained message text.
+
+For a small embedded image, use `<img src="data:image/png;base64,..."
+alt="Description">` (or `image/jpeg`) inside the HTML preview. Model-generated bytes
+receive the same checks as any other source; this does not generate images,
+automatically import attachments, or resolve file paths/URLs. The sanitizer checks
+canonical base64, PNG/JPEG container headers and dimensions before the browser's
+final raster decoding. It excludes SVG data images, other formats, animated PNG,
+remote URLs and `srcset`. Ordinary Markdown images remain disabled.
+
+Per preview, the image budget is eight images, 32 KiB of decoded image bytes and
+2,097,152 pixels total. Each image is limited to 32 KiB, 2048 pixels per edge and
+1,048,576 pixels. Invalid or over-budget images are omitted. Base64 overhead counts
+toward the existing 64 KiB message limit, so full-size generated artwork usually
+will not fit. The fixed receiver converts accepted bytes into local blob URLs
+inside the sandbox; its image CSP permits only blobs, not network or CSS data
+images. Object URLs live for that viewer document and are released when it unloads.
+Image colors are preserved; the theme does not automatically recolor raster content.
 
 ## Optional phone push
 

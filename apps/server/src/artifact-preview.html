@@ -2,32 +2,132 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HTML artifact preview</title>
-<style>html { color-scheme: light; background: var(--background, white); color: var(--foreground, #17202a); font: 14px system-ui, sans-serif; } body { margin: 0; padding: 16px; overflow-wrap: anywhere; } svg { max-width: 100%; }</style>
+<style>html { color-scheme: light; background: var(--background, white); color: var(--foreground, #17202a); font: 14px system-ui, sans-serif; } body { margin: 0; padding: 16px; overflow-wrap: anywhere; } svg, img { max-width: 100%; } img { height: auto; }
+:where(.pw-stack) { display: flex; flex-direction: column; }
+:where(.pw-row) { display: flex; flex-wrap: wrap; align-items: center; }
+:where(.pw-grid) { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr)); }
+:where(.pw-card) { background: var(--card); color: var(--card-foreground); border: 1px solid var(--border); padding: 16px; border-radius: 12px; min-width: 0; }
+:where(.pw-title) { margin: 0; font-size: clamp(20px, 3vw, 32px); line-height: 1.25; }
+:where(.pw-text) { margin: 0; line-height: 1.6; }
+:where(.pw-muted) { color: var(--muted-foreground); }
+:where(.pw-small) { font-size: 14px; }
+:where(.pw-gap-1) { gap: 4px; }
+:where(.pw-gap-2) { gap: 8px; }
+:where(.pw-gap-3) { gap: 16px; }
+:where(.pw-gap-4) { gap: 24px; }
+:where(.pw-pad-1) { padding: 4px; }
+:where(.pw-pad-2) { padding: 8px; }
+:where(.pw-pad-3) { padding: 16px; }
+:where(.pw-pad-4) { padding: 24px; }
+</style>
 <body>
 <script>
-// This fixed receiver is the only script permitted by the response's hash-based CSP.
+// Inline classic scripts execute only inside this opaque-origin sandbox.
 // Generated markup is sanitized by the parent before reaching this opaque-origin frame.
 let hasArtifact = false;
+function applyTheme(theme) {
+  if (typeof theme?.dark !== "boolean") return;
+  const root = document.documentElement;
+  root.classList.toggle("dark", theme.dark);
+  root.style.colorScheme = theme.dark ? "dark" : "light";
+  const colors = theme.colors;
+  if (colors && typeof colors === "object") {
+    for (const name of "background foreground card card-foreground muted muted-foreground primary primary-foreground primary-muted primary-border error error-foreground error-muted error-border success success-foreground success-muted success-border warning warning-foreground warning-muted warning-border info info-foreground info-muted info-border cyan cyan-foreground cyan-muted cyan-border orange orange-foreground orange-muted orange-border pink pink-foreground pink-muted pink-border border accent accent-foreground secondary secondary-foreground radius".split(" ")) {
+      if (typeof colors[name] === "string" && colors[name].length <= 256) root.style.setProperty(`--${name}`, colors[name]);
+    }
+  }
+}
+// Original 24px outline geometry; only these trusted paths become SVG content.
+const iconPaths = {
+  "arrow-right": "M4 12h16m-7-7 7 7-7 7",
+  "arrow-left": "M20 12H4m7-7-7 7 7 7",
+  check: "m5 12 4 5L19 6",
+  x: "m6 6 12 12M6 18 18 6",
+  info: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M12 11v6m0-10v.5",
+  warning: "M12 3 22 21H2ZM12 9v5m0 3v.5",
+  code: "m8 6-6 6 6 6m8-12 6 6-6 6m-3-14-2 16",
+  search: "M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0m-2 5 6 6",
+  settings: "M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-6 2v4",
+  file: "M5 3h9l5 5v13H5ZM14 3v5h5M8 12h8m-8 4h6",
+  folder: "M3 5h7l3 3h8v12H3Z",
+  clock: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0M12 6v6l4 3",
+  plus: "M4 12h16M12 4v16",
+  minus: "M4 12h16",
+};
+// Expand initial span markers, preserving their labels and wrapper attributes.
+function materializeIcons(content) {
+  for (const marker of content.querySelectorAll("span[data-icon]")) {
+    const name = marker.getAttribute("data-icon");
+    if (!Object.hasOwn(iconPaths, name)) continue;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    for (const [attribute, value] of Object.entries({
+      viewBox: "0 0 24 24", width: "1em", height: "1em", fill: "none",
+      stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round",
+      "stroke-linejoin": "round", "aria-hidden": "true", focusable: "false",
+    })) svg.setAttribute(attribute, value);
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", iconPaths[name]);
+    svg.append(path);
+    marker.prepend(svg);
+  }
+}
+/** Reports bounded CSS-pixel content height without treating the viewport floor as content. */
+function observeHeight() {
+  let previous = 0;
+  const measure = () => {
+    const body = document.body;
+    const bounds = body.getBoundingClientRect();
+    // body.scrollHeight can be floored at the viewport height. Only include it
+    // for real overflow; always use the intrinsic border box to allow shrinking.
+    const overflow = body.scrollHeight > Math.max(body.clientHeight, document.documentElement.clientHeight) ? body.scrollHeight : 0;
+    const height = Math.max(80, Math.min(20000, Math.ceil(Math.max(bounds.height, overflow))));
+    if (height === previous) return;
+    previous = height;
+    parent.postMessage({ type: "pi-web-artifact-size", height }, "*");
+  };
+  measure();
+  if (typeof ResizeObserver === "undefined") return;
+  const observer = new ResizeObserver(measure);
+  observer.observe(document.body);
+  window.addEventListener("pagehide", () => observer.disconnect(), { once: true });
+}
 function receiveArtifact(event) {
   if (event.source !== parent) return;
   if (event.data?.type === "pi-web-artifact-theme") {
-    if (typeof event.data.dark !== "boolean") return;
-    const root = document.documentElement;
-    root.classList.toggle("dark", event.data.dark);
-    root.style.colorScheme = event.data.dark ? "dark" : "light";
-    const colors = event.data.colors;
-    if (colors && typeof colors === "object") {
-      for (const name of "background foreground card card-foreground muted muted-foreground primary primary-foreground border accent accent-foreground secondary secondary-foreground".split(" ")) {
-        if (typeof colors[name] === "string" && colors[name].length <= 256) root.style.setProperty(`--${name}`, colors[name]);
-      }
-    }
+    applyTheme(event.data);
+    if (hasArtifact) window.dispatchEvent(new Event("pi-web-theme-change"));
     return;
   }
   if (hasArtifact || event.data?.type !== "pi-web-artifact" || typeof event.data.html !== "string" || event.data.html.length > 524288) return;
   hasArtifact = true;
-  const content = document.createElement("div");
+  applyTheme(event.data.theme);
+  const content = document.createElement("template");
   content.innerHTML = event.data.html;
-  document.body.replaceChildren(content);
+  // The parent has checked image containers and budgets. Materialize only these
+  // images as local blobs, keeping data: and remote URLs blocked even inside CSS.
+  for (const image of content.content.querySelectorAll("img")) {
+    const match = /^data:image\/(png|jpeg);base64,([A-Za-z0-9+/]+={0,2})$/.exec(image.getAttribute("src") || "");
+    if (!match) { image.remove(); continue; }
+    const bytes = Uint8Array.from(atob(match[2]), character => character.charCodeAt(0));
+    image.src = URL.createObjectURL(new Blob([bytes], { type: `image/${match[1]}` }));
+  }
+  materializeIcons(content.content);
+  const scripts = [...content.content.querySelectorAll("script")];
+  document.body.replaceChildren(content.content);
+  if (typeof event.data.chartJs === "string") {
+    const library = document.createElement("script");
+    library.textContent = event.data.chartJs;
+    document.body.prepend(library);
+  }
+  for (const inert of scripts) {
+    if (inert.hasAttribute("src") || !["", "text/javascript", "application/javascript"].includes((inert.getAttribute("type") || "").trim().toLowerCase()) || inert.dataset.library === "chart.js") {
+      inert.remove(); continue;
+    }
+    const executable = document.createElement("script");
+    executable.textContent = inert.textContent;
+    inert.replaceWith(executable);
+  }
+  observeHeight();
 }
 window.addEventListener("message", receiveArtifact);
 </script>

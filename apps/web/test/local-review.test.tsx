@@ -23,100 +23,30 @@ it("prepares focused selection questions without sending or replacing the draft"
   fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
   fireEvent.keyDown(page.getByRole("button", { name: "Focused questions" }), { key: "Enter" }); flush();
   fireEvent.keyDown(screen.getByRole("menuitem", { name: "What could break?" }), { key: "Enter" }); flush();
-  expect(model.draft()).toContain("My question");
-  expect(model.draft()).toContain("What could break?");
-  expect(model.draft()).toContain("old — | new 2 | +<script>alert(1)</script>");
-  expect(model.draft()).not.toContain("| -old");
+  expect(model.draft()).toBe("My question");
+  expect((screen.getByRole("textbox", { name: "Your question" }) as HTMLTextAreaElement).value).toContain("What could break?");
+  expect(screen.getByLabelText("Selected code").textContent).toContain("2+<script>alert(1)</script>");
+  expect(screen.getByLabelText("Selected code").textContent).not.toContain("-old");
   expect(transport).not.toHaveBeenCalled();
-  expect(conversation).toHaveBeenCalledOnce();
+  expect(conversation).not.toHaveBeenCalled();
 });
 
-it("combines review questions in one collapsible panel with independent scopes", async () => {
+it("omits the toolbar Ask dropdown while retaining grouping and file/selection questions", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
-  const model = createSessionModel("combined-ask", vi.fn(() => true), () => true, undefined, () => "cap");
+  const model = createSessionModel("ask-actions", vi.fn(() => true), () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await page.findByRole("button", { name: "Select new line 2" });
+  expect(page.queryByRole("button", { name: /^Ask$/ })).toBeNull();
   expect(page.queryByRole("region", { name: "Ask" })).toBeNull();
-  const trigger = page.getByRole("button", { name: "Ask" });
-  expect(trigger.getAttribute("aria-expanded")).toBe("false");
-  fireEvent.click(trigger); flush();
-  const panel = within(page.getByRole("region", { name: "Ask" }));
-  expect(page.getAllByRole("button", { name: "Explain change" })).toHaveLength(1);
-  expect(panel.getByRole("button", { name: "This file" }).getAttribute("aria-pressed")).toBe("true");
-  expect((panel.getByRole("button", { name: "Selected lines" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(page.getByRole("button", { name: "Group with AI" })).toBeTruthy();
+  expect(page.getByRole("button", { name: "Ask Pi about file" })).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
-  expect(panel.getByRole("button", { name: "Selected lines" }).getAttribute("aria-pressed")).toBe("true");
-  fireEvent.click(panel.getByRole("button", { name: "This file" })); flush();
-  fireEvent.click(panel.getByRole("button", { name: "Explain change" })); flush();
-  expect(model.draft()).toContain(file.patch);
-  expect(model.draft()).not.toContain("Selected lines only");
-  fireEvent.click(panel.getByRole("button", { name: "Selected lines" })); flush();
-  fireEvent.click(page.getByRole("button", { name: "Clear selection" })); flush();
-  expect(panel.getByRole("button", { name: "This file" }).getAttribute("aria-pressed")).toBe("true");
-  expect((panel.getByRole("button", { name: "Selected lines" }) as HTMLButtonElement).disabled).toBe(true);
-  fireEvent.click(trigger); flush();
-  expect(page.queryByRole("region", { name: "Ask" })).toBeNull();
-  expect(trigger.getAttribute("aria-expanded")).toBe("false");
-});
-
-it("offers review question buttons for the current file or selected lines without sending", async () => {
-  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
-  const transport = vi.fn(() => true), conversation = vi.fn();
-  const model = createSessionModel("question-buttons", transport, () => true, undefined, () => "cap");
-  model.setDraft("Keep my draft");
-  const page = render(() => <LocalReview model={model} conversation={conversation} />);
-  await page.findByRole("button", { name: "Select new line 2" });
-  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
-  const questions = within(page.getByRole("region", { name: "Ask" }));
-  expect(questions.getByText(/Whole file/)).toBeTruthy();
-  fireEvent.click(questions.getByRole("button", { name: "Explain change" })); flush();
-  expect(model.draft()).toContain("Keep my draft");
-  expect(model.draft()).toContain("Explain this:");
-  expect(model.draft()).toContain(file.patch);
-  expect(model.draft()).toContain("Do not edit files");
-  model.setDraft("Selection question");
-  fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
-  expect(questions.getByText(/1 selected line/)).toBeTruthy();
-  fireEvent.click(questions.getByRole("button", { name: "Security review" })); flush();
-  expect(model.draft()).toContain("Selection question");
-  expect(model.draft()).toContain("trust boundaries");
-  expect(model.draft()).toContain("old — | new 2 |");
-  expect(model.draft()).not.toContain("| -old");
-  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledTimes(2);
-});
-
-it("prepares an overall review from every listed file, independently of file filters and selection", async () => {
-  const other: ReviewEntry = { path: "src/b.ts", previousPath: "old/b.ts", status: "renamed", patch: null, fingerprint: null };
-  const fetch = vi.fn(async () => new Response(JSON.stringify(snapshot([file, other]))));
-  vi.stubGlobal("fetch", fetch);
-  const transport = vi.fn(() => true), conversation = vi.fn();
-  const model = createSessionModel("overall-question", transport, () => true, undefined, () => "cap");
-  model.setDraft("Keep my notes");
-  const page = render(() => <LocalReview model={model} conversation={conversation} />);
-  await page.findByRole("button", { name: "Select new line 2" });
-  fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
-  fireEvent.input(page.getByRole("searchbox", { name: "Filter files" }), { target: { value: "a.ts" } }); flush();
+  expect(page.getByRole("button", { name: "Ask Pi about selected lines" })).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Overview" })); flush();
-  const calls = fetch.mock.calls.length;
-  expect(page.queryByRole("region", { name: "Organize changed files" })).toBeNull();
-  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
-  const questions = within(page.getByRole("region", { name: "Ask" }));
-  fireEvent.click(questions.getByRole("button", { name: "All changes" })); flush();
-  expect(questions.getByText(/2 files/)).toBeTruthy();
-  expect(questions.getByText(/Nothing is sent automatically/)).toBeTruthy();
-  fireEvent.click(questions.getByRole("button", { name: "What could break?" })); flush();
-  expect(model.draft()).toContain("Keep my notes");
-  expect(model.draft()).toContain("overall local unstaged changes");
-  expect(model.draft()).toContain("src/a.ts");
-  expect(model.draft()).toContain("src/b.ts");
-  expect(model.draft()).toContain("old/b.ts");
-  expect(model.draft()).toContain("Inspect the actual diffs");
-  expect(model.draft()).toContain("Do not edit files");
-  expect(model.draft()).not.toContain(file.patch);
-  expect(model.draft()).not.toContain("Selected lines only");
-  expect(fetch.mock.calls).toHaveLength(calls);
-  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledOnce();
+  expect(page.queryByRole("button", { name: /^Ask$/ })).toBeNull();
 });
+
+
 
 it("keeps overall questions tied to the exact Git comparison and reports incomplete evidence", () => {
   const partial = { ...snapshot(), truncated: true, nextCursor: "next" };
@@ -128,110 +58,70 @@ it("keeps overall questions tied to the exact Git comparison and reports incompl
   expect(branch).not.toContain(file.patch);
   expect(reviewScopeDraft("", snapshot(), { scope: "commit", commit: "abc123" }, "explain")).toContain("commit abc123 against its first parent (empty tree for a root commit)");
   expect(reviewScopeDraft("", snapshot(), { scope: "staged" }, "security")).toContain("overall local staged changes");
-  const commands = [{ name: "skill:security-review", description: null, source: "skill" as const }];
-  expect(reviewScopeDraft("Notes", snapshot(), { scope: "unstaged" }, "security", commands)).toMatch(/^\/skill:security-review Notes\n\n/);
-  expect(reviewScopeDraft("/existing notes", snapshot(), { scope: "unstaged" }, "security", commands)).toMatch(/^\/existing notes\n\n/);
+  expect(reviewScopeDraft("Notes", snapshot(), { scope: "unstaged" }, "security")).toMatch(/^Notes\n\n/);
+  expect(reviewScopeDraft("/existing notes", snapshot(), { scope: "unstaged" }, "security")).toMatch(/^\/existing notes\n\n/);
   expect(() => reviewScopeDraft("🙂".repeat(9000), snapshot(), { scope: "unstaged" }, "risks")).toThrow("message limit");
 });
 
-it("keeps the draft and quote when an overall question exceeds the message limit", async () => {
-  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
-  const transport = vi.fn(() => true), conversation = vi.fn();
-  const model = createSessionModel("overall-limit", transport, () => true, undefined, () => "cap");
-  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
-  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "commands", commands: [{ name: "skill:security-review", description: null, source: "skill" }] } });
-  model.setDraft("Keep my notes");
-  expect(model.quoteReply({ author: "Pi", text: "x".repeat(32000) })).toBe(true); flush();
-  const quote = model.quote();
-  const page = render(() => <LocalReview model={model} conversation={conversation} />);
-  await page.findByRole("button", { name: "Select new line 2" });
-  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
-  const questions = within(page.getByRole("region", { name: "Ask" }));
-  fireEvent.click(questions.getByRole("button", { name: "All changes" })); flush();
-  expect(questions.getByRole("button", { name: "Security review" }).getAttribute("title")).not.toContain("/skill:");
-  fireEvent.click(questions.getByRole("button", { name: "Security review" })); flush();
-  expect(page.getByRole("alert").textContent).toContain("message limit");
-  expect(model.draft()).toBe("Keep my notes"); expect(model.quote()).toBe(quote);
-  expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
-});
 
-it("uses only advertised skills and preserves an existing slash command", async () => {
-  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
-  const transport = vi.fn(() => true);
-  const model = createSessionModel("skills", transport, () => true, undefined, () => "cap");
-  model.receive({ v: 1, sessionId: "skills", epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
-  const commands = [
-    { name: "skill:assess-impact", description: "Impact", source: "skill" as const },
-    { name: "skill:security-review", description: "Not a skill", source: "prompt" as const },
-  ];
-  model.receive({ v: 1, sessionId: "skills", epoch: "e", body: { type: "commands", commands } });
-  model.setDraft("Existing notes");
-  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
-  await page.findByRole("button", { name: "Select new line 2" });
-  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
-  const questions = within(page.getByRole("region", { name: "Ask" }));
-  expect(questions.getByRole("button", { name: "What could break?" }).getAttribute("title")).toContain("/skill:assess-impact");
-  fireEvent.click(questions.getByRole("button", { name: "What could break?" })); flush();
-  expect(model.draft().startsWith("/skill:assess-impact Existing notes\n\n")).toBe(true);
-  expect(model.draft()).toContain("Do not edit files");
-  model.setDraft("/existing keep these arguments"); flush();
-  fireEvent.click(questions.getByRole("button", { name: "What could break?" })); flush();
-  expect(model.draft().startsWith("/existing keep these arguments\n\n")).toBe(true);
-  expect(model.draft()).not.toContain("/skill:assess-impact");
-  model.setDraft(""); flush();
-  fireEvent.click(questions.getByRole("button", { name: "Security review" })); flush();
-  expect(model.draft()).not.toContain("/skill:");
-  expect(model.draft()).toContain("trust boundaries");
-  expect(transport).not.toHaveBeenCalled();
-});
-
-it("preserves a pending quote and submits a plain review question instead of an inactive skill command", async () => {
+it("sends file questions separately while preserving draft commands and a pending quote", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
   const transport = vi.fn((_message: BrowserMessage) => true), conversation = vi.fn();
-  const model = createSessionModel("quoted-question", transport, () => true, undefined, () => "cap");
+  const model = createSessionModel("file-question", transport, () => true, undefined, () => "cap");
   model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
   model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } } });
-  model.receive({ v: 1, sessionId: model.id, epoch: "e", body: { type: "commands", commands: [{ name: "skill:security-review", description: null, source: "skill" }] } });
-  model.setDraft("Keep my notes");
-  expect(model.quoteReply({ author: "Pi", text: "Quoted context" })).toBe(true); flush();
+  model.setDraft("/existing keep these arguments");
+  model.quoteReply({ author: "Pi", text: "Quoted context" }); flush();
   const quote = model.quote();
   const page = render(() => <LocalReview model={model} conversation={conversation} />);
   await page.findByRole("button", { name: "Select new line 2" });
-  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
-  const button = page.getByRole("button", { name: "Security review" });
-  expect(button.getAttribute("title")).not.toContain("/skill:");
-  fireEvent.click(button); flush();
-  expect(model.draft()).not.toContain("/skill:");
-  expect(model.quote()).toBe(quote);
-  expect(model.draft()).toContain("trust boundaries");
-  expect(conversation).toHaveBeenCalledOnce(); expect(transport).not.toHaveBeenCalled();
-  expect(model.canSend()).toBe(true); model.submit();
-  expect(transport.mock.calls[0][0].action).toEqual({ type: "prompt", text: `> Quoted context\n\n${model.draft()}`, images: [] });
+  // A file question must include all changes even when a line is selected.
+  fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
+  expect(screen.getByRole("dialog", { name: "Ask Pi about file" })).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Send to Pi" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Explain change" })); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Send to Pi" })); flush();
+  expect(transport).toHaveBeenCalledOnce();
+  const action = transport.mock.calls[0][0].action;
+  expect(action.type).toBe("prompt");
+  if (action.type !== "prompt") throw new Error("Expected prompt");
+  expect(action.text).toContain("Explain this");
+  expect(action.text).toContain("src/a.ts");
+  expect(action.text).toContain("All changed lines");
+  expect(action.text).toContain("Old lines: 2\nNew lines: 2");
+  expect(action.text).not.toMatch(/\/skill:|Quoted context|existing keep|<script>/);
+  expect(model.draft()).toBe("/existing keep these arguments"); expect(model.quote()).toBe(quote);
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(conversation).toHaveBeenCalledOnce();
 });
 
-it("rejects an over-budget quoted review question without changing the draft or quote", async () => {
+it("validates the modal question budget independently and cancels without changing the composer", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
   const conversation = vi.fn(), transport = vi.fn(() => true);
   const model = createSessionModel("quoted-budget", transport, () => true, undefined, () => "cap");
-  const prompt = reviewDraft("", file, { scope: "unstaged" }, undefined, "security");
-  const draft = "x".repeat(32768 - new TextEncoder().encode(prompt).length - 2);
-  model.setDraft(draft); expect(model.quoteReply({ author: "Pi", text: "é" })).toBe(true); flush();
+  const draft = "x".repeat(32768);
+  model.setDraft(draft); model.quoteReply({ author: "Pi", text: "é" }); flush();
   const quote = model.quote();
   const page = render(() => <LocalReview model={model} conversation={conversation} />);
   await page.findByRole("button", { name: "Select new line 2" });
-  fireEvent.click(page.getByRole("button", { name: "Ask" })); flush();
-  fireEvent.click(page.getByRole("button", { name: "Security review" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
+  expect(screen.queryByRole("alert")).toBeNull();
+  fireEvent.input(screen.getByRole("textbox", { name: "Your question" }), { target: { value: draft } }); flush();
+  expect(screen.getByRole("alert").textContent).toContain("exceed the message limit");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" })); flush();
+  expect(screen.queryByRole("dialog")).toBeNull();
   expect(model.draft()).toBe(draft); expect(model.quote()).toBe(quote);
-  expect(page.getByText(/exceed the message limit/)).toBeTruthy();
   expect(conversation).not.toHaveBeenCalled(); expect(transport).not.toHaveBeenCalled();
 });
 
-it("counts the skill command in the complete draft byte limit", () => {
+it("counts explicit user skill commands in the complete draft byte limit", () => {
   const target = { scope: "unstaged" as const };
   const plain = reviewDraft("", file, target, undefined, "risks");
   const draft = "x".repeat(32768 - new TextEncoder().encode(plain).length - 2);
   expect(new TextEncoder().encode(reviewDraft(draft, file, target, undefined, "risks")).length).toBe(32768);
-  expect(() => reviewDraft(draft, file, target, undefined, "risks", [{ name: "skill:assess-impact", description: null, source: "skill" }])).toThrow("message limit");
+  expect(() => reviewDraft(`/skill:assess-impact ${draft}`, file, target, undefined, "risks")).toThrow("message limit");
 });
 
 it("generates explanations only on request and links validated evidence without marking or sending", async () => {
@@ -427,7 +317,7 @@ it("loads 1000 metadata entries in pages and fetches only selected patches", asy
   const load = vi.fn(async (request: { path?: string; cursor?: string }) => {
     if (request.path) return snapshot([{ ...file, path: request.path }]);
     const start = Number(request.cursor ?? 0);
-    return { ...snapshot(entries.slice(start, start + 100)), ...(start < 900 ? { nextCursor: String(start + 100) } : {}), ...(start === 0 ? { lineStats: { added: 1000, removed: 0, unavailableFiles: 0 } } : {}) };
+    return { ...snapshot(entries.slice(start, start + 100)), ...(start < 900 ? { nextCursor: String(start + 100) } : {}), ...(start === 0 ? { lineStats: { added: 1000, totalAdded: 1000, removed: 0, totalRemoved: 0, unavailableFiles: 0 } } : {}) };
   });
   const review = createLocalReview(load);
   await review.refresh(); flush();
@@ -534,8 +424,8 @@ it("keeps compact file controls named and preserves review, navigation and draft
   fireEvent.click(header.getByRole("button", { name: "Next unreviewed" })); flush();
   await page.findByRole("heading", { name: second.path });
   fireEvent.click(header.getByRole("button", { name: "Ask Pi about file" })); flush();
-  expect(model.draft()).toContain(second.path);
-  expect(conversation).toHaveBeenCalledOnce();
+  expect(screen.getByRole("dialog", { name: "Ask Pi about file" }).textContent).toContain(second.path);
+  expect(conversation).not.toHaveBeenCalled();
   expect(transport).not.toHaveBeenCalled();
 });
 
@@ -545,7 +435,7 @@ it("shows scope-wide line totals without loading all patches and refreshes them 
     const input = JSON.parse(init.body as string);
     return new Response(JSON.stringify(input.path ? snapshot(entries.filter(entry => entry.path === input.path)) : {
       ...snapshot(entries.map(entry => ({ ...entry, patch: null, fingerprint: null }))),
-      lineStats: input.scope === "unstaged" ? { added: 500, removed: 75, unavailableFiles: 2 } : { added: 0, removed: 0, unavailableFiles: 0 },
+      lineStats: input.scope === "unstaged" ? { added: 500, totalAdded: 1120, removed: 75, totalRemoved: 175, unavailableFiles: 2 } : { added: 0, totalAdded: 0, removed: 0, totalRemoved: 0, unavailableFiles: 0 },
     }));
   });
   vi.stubGlobal("fetch", request);
@@ -553,6 +443,14 @@ it("shows scope-wide line totals without loading all patches and refreshes them 
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await page.findByText("+500 added");
   expect(page.getByText("+500 added")).toBeTruthy(); expect(page.getByText("−75 deleted")).toBeTruthy();
+  fireEvent.click(page.getByRole("button", { name: "About line totals" })); flush();
+  const tooltip = await screen.findByRole("tooltip");
+  expect(within(tooltip).getByRole("row", { name: "Added 500 620 1,120" })).toBeTruthy();
+  expect(within(tooltip).getByRole("row", { name: "Deleted 75 100 175" })).toBeTruthy();
+  expect(tooltip.textContent).toContain("Shown counts exclude tests, generated files, lockfiles, and .md files");
+  expect(page.getByText("+500 added")).toBeTruthy();
+  fireEvent.keyDown(document.activeElement!, { key: "Escape" }); flush();
+  await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
   expect(page.queryByText(/files without line counts/)).toBeNull();
   expect(page.queryByText(/Snapshot:/)).toBeNull();
   expect(page.queryByText("575 lines changed")).toBeNull();
@@ -621,7 +519,9 @@ it("expands unchanged context above a hunk without changing the snapshot or send
   expect(page.getByText("1 / 1 files reviewed")).toBeTruthy();
   expect(model.review.snapshot()?.files[0].patch).toBe(selected.patch);
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
-  expect(model.draft()).toContain(selected.patch); expect(model.draft()).not.toContain("const value5");
+  expect([...screen.getByLabelText("File changes").querySelectorAll("code")].map(code => code.textContent).join("\n")).toBe(selected.patch.trimEnd());
+  expect(screen.getByLabelText("File changes").textContent).not.toContain("const value5");
+  expect(model.draft()).toBe("");
   expect(transport).not.toHaveBeenCalled();
 });
 
@@ -661,9 +561,11 @@ it.each([{}, { ...snapshot(), files: [{}] }, { ...snapshot(), files: [{ ...file,
   await expect(fetchReview("session", { scope: "unstaged" }, new AbortController().signal, "cap")).rejects.toThrow();
 });
 
-it.each([null, {}, { added: -1, removed: 0, unavailableFiles: 0 }, { added: 1.5, removed: 0, unavailableFiles: 0 },
-  { added: 0, removed: "2", unavailableFiles: 0 }, { added: 0, removed: 0, unavailableFiles: -1 },
-  { added: Number.MAX_SAFE_INTEGER, removed: 1, unavailableFiles: 0 }])("rejects invalid line totals", async lineStats => {
+it.each([null, {}, { added: -1, totalAdded: 0, removed: 0, totalRemoved: 0, unavailableFiles: 0 }, { added: 1.5, totalAdded: 2, removed: 0, totalRemoved: 0, unavailableFiles: 0 },
+  { added: 0, totalAdded: 0, removed: "2", totalRemoved: 2, unavailableFiles: 0 }, { added: 0, totalAdded: 0, removed: 0, totalRemoved: 0, unavailableFiles: -1 },
+  { added: Number.MAX_SAFE_INTEGER, totalAdded: Number.MAX_SAFE_INTEGER, removed: 1, totalRemoved: 1, unavailableFiles: 0 },
+  ...[undefined, -1, 1.5, "10", 4, Number.MAX_SAFE_INTEGER + 1].map(totalAdded => ({ added: 5, totalAdded, removed: 0, totalRemoved: 0, unavailableFiles: 0 })),
+  ...[undefined, -1, 1.5, "10", 4, Number.MAX_SAFE_INTEGER].map(totalRemoved => ({ added: 1, totalAdded: 1, removed: 5, totalRemoved, unavailableFiles: 0 }))])("rejects invalid line totals", async lineStats => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...snapshot(), lineStats }))));
   await expect(fetchReview("s", { scope: "staged" }, new AbortController().signal, "cap")).rejects.toThrow("Invalid review line totals");
 });
@@ -831,8 +733,8 @@ it("extends a selection across diff pages using source coordinates", async () =>
   fireEvent.click(page.getByRole("button", { name: "Select new line 501" })); flush();
   expect(page.getByRole("button", { name: "Ask Pi about selected lines" }).textContent).toContain("3 lines");
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about selected lines" })); flush();
-  expect(model.draft()).toContain("old — | new 499 | +row 499\nold — | new 500 | +row 500\nold — | new 501 | +row 501");
-  expect(model.draft()).not.toContain("+row 502");
+  expect(screen.getByLabelText("Selected code").textContent).toContain("499+row 499500+row 500501+row 501");
+  expect(screen.getByLabelText("Selected code").textContent).not.toContain("+row 502");
 });
 
 it("numbers unified hunks without treating file headers as additions", () => {
@@ -883,7 +785,8 @@ it("preserves a prior snapshot on refresh failure and keeps errors visible", asy
 
 it("appends review context without losing a draft and rejects oversize prompts", () => {
   const draft = reviewDraft("My question", file, { scope: "branch", base: "main" });
-  expect(draft).toContain("My question\n\nReview the local branch changes"); expect(draft).toContain(file.patch);
+  expect(draft).toContain("My question\n\nContext for this request: local branch changes"); expect(draft).not.toContain(file.patch);
+  expect(draft).toContain("Old lines: 2\nNew lines: 2");
   expect(() => reviewDraft("x".repeat(32768), file, { scope: "staged" })).toThrow("message limit");
 });
 
@@ -901,11 +804,14 @@ it("offers a floating Ask Pi action at the range endpoint without sending the ex
   const floating = page.getByRole("button", { name: "Ask Pi about selected lines" });
   expect(floating.closest(".diff-line")).toBe(end.closest(".diff-line"));
   fireEvent.click(floating); flush();
-  expect(model.draft()).toContain("Explain this\n\nReview the local unstaged changes");
-  expect(model.draft()).toContain("old 2 | new — | -old");
-  expect(model.draft()).toContain("old — | new 2 | +<script>alert(1)</script>");
-  expect(model.draft()).not.toContain("diff --git");
-  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledOnce();
+  const dialog = within(screen.getByRole("dialog", { name: "Ask Pi about selected lines" }));
+  expect(dialog.getByLabelText("Selected code").textContent).toContain("2-old");
+  expect(dialog.getByLabelText("Selected code").textContent).toContain("2+<script>alert(1)</script>");
+  expect(dialog.getByRole("textbox", { name: "Your question" })).toBeTruthy();
+  expect(model.draft()).toBe("Explain this");
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
+  fireEvent.click(dialog.getByRole("button", { name: "Cancel" })); flush();
+  await waitFor(() => expect(document.activeElement).toBe(floating));
   fireEvent.click(page.getByRole("button", { name: "Clear selection" })); flush();
   expect(page.queryByRole("button", { name: "Ask Pi about selected lines" })).toBeNull();
 });
@@ -983,7 +889,7 @@ it("keeps selection controls in the diff without a separate section", async () =
   expect(page.getByRole("group", { name: "Selected lines actions" }).closest(".diff-line")).toBe(first.closest(".diff-line"));
 });
 
-it("selects a line range and appends only that excerpt to an unsent draft", async () => {
+it("previews only the selected excerpt while preserving an unsent draft", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
   const transport = vi.fn(() => true), conversation = vi.fn();
   const model = createSessionModel("session", transport, () => true, undefined, () => "cap");
@@ -994,12 +900,14 @@ it("selects a line range and appends only that excerpt to an unsent draft", asyn
   expect(page.container.querySelectorAll(".diff-selected")).toHaveLength(2);
   expect(page.container.querySelectorAll(".diff-selected")).toHaveLength(2);
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about selected lines" })); flush();
-  expect(model.draft()).toContain("Why did this change?\n\nReview the local unstaged changes");
-  expect(model.draft()).toContain('"src/a.ts"');
-  expect(model.draft()).toContain("old 2 | new — | -old");
-  expect(model.draft()).toContain("old — | new 2 | +<script>alert(1)</script>");
-  expect(model.draft()).not.toContain(" same"); expect(model.draft()).not.toContain("diff --git");
-  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledOnce();
+  expect(model.draft()).toBe("Why did this change?");
+  const dialog = within(screen.getByRole("dialog", { name: "Ask Pi about selected lines" }));
+  expect(dialog.getByText("src/a.ts")).toBeTruthy();
+  const excerpt = dialog.getByLabelText("Selected code").textContent;
+  expect(excerpt).toContain("2-old");
+  expect(excerpt).toContain("2+<script>alert(1)</script>");
+  expect(excerpt).not.toContain(" same"); expect(excerpt).not.toContain("diff --git");
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
   expect(page.getByText("0 / 1 files reviewed")).toBeTruthy();
 });
 
@@ -1020,7 +928,9 @@ it("drags backwards across line numbers and clears selection on pointer cancella
   expect(removed.getAttribute("aria-pressed")).toBe("true");
   expect(added.getAttribute("aria-pressed")).toBe("true");
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about selected lines" })); flush();
-  expect(model.draft().indexOf("-old")).toBeLessThan(model.draft().indexOf("+<script>"));
+  const excerpt = screen.getByLabelText("Selected code").textContent!;
+  expect(excerpt.indexOf("-old")).toBeLessThan(excerpt.indexOf("+<script>"));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" })); flush();
   pointer(added, "pointerdown"); pointer(window, "pointercancel", 0);
   expect(page.queryByRole("button", { name: "Ask Pi about selected lines" })).toBeNull();
 });
@@ -1061,9 +971,10 @@ it("selects expanded context with correct source coordinates and clears it when 
   fireEvent.click(page.getByRole("button", { name: "Select old line 25, new line 25" }), { shiftKey: true }); flush();
   expect(page.container.querySelectorAll(".diff-selected")).toHaveLength(21);
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about selected lines" })); flush();
-  expect(model.draft()).toContain("old 5 | new 5 |  context 5");
-  expect(model.draft()).toContain("old 25 | new 25 |  same");
-  expect(model.draft()).not.toContain("-old");
+  expect(screen.getByLabelText("Selected code").textContent).toContain("55 context 5");
+  expect(screen.getByLabelText("Selected code").textContent).toContain("2525 same");
+  expect(screen.getByLabelText("Selected code").textContent).not.toContain("-old");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" })); flush();
   fireEvent.click(page.getByRole("button", { name: "Staged" })); flush();
   await waitFor(() => { flush(); expect(model.review.busy()).toBe(false); });
   expect(page.queryByRole("button", { name: "Ask Pi about selected lines" })).toBeNull();
@@ -1094,7 +1005,7 @@ it("allows selection in the text fallback after a structural comparison", async 
   fireEvent.click(page.getByRole("button", { name: "Select new line 2" })); flush();
   expect(page.container.querySelectorAll(".diff-selected")).toHaveLength(1);
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about selected lines" })); flush();
-  expect(model.draft()).toContain("old — | new 2 | +<script>alert(1)</script>");
+  expect(screen.getByLabelText("Selected code").textContent).toContain("2+<script>alert(1)</script>");
 });
 
 it("rejects oversized selected context without losing the draft or leaving review", async () => {
@@ -1105,11 +1016,12 @@ it("rejects oversized selected context without losing the draft or leaving revie
   const page = render(() => <LocalReview model={model} conversation={conversation} />);
   fireEvent.click(await page.findByRole("button", { name: "Select new line 2" })); flush();
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about selected lines" })); flush();
-  expect(page.getByRole("alert").textContent).toContain("Select fewer lines");
+  fireEvent.input(screen.getByRole("textbox", { name: "Your question" }), { target: { value: draft } }); flush();
+  expect(screen.getByRole("alert").textContent).toContain("Select fewer lines");
   expect(model.draft()).toBe(draft); expect(conversation).not.toHaveBeenCalled(); expect(transport).not.toHaveBeenCalled();
 });
 
-it("renders escaped diff text, tracks review and adds Ask Pi to an unsent draft", async () => {
+it("renders escaped diff text, tracks review and opens the shared Ask Pi modal without changing the draft", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
   const transport = vi.fn(() => true); const conversation = vi.fn();
   const model = createSessionModel("session", transport, () => true, undefined, () => "cap"); model.setDraft("Existing question");
@@ -1120,8 +1032,11 @@ it("renders escaped diff text, tracks review and adds Ask Pi to an unsent draft"
   await waitFor(() => { flush(); expect(model.review.target()).toEqual({ scope: "staged" }); expect(model.review.busy()).toBe(false); });
   fireEvent.click(page.getByLabelText("Reviewed")); flush(); expect(page.getByText("1 / 1 files reviewed")).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
-  expect(model.draft()).toContain("Existing question\n\nReview the local staged changes");
-  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledOnce();
+  expect(screen.getByRole("dialog", { name: "Ask Pi about file" })).toBeTruthy();
+  expect(screen.getByRole("textbox", { name: "Your question" })).toBeTruthy();
+  expect([...screen.getByLabelText("File changes").querySelectorAll("code")].map(code => code.textContent).join("\n")).toBe(file.patch.trimEnd());
+  expect(model.draft()).toBe("Existing question");
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
 });
 
 it.each(["example.ts", "example.txt"])("hides only diff prefixes and retains source operators in %s", async path => {
@@ -1136,7 +1051,8 @@ it.each(["example.ts", "example.txt"])("hides only diff prefixes and retains sou
   expect(page.getByText("--- a/example")).toBeTruthy(); expect(page.getByText("+++ b/example")).toBeTruthy();
   expect(page.getByText("\\ No newline at end of file")).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
-  expect(model.draft()).toContain(patch);
+  expect([...screen.getByLabelText("File changes").querySelectorAll("code")].map(code => code.textContent).join("\n")).toBe(patch.trimEnd());
+  expect(model.draft()).toBe("");
 });
 
 it("highlights both sides of small diffs while preserving text, line numbers and multiline comments", async () => {

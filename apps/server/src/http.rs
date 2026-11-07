@@ -208,9 +208,9 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
     };
     let headers = response.headers_mut();
     // A separate document policy keeps artifact styles out of the privileged application.
-    // The hash permits only the fixed receiver; generated scripts remain blocked.
+    // Inline scripts run in an opaque origin with resource and navigation restrictions.
     if artifact {
-        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'sha256-um6pYV0dGZcLpyFqSoU2qP4/WthQw/cWTUR1as7UpMU='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts;"));
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'; script-src-attr 'none'; connect-src 'none'; frame-src 'none'; style-src 'unsafe-inline'; img-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts;"));
     } else {
         headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; worker-src 'self'; manifest-src 'self'; style-src 'self'; connect-src 'self' {}; img-src 'self' blob:; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", state.socket_origin)).unwrap());
     }

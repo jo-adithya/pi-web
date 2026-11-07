@@ -152,7 +152,7 @@ async fn line_totals_cover_the_scope_without_loading_patches() {
     fs::write(f.root.join("untracked"), "not counted\n").unwrap();
     let (status, body) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["lineStats"], serde_json::json!({"added":2,"removed":1,"unavailableFiles":2}));
+    assert_eq!(body["lineStats"], serde_json::json!({"added":2,"totalAdded":2,"removed":1,"totalRemoved":1,"unavailableFiles":2}));
     assert!(body["files"].as_array().unwrap().iter().all(|file| file["patch"].is_null()));
     for file in body["files"].as_array().unwrap() {
         if file["path"] == "file.txt" {
@@ -162,9 +162,42 @@ async fn line_totals_cover_the_scope_without_loading_patches() {
         }
     }
     let (_, staged) = f.request(r#"{"scope":"staged"}"#, true, true).await;
-    assert_eq!(staged["lineStats"], serde_json::json!({"added":0,"removed":0,"unavailableFiles":0}));
+    assert_eq!(staged["lineStats"], serde_json::json!({"added":0,"totalAdded":0,"removed":0,"totalRemoved":0,"unavailableFiles":0}));
     let (_, selected) = f.request(r#"{"scope":"unstaged","path":"file.txt"}"#, true, true).await;
     assert!(selected.get("lineStats").is_none());
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn line_totals_exclude_tests_and_generated_files_without_hiding_their_diffs() {
+    let f = Fixture::new().await;
+    f.init();
+    fs::create_dir_all(f.root.join("src/generated")).unwrap();
+    fs::create_dir_all(f.root.join("tests")).unwrap();
+    for path in ["src/app.rs", "tests/app.rs", "src/generated/api.rs", "Cargo.lock"] {
+        fs::write(f.root.join(path), "before\n").unwrap();
+    }
+    f.git(&["add", "."]);
+    f.git(&["commit", "-qm", "baseline counts"]);
+    fs::write(f.root.join("src/app.rs"), "source\nextra\n").unwrap();
+    fs::write(f.root.join("tests/app.rs"), "test\n").unwrap();
+    fs::write(f.root.join("src/generated/api.rs"), "generated\n").unwrap();
+    fs::write(f.root.join("Cargo.lock"), "lock\n").unwrap();
+    f.git(&["add", "."]);
+    let (status, body) = f.request(r#"{"scope":"staged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lineStats"]["added"], 2);
+    assert_eq!(body["lineStats"]["totalAdded"], 5);
+    assert_eq!(body["lineStats"]["removed"], 1);
+    assert_eq!(body["lineStats"]["totalRemoved"], 4);
+    assert_eq!(body["files"].as_array().unwrap().len(), 4);
+    for path in ["tests/app.rs", "src/generated/api.rs", "Cargo.lock"] {
+        let file = body["files"].as_array().unwrap().iter().find(|file| file["path"] == path).unwrap();
+        assert_eq!(file["lineStats"]["added"], 1);
+        assert_eq!(file["lineStats"]["removed"], 1);
+        let (_, selected) = f.request(&serde_json::json!({"scope":"staged","path":path}).to_string(), true, true).await;
+        assert!(selected["files"][0]["patch"].as_str().unwrap().contains("@@"));
+    }
     f.runtime.shutdown().await;
 }
 
@@ -185,7 +218,7 @@ async fn line_totals_include_renames_large_patches_and_files_beyond_display_limi
     assert_eq!(staged["files"].as_array().unwrap().len(), 100);
     assert_eq!(staged["truncated"], false);
     assert!(staged["nextCursor"].is_string());
-    let expected = serde_json::json!({"added":40105,"removed":0,"unavailableFiles":0});
+    let expected = serde_json::json!({"added":40105,"totalAdded":40105,"removed":0,"totalRemoved":0,"unavailableFiles":0});
     assert_eq!(staged["lineStats"], expected);
     let (_, next) = f.request(&serde_json::json!({"scope":"staged","cursor":staged["nextCursor"]}).to_string(), true, true).await;
     let renamed = next["files"].as_array().unwrap().iter().find(|file| file["path"] == "renamed\tfile\n.txt").unwrap();
@@ -200,7 +233,7 @@ async fn line_totals_include_renames_large_patches_and_files_beyond_display_limi
     assert_eq!(commit["lineStats"], expected);
     assert_eq!(commit["files"][0]["lineStats"], serde_json::json!({"added":40000,"removed":0}));
     let (_, root) = f.request(&format!(r#"{{"scope":"commit","commit":"{}"}}"#, f.oid("base")), true, true).await;
-    assert_eq!(root["lineStats"], serde_json::json!({"added":2,"removed":0,"unavailableFiles":0}));
+    assert_eq!(root["lineStats"], serde_json::json!({"added":2,"totalAdded":2,"removed":0,"totalRemoved":0,"unavailableFiles":0}));
     f.runtime.shutdown().await;
 }
 
@@ -214,7 +247,7 @@ async fn line_totals_support_long_thousand_file_listings() {
     }
     let (status, untracked) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
     assert_eq!(status, StatusCode::OK, "{untracked}");
-    assert_eq!(untracked["lineStats"], serde_json::json!({"added":0,"removed":0,"unavailableFiles":1100}));
+    assert_eq!(untracked["lineStats"], serde_json::json!({"added":0,"totalAdded":0,"removed":0,"totalRemoved":0,"unavailableFiles":1100}));
     let (status, next) = f.request(
         &serde_json::json!({"scope":"unstaged","cursor":untracked["nextCursor"]}).to_string(),
         true,
@@ -229,7 +262,7 @@ async fn line_totals_support_long_thousand_file_listings() {
     let (status, staged) = f.request(r#"{"scope":"staged"}"#, true, true).await;
     assert_eq!(status, StatusCode::OK, "{staged}");
     assert_eq!(staged["files"].as_array().unwrap().len(), 100);
-    assert_eq!(staged["lineStats"], serde_json::json!({"added":1100,"removed":0,"unavailableFiles":0}));
+    assert_eq!(staged["lineStats"], serde_json::json!({"added":1100,"totalAdded":1100,"removed":0,"totalRemoved":0,"unavailableFiles":0}));
     f.runtime.shutdown().await;
 }
 

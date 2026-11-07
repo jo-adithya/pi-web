@@ -25,6 +25,8 @@ fail_state = False
 pi_id = "mock-pi"
 start_after_state = False
 settled_once = False
+compacted = False
+compact_after_settlement = False
 late_dialog_stop = False
 late_dialog_ids = set()
 pending_abort = None
@@ -70,6 +72,11 @@ for line in sys.stdin:
             while not os.path.exists("allow-state") and time.monotonic() < deadline:
                 time.sleep(0.005)
         response(command, {"sessionId": pi_id, "sessionFile": path, "isStreaming": active, "isCompacting": False, "model": model, "thinkingLevel": thinking})
+        if compact_after_settlement:
+            compact_after_settlement = False
+            emit({"type": "compaction_start", "reason": "manual"})
+            compacted = True
+            emit({"type": "compaction_end", "reason": "manual", "result": {"summary": "Summary"}, "aborted": False, "willRetry": False})
         if start_after_state:
             start_after_state = False
             active = True
@@ -82,6 +89,8 @@ for line in sys.stdin:
             emit({"type": "response", "id": command["id"], "command": kind, "success": False, "error": "unsupported"})
         else:
             usage = {"tokens": 25000 if settled_once else 12500, "contextWindow": 100000, "percent": 25 if settled_once else 12.5}
+            if compacted:
+                usage = {"tokens": 4000, "contextWindow": 100000, "percent": 4}
             if os.path.exists("unknown-context"):
                 usage["tokens"] = None
                 usage["percent"] = None
@@ -161,6 +170,23 @@ for line in sys.stdin:
             emit({"type": "extension_ui_request", "method": "setStatus", "statusKey": "unrelated", "statusText": "PRIVATE"})
             emit({"type": "extension_ui_request", "method": "setStatus", "statusKey": "codex-fast", "statusText": "\x00" + "é" * 300})
             response(command, {"disposition": "handled"})
+        elif text == "compact-after-settlement":
+            emit({"type": "agent_start"})
+            response(command, {"disposition": "started"})
+            active = False
+            settled_once = True
+            compact_after_settlement = True
+            emit({"type": "agent_settled", "aborted": False})
+        elif text in ("/compact", "compact-overflow", "compact-active"):
+            manual = text == "/compact"
+            active = not manual
+            reason = "manual" if manual else "threshold" if text == "compact-active" else "overflow"
+            if active:
+                emit({"type": "agent_start"})
+            emit({"type": "compaction_start", "reason": reason})
+            compacted = True
+            emit({"type": "compaction_end", "reason": reason, "result": {"summary": "Summary", "tokensBefore": 12500}, "aborted": False, "willRetry": text == "compact-overflow"})
+            response(command, {"disposition": "handled" if manual else "started"})
         elif text in ("/handled", "/handled-fail"):
             fail_state = text == "/handled-fail"
             response(command, {"disposition": "handled"})

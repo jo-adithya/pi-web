@@ -144,6 +144,7 @@ struct PendingDialog {
 enum StateReason {
     Startup,
     Settled,
+    Compaction,
     Handled(String),
     Settings,
 }
@@ -1054,13 +1055,27 @@ impl Runtime {
                                 });
                             }
                             StateReason::Handled(id) => {
-                                if self.view.activity == Activity::Submitting
-                                    && state["isStreaming"] == false
+                                if matches!(
+                                    self.view.activity,
+                                    Activity::Submitting | Activity::Reconciling
+                                ) && state["isStreaming"] == false
                                     && state["isCompacting"] == false
                                 {
                                     self.view.activity = Activity::Idle;
                                 }
                                 self.result(&id, true, "accepted", Some("handled".into()), None);
+                            }
+                            StateReason::Compaction => {
+                                // Extensions can compact after settlement, without starting another run.
+                                if self.view.activity == Activity::Reconciling
+                                    && state["isCompacting"] == false
+                                {
+                                    self.view.activity = if state["isStreaming"] == true {
+                                        Activity::Running
+                                    } else {
+                                        Activity::Idle
+                                    };
+                                }
                             }
                             StateReason::Settled | StateReason::Settings => {}
                         }
@@ -1238,9 +1253,12 @@ impl Runtime {
         }
         if matches!(
             event["type"].as_str(),
-            Some("message_end" | "auto_compaction_end")
+            Some("message_end" | "compaction_end")
         ) {
             self.request_context();
+        }
+        if event["type"] == "compaction_end" {
+            self.request_state(StateReason::Compaction);
         }
         if event["type"] == "agent_start" {
             self.push_run_active = true;

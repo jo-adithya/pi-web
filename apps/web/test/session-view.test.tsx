@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { SessionView } from "../src/SessionView";
@@ -25,7 +25,50 @@ function activity(model: SessionModel, activity: Activity) {
     status: { ...model.state.status, activity, notice: null, error: null } } });
   flush();
 }
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
+
+it("shows extension notices as transient toasts without hiding errors", () => {
+  vi.useFakeTimers();
+  const model = session(); flush();
+  statusNotice(model, "Ponytail loaded: full");
+  const view = render(() => <SessionView model={model} />); flush();
+  const toast = view.getByRole("status").closest(".toast");
+  expect(toast).not.toBeNull();
+  expect(toast?.closest(".composer")).toBeNull();
+  vi.advanceTimersByTime(5000); flush();
+  expect(view.queryByText("Ponytail loaded: full")).toBeNull();
+  expect(view.getByRole("alert").textContent).toBe("Keep this error");
+  cleanup();
+  const remounted = render(() => <SessionView model={model} />); flush();
+  expect(remounted.queryByText("Ponytail loaded: full")).toBeNull();
+  statusNotice(model, "Ponytail loaded: lite");
+  expect(remounted.getByRole("status").textContent).toBe("Ponytail loaded: lite");
+});
+
+it("pauses toast dismissal for hover and focus and resets the timer for fresh notices", () => {
+  vi.useFakeTimers();
+  const model = session();
+  const view = render(() => <SessionView model={model} />); flush();
+  const toast = view.getByRole("status").closest(".toast")!;
+  fireEvent.pointerEnter(toast);
+  vi.advanceTimersByTime(6000); flush();
+  expect(view.getByRole("status").textContent).toContain("MCP connected");
+  fireEvent.focusIn(view.getByRole("button", { name: "Dismiss notice" }));
+  fireEvent.pointerLeave(toast);
+  vi.advanceTimersByTime(6000); flush();
+  expect(view.getByRole("status")).toBeTruthy();
+  fireEvent.focusOut(view.getByRole("button", { name: "Dismiss notice" }));
+  vi.advanceTimersByTime(4000); flush();
+  statusNotice(model, "Fresh notice");
+  vi.advanceTimersByTime(1000); flush();
+  expect(view.getByRole("status").textContent).toBe("Fresh notice");
+  vi.advanceTimersByTime(4000); flush();
+  expect(view.queryByRole("status")).toBeNull();
+  statusNotice(model, "Unmounted notice");
+  cleanup();
+  vi.advanceTimersByTime(5000); flush();
+  expect(model.visibleNotice()).toBe("Unmounted notice");
+});
 
 it("shows context usage beside LSP status, updates it, and clears unavailable or stale usage", () => {
   const model = session();

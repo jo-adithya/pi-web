@@ -83,10 +83,16 @@ async fn artifact_viewer_has_its_own_opaque_sandbox_and_restricted_script_policy
         .unwrap();
     assert!(csp.contains("sandbox allow-scripts;"));
     assert!(!csp.contains("allow-same-origin"));
-    assert!(csp.contains("script-src 'sha256-"));
+    assert!(csp.contains("script-src 'unsafe-inline';"));
+    assert!(csp.contains("script-src-attr 'none';"));
+    assert!(csp.contains("connect-src 'none';"));
+    assert!(csp.contains("frame-src 'none';"));
     assert!(!csp.contains("script-src 'self'"));
     assert!(csp.contains("style-src 'unsafe-inline';"));
     assert!(csp.contains("default-src 'none';"));
+    assert!(csp.contains("img-src blob:;"));
+    assert!(!csp.contains("data:"));
+    assert!(!csp.contains("https:"));
     assert!(csp.contains("frame-ancestors 'self';"));
     assert_eq!(response.headers()["cache-control"], "no-store");
     let body = axum::body::to_bytes(response.into_body(), 16384)

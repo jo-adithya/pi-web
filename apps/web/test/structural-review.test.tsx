@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { LocalReview } from "../src/LocalReview";
 import { createSessionModel } from "../src/session-model";
@@ -14,7 +14,7 @@ const result = { mode: "structural", engine: "Difftastic 0.72.0", language: "Rus
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-it("loads structural comparison only on request and keeps Ask Pi as an unsent text draft", async () => {
+it("loads structural comparison only on request and opens Ask Pi with the original file diff", async () => {
   const fetch = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/structural") ? result : snapshot)));
   vi.stubGlobal("fetch", fetch);
   const transport = vi.fn(() => true), conversation = vi.fn();
@@ -33,8 +33,10 @@ it("loads structural comparison only on request and keeps Ask Pi as an unsent te
   expect(page.container.querySelector(".diff-add code")?.textContent).toBe("fn main() { new(); }");
   expect(page.getByText(/Difftastic 0.72.0/)).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
-  expect(model.draft()).toContain(file.patch);
-  expect(transport).not.toHaveBeenCalled(); expect(conversation).toHaveBeenCalledOnce();
+  expect([...screen.getByLabelText("File changes").querySelectorAll("code")].map(code => code.textContent).join("\n")).toBe(file.patch.trimEnd());
+  expect(model.draft()).toBe("");
+  expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" })); flush();
   fireEvent.click(page.getByRole("button", { name: "Text" })); flush();
   expect(page.getByRole("region", { name: "Unified diff" })).toBeTruthy();
 });
