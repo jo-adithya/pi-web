@@ -55,7 +55,7 @@ it("accepts paragraph selection ending just before the next message's heading", 
   const view = render(() => <MessageList state={transcript()} onReply={reply} />); flush();
   const range = document.createRange();
   range.setStart(view.getByText("Keep the public interface stable.").firstChild!, 0);
-  range.setEnd(view.getByRole("heading", { name: "user" }), 0);
+  range.setEnd(view.getByRole("heading", { name: "You" }), 0);
   window.getSelection()!.addRange(range); fireEvent(document, new Event("selectionchange")); flush();
   fireEvent.click(view.getByRole("button", { name: "Reply to selection" }));
   expect(reply).toHaveBeenCalledExactlyOnceWith({ author: "Pi", text: "Keep the public interface stable." });

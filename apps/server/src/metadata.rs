@@ -66,6 +66,45 @@ impl MetadataStore {
         Ok(Self { root, _lock: lock })
     }
 
+    /// Opens a private record namespace under this store, sharing its ownership lock.
+    /// Names are internal constants; dropping the child retains the parent directory.
+    pub(crate) fn child(&self, name: &str) -> io::Result<Self> {
+        let root = self.root.join(name);
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
+        let metadata = fs::symlink_metadata(&root)?;
+        if !metadata.is_dir() { return Err(invalid("record namespace must be a directory, not a symlink")); }
+        check_private(&metadata)?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(Self { root: root.canonicalize()?, _lock: self._lock.try_clone()? })
+    }
+
+    /// Removes one private application record durably. Missing records permit retries.
+    pub(crate) fn remove_record(&self, name: &str) -> io::Result<()> {
+        let file = match read_regular(&self.root.join(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        check_private(&file.metadata()?)?;
+        fs::remove_file(self.root.join(name))?;
+        File::open(&self.root)?.sync_all()
+    }
+
+    /// Removes a conversation-owned record namespace, leaving shared metadata intact.
+    /// A symlink or insecure namespace is an error; a missing namespace permits retries.
+    pub(crate) fn remove_namespace(&self, name: &str) -> io::Result<()> {
+        let path = self.root.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() { return Err(invalid("record namespace must be a directory, not a symlink")); }
+        check_private(&metadata)?;
+        fs::remove_dir_all(path)?;
+        File::open(&self.root)?.sync_all()
+    }
+
     /// Reads bounded restart metadata. Missing data means a new application;
     /// corruption, incompatible schemas and insecure files are explicit errors.
     pub fn load(&self) -> io::Result<Option<SessionMetadata>> {
@@ -81,15 +120,25 @@ impl MetadataStore {
         &self,
         name: &str,
     ) -> io::Result<Option<T>> {
+        let Some(file) = self.record_file(name)? else { return Ok(None); };
+        serde_json::from_slice(&bounded_bytes(file)?).map(Some).map_err(invalid)
+    }
+
+    /// Reads a private JSON document; its caller validates the document's schema.
+    /// Unlike small restart records, documents have no aggregate byte-size policy.
+    pub(crate) fn load_document<T: serde::de::DeserializeOwned>(&self, name: &str) -> io::Result<Option<T>> {
+        let Some(file) = self.record_file(name)? else { return Ok(None); };
+        serde_json::from_reader(BufReader::new(file)).map(Some).map_err(invalid)
+    }
+
+    fn record_file(&self, name: &str) -> io::Result<Option<File>> {
         let file = match read_regular(&self.root.join(name)) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         check_private(&file.metadata()?)?;
-        let bytes = bounded_bytes(file)?;
-        let value = serde_json::from_slice(&bytes).map_err(invalid)?;
-        Ok(Some(value))
+        Ok(Some(file))
     }
 
     /// Atomically replaces restart metadata with a private, flushed file. On
@@ -105,6 +154,15 @@ impl MetadataStore {
         if bytes.len() as u64 > MAX_METADATA {
             return Err(invalid("metadata exceeds size limit"));
         }
+        self.write_record(name, &bytes)
+    }
+
+    /// Atomically persists a private JSON document with caller-validated content.
+    pub(crate) fn save_document<T: Serialize>(&self, name: &str, value: &T) -> io::Result<()> {
+        self.write_record(name, &serde_json::to_vec(value).map_err(invalid)?)
+    }
+
+    fn write_record(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         let destination = self.root.join(name);
         match fs::symlink_metadata(&destination) {
             Ok(meta) => {
@@ -128,7 +186,7 @@ impl MetadataStore {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&temporary)?;
         let result = (|| {
-            file.write_all(&bytes)?;
+            file.write_all(bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, &destination)?;
             File::open(&self.root)?.sync_all()

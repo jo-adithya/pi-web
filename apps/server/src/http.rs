@@ -23,6 +23,7 @@ use std::{
 use tokio::sync::{Semaphore, watch};
 
 mod listener;
+mod history;
 mod multiplex;
 pub use listener::BoundedListener;
 
@@ -144,6 +145,7 @@ pub fn router(state: WebState) -> Router {
         .route("/auth", post(auth))
         .route("/sw.js", get(service_worker))
         .route("/push", post(push_request))
+        .route("/history/{session}", post(history::read))
         .route("/files/{session}", post(workspace_files))
         .route("/files/{session}/source", post(workspace_source))
         .route("/review/{session}", post(local_review))
@@ -170,6 +172,7 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
     let valid_origin =
         origins.iter().count() <= 1 && origins.iter().all(|origin| origin == state.origin.as_str());
     let stateful = matches!(request.uri().path(), "/auth" | "/ws" | "/push")
+        || request.uri().path().starts_with("/history/")
         || request.uri().path().starts_with("/images/")
         || request.uri().path().starts_with("/files/")
         || request.uri().path().starts_with("/review/");

@@ -104,6 +104,7 @@ pub(super) fn validate(message: &BrowserMessage) -> Result<(), &'static str> {
         BrowserAction::Prompt { text, images } | BrowserAction::Steer { text, images } if (text.trim().is_empty() && images.is_empty()) || text.len() > 32 * 1024 || images.len() > 4 || images.iter().any(|id| !crate::images::valid_ref(id)) => {
             Err("invalid_prompt")
         }
+        BrowserAction::RetryResponse { message_id } if message_id.is_empty() || message_id.len() > 1024 => Err("invalid_message"),
         BrowserAction::UiReply { dialog_id, answer } => {
             if dialog_id.is_empty() || dialog_id.len() > 1024 {
                 return Err("invalid_dialog");

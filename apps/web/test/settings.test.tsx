@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import { createSignal, flush } from "solid-js";
-import { SettingsPage, type GroupingPreferences } from "../src/SettingsPage";
+import { SettingsPage, type GroupingPreferences, type ResponsePreferences } from "../src/SettingsPage";
 import { createSessionModel } from "../src/session-model";
 import type { GroupOptions } from "../src/review-costs";
 
@@ -22,6 +22,26 @@ function preferences() {
 }
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); });
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+it("keeps simple responses always on and edits only the formatter model", async () => {
+  const model = session("response-settings");
+  const [selected, update] = createSignal({ provider: "openai-codex", id: "gpt-6-luna" });
+  const [disabled, setDisabled] = createSignal(false);
+  const save = vi.fn((next: { provider: string; id: string }) => { update(next); flush(); });
+  const response: ResponsePreferences = { model: selected, setModel: save, disabled, status: () => "Saved on this server." };
+  const page = render(() => <SettingsPage response={response} model={model} theme="system" setTheme={() => {}} />);
+  flush();
+  expect(page.getByText(/Always on/)).toBeTruthy();
+  expect(page.getByRole("button", { name: /^Simple response model / }).textContent).toContain("gpt-6-luna");
+  expect(save).not.toHaveBeenCalled();
+  await chooseOption("Simple response model", "Small · test");
+  expect(save).toHaveBeenCalledWith({ provider: "test", id: "small" });
+  expect(model.state.settings.model).toEqual(cheap);
+  setDisabled(true); flush();
+  expect((page.getByRole("button", { name: /^Simple response model / }) as HTMLButtonElement).disabled).toBe(true);
+  update({ provider: "remote", id: "other" }); flush();
+  expect(page.getByRole("button", { name: /^Simple response model / }).textContent).toContain("other");
+});
 
 it("opens appearance choices from the shared picker and dismisses with Escape without changing the value", async () => {
   const theme = vi.fn();

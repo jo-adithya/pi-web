@@ -44,7 +44,7 @@ it.each([
   initialize(saved, systemDark);
   expect(document.documentElement.classList.contains("dark")).toBe(dark);
   expect(document.querySelector('meta[name="theme-color"]')?.getAttribute("content"))
-    .toBe(dark ? "#171c22" : "#ffffff");
+    .toBe(dark ? "#18211b" : "#fafbf5");
 });
 
 it.each([true, false])("uses system dark=%s when storage is unavailable", systemDark => {

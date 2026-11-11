@@ -52,6 +52,159 @@ is opened. Unavailable folders remain remembered without blocking healthy worksp
 last-selected folder is unavailable at startup, use `--cwd /available/project` to select another.
 Unsaved empty sessions can restart fresh; the UI distinguishes persistence and interrupted output.
 
+## Simple responses and adaptive canvases
+
+Simple responses are always enabled. The default formatter is
+`openai-codex/gpt-6-luna`. Change it under **Settings → Simple responses → Simple
+response model**. The choice is saved server-wide across workspaces, devices, and
+restarts in private `response-settings.json` registry metadata. It applies to future
+formatting calls in existing and new conversations; calls already running keep
+their starting model. Saving settings does not call a model or change the coding model.
+
+No startup flag is required. `--response-model PROVIDER/MODEL` can set a different
+initial default when no server preference has been saved; saved Settings take precedence.
+The chosen model must be configured in Pi. If unavailable, the UI offers retry or
+the Original view, without automatically exposing raw output or switching providers.
+Each completed coding run combines all of its assistant replies, in order, into one
+request to a separate, tool-free Pi process using that model and Pi's existing
+credentials. It adds provider cost and latency. The provider receives assistant reply
+text from that run plus bounded observations: generic tool labels/outcomes and
+captured file paths/line counts. Thinking blocks, raw tool messages/arguments, user
+messages and earlier queries are not attached. File contents are not attached
+separately; code or private data quoted in assistant replies is included. Replies
+and paths may contain private project details.
+
+JSON/schema parser failures show a bounded reason and line/column in the UI and
+saved presentation. Unknown enum values are quoted, escaped and shortened for
+diagnosis; other model-authored values and unknown field names are redacted.
+The rejected model response is not stored in full.
+
+While Pi works, the UI shows activity without rendering intermediate assistant
+messages or per-message loading cards. Only after `agent_settled` does it prepare
+one simple reply covering the completed query. Useful findings and required actions
+from earlier replies are retained; later corrections and the final outcome take precedence.
+There is still only one formatter call per run, not one per assistant reply or visual.
+A short headline and lead introduce one primary visual. The planner selects an answer, result, explanation, investigation,
+review, plan, or comparison layout; supporting sections adapt around that focus.
+Simple acknowledgements can remain one sentence. The outer reply stays unboxed.
+A newly revealed tall canvas starts at its core result instead of its footer, unless
+the reader paused following or chose Original. Loading saved history preserves position.
+A quiet **View original** action opens all retained assistant replies for that query,
+in order, in the same reading area; **Back to simple** returns to the summary. Original content mounts only when
+selected, except explicit HTML-preview replies, which retain their existing direct-preview presentation. **Try again** retries only formatting, never the coding task. History
+also shows one combined simple answer between user messages. Caches and formatting
+retries match the full reply group, rather than only its last message. Original text
+is fetched by the authenticated browser when requested; this is presentation, not redaction.
+Pi's transcript and future model context are unchanged.
+
+Derived results are saved as private per-reply JSON records in the conversation's
+`response-formats/` metadata directory until that conversation is deleted. There is
+no automatic eviction. Presentations are read on demand from their files, rather
+than retained in a second in-memory cache. Each record still has schema-validated
+content. Existing
+`response-formats.json` caches migrate automatically, retaining available entries.
+Migration cannot restore entries the old cache already evicted; reformat those
+answers explicitly if needed. Reconnects replay
+the current result; restarts reuse saved results where the complete answer and its
+SDK source identity are retained. Changing the formatter preference applies to
+future calls and does not hide previously saved adaptive results. Adaptive keys
+include the planner contract, selected model, answer, turn identity and observations. A fresh “Done” reply cannot borrow another turn's
+file changes or outcomes. Older v1 narrative caches stay readable. SDK messages
+without timestamps use runtime-scoped identities; their observations cannot be
+rebound to historical messages. Formatting retries reuse saved observations rather
+than the current workspace. Uncached answers are not automatically billed: use Try again
+in the latest live window, or choose Original on read-only older pages. Interrupted
+or empty answers require viewing the original; truncated browser previews or clipped history missing the start of a reply group cannot be retried.
+Workers have two inference slots across sessions.
+File comparison, queue waits, startup, and generation share one 60-second budget; supervised cleanup
+runs afterward. Simple-response content has no maximum text lengths, component/item
+counts, table dimensions, diagram node/edge counts, or finite chart-value range.
+Required field types, nonempty content, rectangular rows, unique node IDs, valid
+references and safe rendering still apply. Unknown layout names fall back to the
+general Answer layout. Protocol transport safeguards, history projection budgets,
+and server-observed evidence collection budgets remain. Large responses can use
+more memory and render more slowly. Presentation files are separate from
+small restart metadata and its size limit. Saved Ready results skip busy formatter workers.
+
+The info icon beside **View original** shows measured formatting timings: queue
+wait, file comparison, startup, model request, wait for first text, remaining output,
+cleanup, and total. Hover, focus, or tap to open it. Formatting timings start after Pi finishes
+and end before cache saving and browser delivery; first-text waiting is included
+in model-request time. Cached results show the original attempt’s timings and are
+labelled as cached. Older replies without timings say so; opening the tooltip never
+calls a model. This does not impose a 1–3-second response guarantee: provider time
+and output length still determine the normal formatting delay.
+
+Planner wording lives in `apps/server/src/response_format/planner.txt`; typed visual
+contracts live in its `canvas.rs` module. `ResponseCanvas.tsx` owns composition,
+`ResponseGraphics.tsx` draws native visuals, and `response-canvas.css` styles them.
+`SimpleResponse.tsx` retains Original, retries and legacy rendering. New card types
+also need browser validation in `response-schema.ts` and regenerated protocol types
+(`bun run types:generate`). Summary, note, and list-item text supports safe Markdown:
+bold, italics, headings, lists, code, and links. Table cells, comparison text, and
+flow labels use the same policy; fact labels/values and table headers are plain text.
+Source references open in Changes.
+Raw HTML stays escaped; remote images and HTML previews stay disabled in simple
+responses. No formatter-provided code executes. AI summaries can omit or misstate
+details; consult the original for important decisions.
+
+The response vocabulary is typed and read-only:
+
+| Component | Use |
+| --- | --- |
+| `note` | Short supporting context. |
+| `checklist` | Unordered changes or related points, not interactive tasks. |
+| `warning` | A visible risk or limitation, with a warning label. |
+| `steps` | Numbered actions whose order matters. |
+| `checks` | Pi-reported passed, failed, skipped, or unverified outcomes. |
+| `details` | Optional context, collapsed by default. |
+| `code` | Literal source with an optional language label, syntax highlighting and exact copying; never executed. |
+| `table` | Comparisons or data in rectangular rows and columns. |
+| `facts` | Pi-reported label/value pairs. |
+| `comparison` | Visible before/after states, side by side or stacked on phones. |
+| `flow` | A local linear process diagram with connected labels. |
+| `diagram` | Semantic nodes and directed edges, including branches, cycles and explicit hypotheses. App-owned SVG supplies the shapes. |
+| `chart` | Source-reported, comparable finite decimal values in one unit, drawn from a shared zero baseline. |
+| `timeline` | Pi-reported events, hypotheses or next checks, visually distinguished and labelled. |
+| `findings` | Severity-ranked Pi assessments with optional source locations. |
+| `evidence` | References to server-recorded tool outcomes or captured file metadata; the model supplies IDs only. |
+
+The formatter chooses useful blocks without repeating the summary.
+Warnings, required actions and verification gaps belong in visible blocks, not
+`details`. The formatter is instructed to preserve useful tables, numbers, units,
+and row labels rather than flattening comparisons into lists. It leads with a clear
+summary and uses visuals only when they help, without duplicating them in prose.
+Tables and code can also appear in safe Markdown. The code component uses
+`{"type":"code","title":"Example","language":"typescript","code":"const value = 42;\n"}`;
+language is optional. It preserves all source text, including indentation, line endings
+and embedded fences. Known short snippets share Markdown’s syntax highlighter;
+large snippets and unknown languages remain fully visible as plain text. Copy code
+copies exactly the source; copying the whole answer includes a containing Markdown
+fence. Code and HTML snippets never execute or open previews. Source links remain Markdown.
+Copying includes all supporting text, including table headers/rows, fact labels,
+before/after states, graph relationships and hypotheses, chart precision/units,
+ranked findings, recorded provenance, collapsed details, and check labels. Warnings
+lead adaptive reading order; optional details come last.
+
+Blue/teal accents distinguish data and relationships. Warning and outcome colors
+retain text labels, and all colors follow the current light/dark theme. Diagrams use
+app-owned shapes, arrows and responsive layout. Model-provided SVG, Mermaid, arbitrary
+HTML/CSS and generated images are not accepted. The visual components need no extra
+model calls or external resources; formatter output must satisfy the component schemas.
+The larger vocabulary does not guarantee lower provider latency or perfect rewriting.
+Existing cached answers stay reusable; new replies can use the expanded vocabulary.
+These components never run commands, perform checks or change files.
+
+Server observations are separate from Pi's narrative claims. Tool traces record paired
+RPC outcomes from the latest twelve calls; “Call completed” is **not** proof that tests
+passed. Recorded tool errors
+remain visible even if the planner omits their evidence block, and may include recovered
+errors. File metadata reuses the existing before/after turn capture; pre-existing edits
+are excluded, but concurrent/manual edits are included. It is a content comparison, not
+an ownership claim or filesystem transaction. Unavailable/stale captures stay unknown;
+binary, symlink, oversized or over-budget data may be omitted. File links open the current
+Changes/source view, not an immutable historical diff. The planner receives no patch text.
+
 ## Phone access with Tailscale Serve
 
 Remote access is opt-in. The listener stays on `127.0.0.1`; `--remote-origin`
@@ -140,6 +293,13 @@ Open **Changes** beside **Conversation** to review the selected conversation’s
 workspace, even when its Pi runtime is stopped. The workspace must be the root of
 a Git working tree (including a Git-colocated jj repository).
 
+- The header shows the current Git branch, or the working-copy change ID for jj.
+  For jj, attached local bookmarks take priority; otherwise it checks up to three
+  parent hops and labels the nearest unconflicted local bookmarks **Based on**.
+  Equally near merge-parent bookmarks are shown together, not chosen arbitrarily.
+  This is an ancestry hint, not an active branch. Last turn retains the context
+  from capture time. jj metadata reads do not snapshot the working copy or merge
+  operations; an unavailable jj CLI leaves the Git diff usable. Refresh to update.
 - **Unstaged** compares tracked files with the index. Untracked filenames are listed,
   but their contents are not read. **Staged** compares the index with HEAD.
 - **Branch** lists up to 100 local and locally stored remote-tracking branches on
@@ -252,7 +412,7 @@ a Git working tree (including a Git-colocated jj repository).
 - **Group with AI** is optional; folder grouping remains the default. Clicking it
   sends the displayed file names and bounded diff snippets to the conversation’s
   current Pi provider/model by default. Open **Settings → AI review** from the
-  Settings button at the bottom of the sidebar to choose a separate grouping model and run limits without
+  Settings button in the top bar (or the sidebar on phones) to choose a separate grouping model and run limits without
   changing chat. AI review preferences are shared across this server’s workspaces,
   conversations, and devices, and saved in the private registry’s `grouping-settings.json`.
   Updates apply immediately to connected clients and new runs without a restart;
@@ -351,16 +511,19 @@ a Git working tree (including a Git-colocated jj repository).
 - Completed answers offer **Copy answer** (Markdown text); completed code blocks offer
   **Copy code** without their surrounding controls. Buttons appear on hover/focus or
   remain visible on touch devices. Clipboard permission failures show a manual-copy fallback.
-- Use the **+** in the composer to choose PNG/JPEG images, or continue to paste/drop them.
+- Use **Attach images** (the image icon) in the composer to choose PNG/JPEG images, or continue to paste/drop them.
   Picking never sends a prompt. Existing limits apply: four images, model support,
   idle upload, and a combined 512 KiB after preparation.
-- Fold workspace conversations with the chevron beside their heading. The selected
-  conversation stays visible; folding is remembered in this browser and is page-local
-  if storage is blocked. Solid unread dots mark newly observed successful/error run
-  completions outside the visible conversation, including in collapsed workspace headings.
-  Opening the visible transcript clears its dot. These markers last only for this page;
-  reload/history snapshots do not replay completions, and aborted runs do not add markers.
-- Send with Enter, the button or Ctrl/⌘ Enter; Shift+Enter inserts a newline. During running/retrying, the send action becomes **Steer Pi**: the correction is delivered after the current assistant tool calls, before the next model call. It does not abort tools or promise immediate delivery. Only confirmed acceptance clears the submitted draft; rejection or uncertain delivery keeps it, with no automatic resend. Model/thinking configuration stays idle-only, and compaction, pending dialogs, reconciliation, and cancellation do not accept steering. **Stop** remains separate and clears queued prompts, then requests
+- Switch folders with the workspace picker above the flat conversation list. Search
+  conversation titles and workspace names with **Filter conversations**, or narrow the
+  list with **This project**. Filters stay local to the mounted sidebar; they never switch
+  conversations or change drafts. **All projects** restores the cross-workspace list.
+  Hide the desktop sidebar with the panel button in the top bar to focus on chat.
+  Solid unread dots mark newly observed successful/error run completions outside the
+  visible conversation, including in the workspace picker. Opening the visible transcript
+  clears its dot. These markers last only for this page; reload/history snapshots do not
+  replay completions, and aborted runs do not add markers.
+- Send with the button or Ctrl/⌘ Enter. On desktop, Enter also sends; on mobile, Enter inserts a newline. Shift+Enter always inserts a newline. During running/retrying, the send action becomes **Steer Pi**: the correction is delivered after the current assistant tool calls, before the next model call. It does not abort tools or promise immediate delivery. Only confirmed acceptance clears the submitted draft; rejection or uncertain delivery keeps it, with no automatic resend. Model/thinking configuration stays idle-only, and compaction, pending dialogs, reconciliation, and cancellation do not accept steering. **Stop** remains separate and clears queued prompts, then requests
   abort; only `agent_settled` means completion. An unconfirmed cancellation offers
   separately confirmed process termination. Failed/exited children require explicit
   restart; prompts are never replayed automatically.
@@ -418,7 +581,9 @@ a Git working tree (including a Git-colocated jj repository).
   underlying Pi transcript unchanged.
   **Delete conversation…** in the top menu (or **Delete…** in the sidebar) confirms removal from Pi Web, stops
   its runtime, discards its page-local draft, and permanently deletes its saved Pi
-  transcript. Project files are not deleted. This cannot be undone.
+  transcript and conversation-owned simplified-response records (including legacy
+  caches). Shared workspace settings and project files are not deleted. This cannot
+  be undone. Presentation cleanup failures keep the sidebar entry available for retry.
   Deleting a workspace's last conversation creates a blank stopped replacement;
   reopen it to start chatting. Failed cleanup or transcript deletion leaves the entry
   visible. If the transcript was deleted but saving the catalog fails, an explicit
@@ -437,13 +602,22 @@ a Git working tree (including a Git-colocated jj repository).
   separate project folders, but are **not security sandboxes or isolated worktrees**:
   coordinate concurrent edits. Split views are not supported.
   Existing project histories and legacy metadata are adopted in place.
-- Recent display is bounded to 500 messages/8 MiB and 64 KiB per message, with
-  explicit omission markers. Initially only 100 messages mount; reveal earlier
-  **retained** messages locally. Tool calls and results are omitted from the web
-  transcript, as are internal subagent completion notifications. Pi still receives
-  those results, executes tools, and keeps its full session history.
+- Conversations open on the latest **10 exchanges**. **Older** and **Newer** read
+  replacement pages from disk; **Back to latest** resumes live snapshots. The browser
+  releases the previous page rather than accumulating it. While viewing history,
+  live status and a new-replies notice continue without retaining new message bodies.
+  Completed simplified replies release their original source text from server/browser
+  history; **View original** reads it from Pi on demand and closing it releases that
+  browser copy. Older pages are read-only; formatting retries remain in the latest live
+  window. Timestamp-less, interrupted or truncated sources retain their existing
+  inline recovery previews. History navigation and Original never invoke a model.
+  Pages retain the existing 500-entry/8 MiB and 64 KiB-per-preview safety guards,
+  with explicit omission markers. Tool text and internal completion notifications
+  remain hidden. Pi still owns its complete transcript and model context; its own
+  process memory is separate from Pi Web’s bounded display window.
 - Large Pi files are resumed without fetching aggregate history over RPC. The
-  read-only projection caps scan work at 128 MiB, decoded entries at 64 KiB,
+  read-only projection uses opaque byte/ancestry cursors to resume older pages
+  without rescanning the file tail. It caps each scan at 128 MiB, decoded entries at 64 KiB,
   and retained decoded nodes at 16,384; dense/oversized records may yield a shorter
   window or an explicit history-only warning. Pi still owns full model context.
 - The composer footer also shows **Codex subscription usage** (percent used per provider

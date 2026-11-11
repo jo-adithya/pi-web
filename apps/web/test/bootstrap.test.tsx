@@ -19,16 +19,16 @@ const storageKey = "pi-web.capability.v1", first = "a".repeat(64), second = "b".
 beforeEach(() => { sessionStorage.setItem(storageKey, first); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); sessionStorage.clear(); history.replaceState(null, "", "/"); });
 
-it("places icon-only Settings to the right of the color picker with accessible labels", () => {
+it("keeps accessible Settings in the compact header and appearance in the sidebar", () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true })); vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
   const settings = page.getByRole("button", { name: "Settings" });
   const picker = page.getByRole("button", { name: /^Color scheme / });
   expect(settings.textContent).toBe("");
   expect(settings.title).toBe("Settings");
-  expect(settings.parentElement).toBe(picker.closest(".theme-picker"));
-  expect(settings.previousElementSibling?.contains(picker)).toBe(true);
-  expect(picker.closest(".theme-picker")?.querySelector(":scope > span")).toBeNull();
+  expect(within(page.getByRole("navigation", { name: "Studio tools" })).getByRole("button", { name: "Settings" })).toBe(settings);
+  expect(settings.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+  expect(picker.closest(".sidebar-footer")).not.toBeNull();
   fireEvent.click(settings); flush();
   expect(page.getByRole("heading", { name: "Settings" })).toBeTruthy();
 });
@@ -66,7 +66,7 @@ it.each(["terminal URL", "pasted link"])("keeps an unacknowledged draft editable
   function attach(socket: Socket) {
     socket.onopen?.();
     const sessionId = "10000000-0000-4000-8000-000000000001", epoch = "20000000-0000-4000-8000-000000000001";
-  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
+  const catalog = { v: 2, responseModel: { provider: "openai-codex", id: "gpt-6-luna" }, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
   socket.onmessage?.({ data: JSON.stringify(catalog) });
     for (const body of [
       { type: "hello", project: "fixture", process: "ready" },
@@ -102,8 +102,8 @@ it("opens Settings without a conversation or starting AI work", async () => {
   const page = render(() => <App />);
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const settings = page.getByRole("button", { name: "Settings" });
-  expect(settings.closest(".sidebar-footer")).not.toBeNull();
-  expect(settings.closest(".workspace-controls")).toBeNull();
+  expect(settings.closest(".header-tools")).not.toBeNull();
+  expect(settings.closest(".workspace-controls")).not.toBeNull();
   fireEvent.click(settings); flush();
   expect(page.getByRole("heading", { name: "Settings", level: 1 })).toBeTruthy();
   expect(page.getByText("Connect to load global AI review settings.")).toBeTruthy();
@@ -139,7 +139,7 @@ it("keeps the chat draft and review preferences when navigating through Settings
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0], sessionId = "10000000-0000-4000-8000-000000000001", epoch = "20000000-0000-4000-8000-000000000001";
   socket.onopen?.();
-  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
+  const catalog = { v: 2, responseModel: { provider: "openai-codex", id: "gpt-6-luna" }, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
   socket.onmessage?.({ data: JSON.stringify(catalog) });
   for (const body of [
     { type: "hello", project: "fixture", process: "ready" },
@@ -153,7 +153,7 @@ it("keeps the chat draft and review preferences when navigating through Settings
   fireEvent.change(page.getByLabelText("Maximum AI calls"), { target: { value: "2" } }); flush();
   const update = JSON.parse(socket.send.mock.calls.at(-1)![0]);
   expect(update.action).toEqual({ type: "set_grouping_settings", settings: { model: null, maxCalls: 2, maxRequestBytes: 524288, includeGenerated: false } });
-  expect(page.getByRole("status").textContent).toContain("Saving settings");
+  expect(within(page.getByRole("region", { name: "AI review" })).getByRole("status").textContent).toContain("Saving settings");
   socket.onmessage?.({ data: JSON.stringify({ ...catalog, code: "grouping_settings_updated", requestId: update.requestId, groupingSettings: update.action.settings }) }); flush();
   fireEvent.click(page.getByRole("button", { name: "Conversation" })); flush();
   expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep my draft");
@@ -183,7 +183,7 @@ it.each([true, false])("keeps a grouping run alive across Settings (finish there
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0], sessionId = "10000000-0000-4000-8000-000000000001", epoch = "20000000-0000-4000-8000-000000000001";
   socket.onopen?.();
-  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
+  const catalog = { v: 2, responseModel: { provider: "openai-codex", id: "gpt-6-luna" }, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "My review", lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } }] };
   socket.onmessage?.({ data: JSON.stringify(catalog) });
   for (const body of [
     { type: "hello", project: "fixture", process: "ready" },
@@ -222,7 +222,7 @@ it("uses accessible icon-only view buttons on mobile and text on desktop", async
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   Socket.instances[0].onopen?.();
   const sessionId = "10000000-0000-4000-8000-000000000001";
-  const catalog = { v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "stopped", runtime: null }] };
+  const catalog = { v: 2, responseModel: { provider: "openai-codex", id: "gpt-6-luna" }, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: sessionId, selectedWorkspace: "30000000-0000-4000-8000-000000000001", workspaces: [{ workspaceId: "30000000-0000-4000-8000-000000000001", name: "fixture", path: "/projects/fixture" }], sessions: [{ sessionId, workspaceId: "30000000-0000-4000-8000-000000000001", title: "Conversation 1", lifecycle: "stopped", runtime: null }] };
   Socket.instances[0].onmessage?.({ data: JSON.stringify(catalog) });
   flush();
   for (const name of ["Conversation", "Changes"]) {

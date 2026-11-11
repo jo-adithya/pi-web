@@ -19,6 +19,7 @@ use std::{
 use tokio::sync::{Mutex, watch};
 
 mod grouping_settings;
+mod response_settings;
 
 pub const MAX_ACTIVE: usize = 4;
 const CACHE_BYTES: usize = 512 * 1024;
@@ -29,6 +30,7 @@ struct Inner {
     push: Option<crate::push::PushService>,
     registry_store: MetadataStore,
     grouping_changed: watch::Sender<()>,
+    response_model: watch::Sender<config::ResponseModel>,
     owners: Ownership,
     state: Mutex<State>,
 }
@@ -47,6 +49,7 @@ struct Project {
 }
 struct State {
     grouping_settings: GroupingSettings,
+    response_model: config::ResponseModel,
     registry: Registry,
     projects: BTreeMap<String, Project>,
     active: BTreeMap<String, Active>,
@@ -67,6 +70,8 @@ impl SessionManager {
     ) -> io::Result<Self> {
         let registry_store = MetadataStore::open(&config.registry_dir)?;
         let grouping_settings = GroupingSettings::load(&registry_store)?;
+        let response_model = config::ResponseModel::load(&registry_store, &config.response_model)?;
+        let (response_model_tx, _) = watch::channel(response_model.clone());
         let mut registry = Registry::load(&registry_store)?;
         if config.explicit_cwd || registry.entries.is_empty() {
             let cwd = canonical_folder(&config.cwd)?;
@@ -117,7 +122,7 @@ impl SessionManager {
             .find(|entry| entry.id == project.catalog.selected)
             .unwrap();
         let owners = Ownership::default();
-        let handle = Self::launch(&project.config, &project.store, entry, owners.clone(), push.clone())?;
+        let handle = Self::launch(&project.config, &project.store, entry, owners.clone(), push.clone(), response_model_tx.subscribe())?;
         let active = BTreeMap::from([(
             entry.id.clone(),
             Active {
@@ -130,9 +135,11 @@ impl SessionManager {
             push,
             registry_store,
             grouping_changed: watch::channel(()).0,
+            response_model: response_model_tx,
             owners,
             state: Mutex::new(State {
                 grouping_settings,
+                response_model,
                 registry,
                 projects,
                 active,
@@ -218,6 +225,7 @@ impl SessionManager {
         entry: &CatalogEntry,
         owners: Ownership,
         push: Option<crate::push::PushService>,
+        response_model: watch::Receiver<config::ResponseModel>,
     ) -> io::Result<SessionHandle> {
         require_available_folder(&config.cwd)?;
         let store = Self::record_store(config, root, entry)?;
@@ -235,7 +243,7 @@ impl SessionManager {
         options
             .session_roots
             .push(config.state_dir.join("sessions"));
-        session::start_owned(options, store, metadata, owners, push)
+        session::start_owned(options, store, metadata, owners, push, response_model)
     }
     fn add_record(
         config: &Config,
@@ -324,6 +332,7 @@ impl SessionManager {
         WorkspaceReply {
             v: 2,
             grouping_settings: state.grouping_settings.clone(),
+            response_model: state.response_model.clone(),
             request_id,
             ok,
             code: code.into(),
@@ -376,6 +385,7 @@ impl SessionManager {
             && match &command.action {
                 WorkspaceAction::List | WorkspaceAction::Create => true,
                 WorkspaceAction::SetGroupingSettings { settings } => settings.valid(),
+                WorkspaceAction::SetResponseModel { model } => model.valid(),
                 WorkspaceAction::CreateIn { workspace_id }
                 | WorkspaceAction::SelectWorkspace { workspace_id } => valid_id(workspace_id),
                 WorkspaceAction::DeleteWorkspace { workspace_id, expected_sessions, .. } => {
@@ -441,6 +451,7 @@ impl SessionManager {
                     workspaces: vec![],
                     selected_workspace: String::new(),
                     grouping_settings: self.snapshot().await.grouping_settings,
+                    response_model: self.snapshot().await.response_model,
                 };
             }
         }
@@ -490,12 +501,28 @@ impl SessionManager {
         // Serialize mutations until removal commits to prevent new runtimes or selection races.
         if state.removing_workspace && !matches!(command.action,
             WorkspaceAction::List | WorkspaceAction::Subscribe { .. } | WorkspaceAction::Unsubscribe { .. }
-                | WorkspaceAction::SetGroupingSettings { .. }
+                | WorkspaceAction::SetGroupingSettings { .. } | WorkspaceAction::SetResponseModel { .. }
         ) {
             return Self::reply(&state, id, false, "workspace_busy");
         }
         match &command.action {
             WorkspaceAction::List => Self::reply(&state, id, true, "catalog"),
+            WorkspaceAction::SetResponseModel { model } => {
+                if model.save(&self.0.registry_store).is_err() {
+                    if let Ok(saved) = config::ResponseModel::load(&self.0.registry_store, &self.0.config.response_model) {
+                        if saved != state.response_model {
+                            state.response_model = saved.clone();
+                            self.0.response_model.send_replace(saved);
+                            self.0.grouping_changed.send_replace(());
+                        }
+                    }
+                    return Self::reply(&state, id, false, "response_settings_write_failed");
+                }
+                state.response_model = model.clone();
+                self.0.response_model.send_replace(model.clone());
+                self.0.grouping_changed.send_replace(());
+                Self::reply(&state, id, true, "response_model_updated")
+            }
             WorkspaceAction::SetGroupingSettings { settings } => {
                 if settings.save(&self.0.registry_store).is_err() {
                     // A directory flush can fail after replacement; keep live values aligned
@@ -634,6 +661,7 @@ impl SessionManager {
                         entry,
                         self.0.owners.clone(),
                         self.0.push.clone(),
+                        self.0.response_model.subscribe(),
                     ) {
                         Ok(handle) => {
                             state.active.insert(
@@ -708,6 +736,7 @@ impl SessionManager {
                     entry,
                     self.0.owners.clone(),
                     self.0.push.clone(),
+                    self.0.response_model.subscribe(),
                 ) {
                     Ok(handle) => {
                         state.active.insert(
@@ -767,6 +796,7 @@ impl SessionManager {
                         entry,
                         self.0.owners.clone(),
                         self.0.push.clone(),
+                        self.0.response_model.subscribe(),
                     ) {
                         Ok(handle) => {
                             state.active.insert(
@@ -865,6 +895,14 @@ impl SessionManager {
                     Ok(removed) => removed,
                     Err(_) => return Self::reply(&state, id, false, "transcript_delete_failed"),
                 };
+                let entry = project.catalog.entries.iter().find(|entry| entry.id == *session_id).unwrap();
+                let cleaned = match Self::record_store(&project.config, &project.store, entry) {
+                    Ok(store) => matches!(tokio::task::spawn_blocking(move || crate::response_format::remove_saved(&store)).await, Ok(Ok(()))),
+                    Err(_) => false,
+                };
+                if !cleaned {
+                    return Self::reply(&state, id, false, "presentation_delete_failed");
+                }
                 if Self::forget_record(project, session_id).is_err() {
                     let code = if removed {
                         "catalog_write_failed_after_transcript_deleted"

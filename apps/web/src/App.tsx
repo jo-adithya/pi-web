@@ -15,7 +15,8 @@ import { decodeWorkspace } from "./workspace-state";
 import { createSessionModel, type SessionModel } from "./session-model";
 import { SessionView } from "./SessionView";
 import { LocalReview } from "./LocalReview";
-import { SettingsPage, type GroupingPreferences } from "./SettingsPage";
+import { SettingsPage, type GroupingPreferences, type ResponsePreferences } from "./SettingsPage";
+import type { ResponseModel } from "./generated/protocol";
 import type { GroupOptions } from "./review-costs";
 import { createCompletionNotifications } from "./notifications";
 import { createPhonePush } from "./phone-push";
@@ -42,30 +43,32 @@ export default function App() {
     return () => viewport.removeEventListener("resize", resized);
   });
   const [sidebarOpen, setSidebarOpen] = createSignal(false);
+  const [shelfOpen, setShelfOpen] = createSignal(true);
   const [sidebarDrag, setSidebarDrag] = createSignal<SidebarDrag | null>(null);
   const [catalog, setCatalog] = createSignal<CatalogItem[]>([]);
   const [selected, setSelected] = createSignal("");
   const [view, setView] = createSignal<"conversation" | "changes" | "settings">("conversation");
   const [settingsReview, setSettingsReview] = createSignal("");
   const [workspaces, setWorkspaces] = createSignal<WorkspaceItem[]>([]);
-  let savedCollapsed: string[] = [];
-  try {
-    const saved: unknown = JSON.parse(localStorage.getItem("pi-web.collapsed-workspaces.v1") ?? "[]");
-    if (Array.isArray(saved) && saved.length <= 16 && saved.every(id => typeof id === "string" && id.length <= 128)) savedCollapsed = saved;
-  } catch { /* Workspace folding stays available when browser storage is blocked. */ }
-  const [collapsedWorkspaces, setCollapsedWorkspaces] = createSignal(savedCollapsed);
   const [unread, setUnread] = createSignal<string[]>([]);
-  function toggleWorkspace(id: string) {
-    const next = collapsedWorkspaces().includes(id) ? collapsedWorkspaces().filter(value => value !== id) : [...collapsedWorkspaces().filter(value => workspaces().some(workspace => workspace.workspaceId === value)), id];
-    setCollapsedWorkspaces(next);
-    try { localStorage.setItem("pi-web.collapsed-workspaces.v1", JSON.stringify(next)); } catch { /* Keep the page-local choice. */ }
-  }
   const [addingWorkspace, setAddingWorkspace] = createSignal(false);
   const [connection, setConnection] = createSignal("Connecting");
   const [loginOpen, setLoginOpen] = createSignal(false);
   const [loginLink, setLoginLink] = createSignal("");
   const [reloadConfirmation, setReloadConfirmation] = createSignal<{ returnFocus: Element | null } | null>(null);
   const [notice, setNotice] = createSignal(""); const [managementPending, setManagementPending] = createSignal(0);
+  const [responseModel, setResponseModel] = createSignal<ResponseModel>();
+  const [responseSave, setResponseSave] = createSignal<string>();
+  const [responseError, setResponseError] = createSignal("");
+  const responsePreferences: ResponsePreferences = {
+    model: () => responseModel()!,
+    disabled: () => connection() !== "Connected" || !!responseSave(),
+    status: () => responseError() || (connection() !== "Connected" ? "Reconnect to update settings." : responseSave() ? "Saving settings…" : "Saved on this server."),
+    setModel: model => {
+      const id = command({ type: "set_response_model", model });
+      if (id) { setResponseError(""); setResponseSave(id); }
+    },
+  };
   const [groupingSettings, setGroupingSettings] = createSignal<GroupOptions>();
   const [groupingSave, setGroupingSave] = createSignal<string>();
   const [groupingError, setGroupingError] = createSignal("");
@@ -134,10 +137,12 @@ export default function App() {
     if (command({ type: "subscribe", sessionId: id })) subscriptions.add(id);
   }
   function disconnectModels() {
+    if (responseSave()) setResponseError("Connection lost while saving. Reconnect to check the server’s current settings.");
+    setResponseSave(undefined);
     if (groupingSave()) setGroupingError("Connection lost while saving. Reconnect to check the server’s current settings.");
     setGroupingSave(undefined);
     for (const model of models.values()) model.disconnected();
-    if ([...pending.values()].some(action => ["create", "create_in", "add_workspace", "select_workspace", "open", "stop", "delete", "delete_workspace", "rename", "set_grouping_settings"].includes(action.type))) setNotice("A workspace operation may have completed. Inspect the catalog before retrying; nothing was replayed.");
+    if ([...pending.values()].some(action => ["create", "create_in", "add_workspace", "select_workspace", "open", "stop", "delete", "delete_workspace", "rename", "set_grouping_settings", "set_response_model"].includes(action.type))) setNotice("A workspace operation may have completed. Inspect the catalog before retrying; nothing was replayed.");
     pending.clear(); setManagementPending(0); subscriptions.clear(); blocked.clear(); selectionRequest = undefined;
   }
   function connect() {
@@ -162,6 +167,11 @@ export default function App() {
             const model = modelFor(item.sessionId);
             if (item.lifecycle === "stopped") { model.stopped(); subscriptions.delete(item.sessionId); blocked.delete(item.sessionId); }
           }
+          setResponseModel(reply.responseModel);
+          if (reply.requestId === responseSave()) {
+            setResponseSave(undefined);
+            setResponseError(reply.ok ? "" : "Response model could not be saved reliably. Shown values reflect the server’s current settings; check before retrying.");
+          }
           const preferences: GroupOptions = { ...reply.groupingSettings, model: reply.groupingSettings.model ?? undefined };
           setGroupingSettings(preferences);
           for (const model of models.values()) model.review.grouping.setOptions(preferences);
@@ -182,6 +192,8 @@ export default function App() {
               modelFor(action.sessionId).setNotice(reply.code === "too_many_clients" ? "This session has reached its connected-device limit. Close another tab, then Reattach here." : `Attachment failed: ${reply.code.replaceAll("_", " ")}.`);
             } else setNotice(reply.code === "catalog_write_failed_after_transcript_deleted"
               ? "The saved transcript was deleted, but the sidebar entry could not be removed. Retry deletion to finish."
+              : reply.code === "presentation_delete_failed"
+              ? "Saved simplified replies could not be removed. Retry deletion to finish; the transcript may already have been deleted."
               : `Workspace command not completed: ${reply.code.replaceAll("_", " ")}.`);
           }
           for (const item of reply.sessions) if (item.lifecycle === "open") subscribe(item.sessionId);
@@ -308,9 +320,12 @@ export default function App() {
   const canManage = () => connection() === "Connected" && managementPending() === 0;
   const canCreate = () => canManage() && Boolean(entry()) && catalog().filter(item => item.lifecycle !== "stopped").length < 4 && catalog().filter(item => item.workspaceId === entry()?.workspaceId).length < 32;
   const [paletteOpen, setPaletteOpen] = createSignal(false);
+  let sessionsTrigger: HTMLButtonElement | undefined;
+  let paletteReturnFocus: Element | undefined;
   function openPalette() {
     // Keep extension prompts and other modal tasks in control of keyboard focus.
     if (document.querySelector('[role="dialog"], [role="alertdialog"]')) return;
+    paletteReturnFocus = undefined;
     setPaletteOpen(true);
   }
   onSettled(() => {
@@ -330,7 +345,7 @@ export default function App() {
     ...workspaces().map(workspace => ({ id: workspace.workspaceId, label: workspace.name, detail: `Workspace · ${workspace.path}`, disabled: !canManage(), run: () => { if (canManage()) command({ type: "select_workspace", workspaceId: workspace.workspaceId }); } })),
     ...catalog().map(item => ({ id: item.sessionId, label: item.title, detail: `Conversation · ${workspaces().find(workspace => workspace.workspaceId === item.workspaceId)?.name ?? ""} · ${item.lifecycle}`, run: () => choose(item) })),
   ]);
-  const sidebar = () => <SessionSidebar collapsed={collapsedWorkspaces()} toggleWorkspace={toggleWorkspace} unread={id => unread().includes(id)} catalog={catalog()} workspaces={workspaces()} selected={selected()} selectedWorkspace={entry()?.workspaceId ?? ""} canCreate={canCreate()}
+  const sidebar = () => <SessionSidebar unread={id => unread().includes(id)} catalog={catalog()} workspaces={workspaces()} selected={selected()} selectedWorkspace={entry()?.workspaceId ?? ""} canCreate={canCreate()}
     rename={renameConversation} remove={deleteConversation} removeWorkspace={deleteWorkspace}
     canManage={canManage()} adding={addingWorkspace()} setAdding={value => { setNotice(""); setAddingWorkspace(value); }} notice={notice()}
     addWorkspace={path => { setNotice(""); command({ type: "add_workspace", path, confirmed: true }); }}
@@ -338,28 +353,32 @@ export default function App() {
     choose={item => { choose(item); setSidebarOpen(false); }} create={() => { const workspaceId = entry()?.workspaceId; if (workspaceId) command({ type: "create_in", workspaceId }); setSidebarOpen(false); }}
     activity={id => { const model = models.get(id); return model?.online() && model.state.status.process === "ready" ? model.state.status.activity : undefined; }}
     needsInput={id => Boolean(models.get(id)?.state.dialogs.length)} theme={theme.preference()} setTheme={theme.setPreference}
-    settingsOpen={view() === "settings"} openSettings={openSettings} />;
+    settingsOpen={view() === "settings"} openSettings={openSettings} mobile={mobile()} openPalette={() => { paletteReturnFocus = mobile() ? sessionsTrigger : undefined; setSidebarOpen(false); setPaletteOpen(true); }} />;
   return <Dialog preventScroll={sidebarOpen()} forceMount={canShowSidebar() && sidebarDrag() !== null} open={canShowSidebar() && sidebarOpen()} onOpenChange={setSidebarOpen}>
     <div class={["workspace", { "pinch-zoomed": pinchZoomed(), "review-workspace": view() === "changes" && Boolean(current()), "settings-workspace": view() === "settings" }]}>
       <Show when={!mobile()}>
-        <aside class="sidebar" aria-label="Sessions">
-          <div class="sidebar-brand"><span class="brand">π</span><span>Pi<span class="brand-subtitle">Local workspace</span></span></div>
+        <aside class="sidebar" id="project-shelf" aria-label="Sessions" hidden={!shelfOpen()}>
+          <div class="sidebar-brand"><span class="brand" aria-hidden="true">π</span><strong>Pi Web</strong><span class="brand-subtitle">Workspace</span></div>
           {sidebar()}
         </aside>
       </Show>
       <main class="chat-panel">
-        <div class="workspace-controls">
-          <Show when={mobile()}><Dialog.Trigger class="icon-button" aria-label="Open sessions" disabled={!canShowSidebar()}><Icon name="panel" /></Dialog.Trigger>
-            <Show when={entry()}>{item => <Button class="workspace-context" aria-label={`Switch conversation: ${workspaces().find(workspace => workspace.workspaceId === item().workspaceId)?.name ?? ""} / ${item().title}`} title="Switch workspace or conversation" onClick={openPalette}>
-              <strong>{workspaces().find(workspace => workspace.workspaceId === item().workspaceId)?.name}</strong><span>{item().title}</span>
-            </Button>}</Show>
-          </Show>
+        <header class="workspace-controls">
+          <Show when={!mobile()}><Button class="icon-button" aria-label="Toggle project shelf" aria-expanded={shelfOpen() ? "true" : "false"} aria-controls="project-shelf" title="Focus conversation / show sidebar" onClick={() => setShelfOpen(value => !value)}><Icon name="panel" /></Button></Show>
+          <Show when={mobile()}><Dialog.Trigger ref={sessionsTrigger} class="icon-button" aria-label="Open sessions" disabled={!canShowSidebar()}><Icon name="panel" /></Dialog.Trigger></Show>
+          <Show when={entry()}>{item => <Button class="workspace-context" aria-label={`Switch conversation: ${workspaces().find(workspace => workspace.workspaceId === item().workspaceId)?.name ?? ""} / ${item().title}`} title="Switch workspace or conversation" onClick={openPalette}>
+            <Icon name="folder" /><strong>{workspaces().find(workspace => workspace.workspaceId === item().workspaceId)?.name}</strong><span class="context-divider" aria-hidden="true">/</span><span class="context-title">{item().title}</span>
+          </Button>}</Show>
           <Show when={current()}><div class="workspace-views" role="group" aria-label="Workspace view">
-            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Conversation" title="Conversation" aria-pressed={view() === "conversation" ? "true" : "false"} onClick={() => setView("conversation")}><Show when={mobile()} fallback="Conversation"><Icon name="chat" /></Show></Button>
-            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Changes" aria-describedby={current()?.feedback().length ? "pending-feedback-description" : undefined} title="Changes" aria-pressed={view() === "changes" ? "true" : "false"} onClick={() => setView("changes")}><Show when={mobile()} fallback="Changes"><Icon name="code" /></Show><Show when={current()?.feedback().length}>{count => <><span class="feedback-count" aria-hidden="true">{count()}</span><span id="pending-feedback-description" class="sr-only">{count()} unsent feedback {count() === 1 ? "note" : "notes"}</span></>}</Show></Button>
+            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Conversation" title="Conversation" aria-pressed={view() === "conversation" ? "true" : "false"} onClick={() => setView("conversation")}><Icon name="chat" /><Show when={!mobile()}><span class="workspace-view-label">Conversation</span></Show></Button>
+            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Changes" aria-describedby={current()?.feedback().length ? "pending-feedback-description" : undefined} title="Changes" aria-pressed={view() === "changes" ? "true" : "false"} onClick={() => setView("changes")}><Icon name="branch" /><Show when={!mobile()}><span class="workspace-view-label">Changes</span></Show><Show when={current()?.feedback().length}>{count => <><span class="feedback-count" aria-hidden="true">{count()}</span><span id="pending-feedback-description" class="sr-only">{count()} unsent feedback {count() === 1 ? "note" : "notes"}</span></>}</Show></Button>
           </div></Show>
           <div class="session-controls">
-            <Show when={!mobile() || !entry()}><Button type="button" class="icon-button" aria-label="Command palette" title="Command palette (Ctrl/⌘ K)" aria-keyshortcuts="Control+k Meta+k" onClick={openPalette}><Icon name="search" /></Button></Show>
+            <Show when={!mobile()}><nav class="header-tools" aria-label="Studio tools">
+              <Button class="icon-button" aria-label="Command palette" aria-keyshortcuts="Control+k Meta+k" title="Search (Ctrl/⌘ K)" onClick={openPalette}><Icon name="search" /></Button>
+              <Button class="icon-button" aria-label="Settings" aria-pressed={view() === "settings" ? "true" : "false"} title="Settings" onClick={openSettings}><Icon name="settings" /></Button>
+            </nav></Show>
+            <Show when={mobile() && !entry()}><Button type="button" class="icon-button" aria-label="Command palette" title="Command palette (Ctrl/⌘ K)" aria-keyshortcuts="Control+k Meta+k" onClick={openPalette}><Icon name="search" /></Button></Show>
             <div class="statuses" aria-live="polite"><span class={["connection", { connected: connection() === "Connected" }]} title={connection()}><span class="connection-label">{connection()}</span></span>
             </div>
             <Show when={(!mobile() || !entry()) && (connection() === "Disconnected" || connection() === "Connecting") && capability !== null && !loginOpen()}>
@@ -381,11 +400,11 @@ export default function App() {
               </DropdownMenu.Content></DropdownMenu.Portal>
             </DropdownMenu>}</Show>
           </div>
-        </div>
+        </header>
         <DismissibleAlert class="workspace-notice" message={notice()} />
         <DismissibleAlert class="workspace-notice" message={phonePush.message()} />
         <DismissibleAlert class="workspace-notice" message={notifications.message()} />
-        <Show when={view() === "settings" && !loginOpen()}><SettingsPage model={current()} grouping={groupingSettings() ? groupingPreferences : undefined} theme={theme.preference()} setTheme={theme.setPreference} /></Show>
+        <Show when={view() === "settings" && !loginOpen()}><SettingsPage model={current()} response={responseModel() ? responsePreferences : undefined} grouping={groupingSettings() ? groupingPreferences : undefined} theme={theme.preference()} setTheme={theme.setPreference} /></Show>
         <div style={{ display: view() === "settings" ? "none" : "contents" }}>
         <Show when={(view() !== "settings" || settingsReview() === current()?.id) && connection() !== "Authentication required" && !loginOpen()}><Show when={current()} keyed>{model => <Show when={view() === "conversation"} fallback={<LocalReview model={model} conversation={() => setView("conversation")} />}><Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
           <Show when={entry()?.lifecycle === "stopped"}><Button disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => command({ type: "open", sessionId: model.id })}>Reopen conversation</Button></Show>
@@ -415,7 +434,7 @@ export default function App() {
         <Show when={view() !== "settings" && !catalog().length && connection() !== "Authentication required" && !loginOpen()}><section class="empty workspace-empty"><span class="empty-mark">π</span><h2>Connecting to your workspace</h2><p>Keep the computer and Pi Web server running.</p></section></Show>
       </main>
     </div>
-    <Show when={paletteOpen()}><CommandPalette commands={paletteCommands()} close={() => setPaletteOpen(false)} /></Show>
+    <Show when={paletteOpen()}><CommandPalette commands={paletteCommands()} returnFocus={paletteReturnFocus} close={() => setPaletteOpen(false)} /></Show>
     <Show when={reloadConfirmation()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Reload app?" description="Draft text, reply quotes, and feedback restore from this tab’s storage when available. Attached images and any work this browser could not save will be lost. Saved history is retained. Nothing is sent, stopped, or restarted." action="Reload app" close={() => setReloadConfirmation(null)} confirm={() => window.location.reload()} />}</Show>
     <Show when={workspaceRemoval()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Delete workspace" description={`Remove “${target.item.name}” (${target.item.path}) from Pi? All sessions in this workspace will be stopped and unsent drafts discarded. Project files and saved history will be retained.`} action="Delete workspace" disabled={!workspaceRemovalEligible()} close={() => setWorkspaceRemoval(null)} confirm={submitWorkspaceRemoval} />}</Show>
     <Show when={action()} keyed>{target => <Show when={target.kind === "rename"} fallback={<ConfirmationDialog returnFocus={target.returnFocus} title={target.kind === "delete" ? "Delete conversation" : "Stop session"} description={target.description} action={target.kind === "delete" ? "Delete conversation" : "Stop session"} disabled={!eligible()} close={() => setAction(null)} confirm={submitAction} />}>
@@ -430,10 +449,11 @@ export default function App() {
     <Dialog.Portal>
       {/* Explicit dismissal also covers Kobalte alpha’s unregistered dismissable layer. */}
       <Dialog.Overlay class="sidebar-overlay" data-dragging={sidebarDrag()?.dragging ? "" : undefined} style={{ opacity: sidebarDrag()?.progress }} onClick={() => setSidebarOpen(false)} />
-      <Dialog.Content class="sidebar sidebar-drawer" inert={!sidebarOpen()} data-dragging={sidebarDrag()?.dragging ? "" : undefined} style={{ transform: sidebarDrag() ? `translateX(${(sidebarDrag()!.progress - 1) * 100}%)` : undefined }} onKeyDown={event => {
+      <Dialog.Content class="sidebar sidebar-drawer" onCloseAutoFocus={event => { if (paletteOpen()) event.preventDefault(); }} inert={!sidebarOpen()} data-dragging={sidebarDrag()?.dragging ? "" : undefined} style={{ transform: sidebarDrag() ? `translateX(${(sidebarDrag()!.progress - 1) * 100}%)` : undefined }} onKeyDown={event => {
+        if (event.target instanceof Element && event.target.closest('[role="menu"]')) return;
         if (event.key === "Escape" && !event.isComposing) { event.preventDefault(); setSidebarOpen(false); }
       }}>
-        <div class="sidebar-brand"><span class="brand">π</span><Dialog.Title>Sessions</Dialog.Title><Dialog.CloseButton class="icon-button" aria-label="Close sessions"><Icon name="close" /></Dialog.CloseButton></div>
+        <div class="sidebar-brand"><span class="brand" aria-hidden="true">π</span><Dialog.Title>Sessions</Dialog.Title><Dialog.CloseButton class="icon-button" aria-label="Close sessions"><Icon name="close" /></Dialog.CloseButton></div>
         <Dialog.Description class="sr-only">Choose a workspace and conversation, or add a trusted project folder.</Dialog.Description>
         {sidebar()}
       </Dialog.Content>

@@ -4,6 +4,7 @@
 mod admission;
 mod commands;
 mod history;
+mod progress;
 mod quota;
 mod settings;
 
@@ -55,6 +56,17 @@ pub struct SessionHandle {
     summary: watch::Receiver<RuntimeSummary>,
 }
 impl SessionHandle {
+    /// Reads a bounded page or original through the actor's authoritative Pi checkpoints.
+    pub async fn read_history(&self, request: HistoryRequest) -> Result<HistoryResponse, String> {
+        self.read_history_bounded(request, None).await
+    }
+    /// Carries HTTP admission into blocking reads, including after request/session cancellation.
+    pub(crate) async fn read_history_bounded(&self, request: HistoryRequest, budget: Option<Arc<OwnedSemaphorePermit>>) -> Result<HistoryResponse, String> {
+        let (send, receive) = oneshot::channel();
+        self.tx.try_send(Control::ReadHistory(request, send, budget)).map_err(|_| "History is busy; try again")?;
+        tokio::time::timeout(Duration::from_secs(45), receive).await.map_err(|_| "History request timed out")?
+            .map_err(|_| "History request was interrupted".to_owned())?
+    }
     /// Atomically snapshots a ready runtime's operator launch identity without changing its state.
     pub(crate) async fn grouping_config(&self) -> Result<GroupingConfig, &'static str> {
         let (send, receive) = oneshot::channel();
@@ -125,6 +137,7 @@ pub(crate) struct GroupingConfig {
     pub model: ModelOption,
 }
 enum Control {
+    ReadHistory(HistoryRequest, oneshot::Sender<Result<HistoryResponse, String>>, Option<Arc<OwnedSemaphorePermit>>),
     GroupingConfig(oneshot::Sender<Result<GroupingConfig, &'static str>>),
     Connect(String, oneshot::Sender<Result<Connection, &'static str>>),
     Message(String, BrowserMessage),
@@ -150,6 +163,8 @@ enum StateReason {
     Settings,
 }
 enum HeadPurpose {
+    Read(HistoryRequest, usize, oneshot::Sender<Result<HistoryResponse, String>>, Option<Arc<OwnedSemaphorePermit>>),
+    ReadAfter(history::ReadScan, oneshot::Sender<Result<HistoryResponse, String>>),
     Before,
     After(history::Scan),
 }
@@ -180,9 +195,11 @@ enum Done {
     Commands(Result<Value, rpc::Error>),
     HeadAck(String, Result<Value, rpc::Error>),
     History(Result<history::Scan, String>),
+    ReadHistory(String, Result<history::ReadScan, String>, oneshot::Sender<Result<HistoryResponse, String>>),
     Prompt(String, u64, Result<Value, rpc::Error>),
     Steer(String, Result<Value, rpc::Error>),
     TurnCaptured,
+    Formatted(String, String, crate::response_format::ResponsePresentation),
     Cancel(String, u64, Result<Option<String>, rpc::Error>),
     Ui(String, Result<(), rpc::Error>),
     Terminated(rpc::Exit),
@@ -202,6 +219,13 @@ struct Runtime {
     cleanup_complete: bool,
     exit_observed: bool,
     view: ViewState,
+    progress: progress::Progress,
+    formatter: crate::response_format::Formatter,
+    response_model: watch::Receiver<config::ResponseModel>,
+    format_candidate: Option<(String, Result<String, &'static str>)>,
+    response_replies: crate::response_format::ReplyText,
+    run_started: Option<Instant>,
+    response_evidence: crate::response_format::EvidenceCollector,
     commands: Vec<SlashCommand>,
     settings: AgentSettings,
     background: crate::background::Background,
@@ -220,6 +244,7 @@ struct Runtime {
     jobs: JoinSet<Done>,
     dialogs: VecDeque<PendingDialog>,
     head: Option<HeadWait>,
+    read_pending: bool,
     revision: u64,
     settled: u64,
     push: Option<crate::push::PushService>,
@@ -262,12 +287,14 @@ pub fn start(config: Config) -> io::Result<SessionHandle> {
         )?);
         // Identity is established by Pi after migration, before metadata persistence.
     }
+    let response_model = watch::channel(config.response_model.clone()).1;
     start_owned(
         config,
         Arc::new(store),
         metadata,
         crate::ownership::Ownership::default(),
         None,
+        response_model,
     )
 }
 
@@ -278,6 +305,7 @@ pub(crate) fn start_owned(
     mut metadata: SessionMetadata,
     ownership: crate::ownership::Ownership,
     push: Option<crate::push::PushService>,
+    response_model: watch::Receiver<config::ResponseModel>,
 ) -> io::Result<SessionHandle> {
     if metadata.cwd != config.cwd {
         return Err(io::Error::other("metadata belongs to a different project"));
@@ -297,6 +325,7 @@ pub(crate) fn start_owned(
     let status = RuntimeStatus {
         process: ProcessStatus::Starting,
         activity: Activity::Idle,
+        work_phase: None,
         last_outcome: None,
         error: None,
         history_warning: Some("Loading recent history…".into()),
@@ -305,6 +334,7 @@ pub(crate) fn start_owned(
         notice: None,
         lsp_status: None,
     };
+    let formatter = crate::response_format::Formatter::new(response_model.borrow().clone(), store.clone())?;
     let epoch = config::identity()?;
     ownership.claim(&metadata.app_id, metadata.pi_session_path.as_deref())?;
     let id = metadata.app_id.clone();
@@ -315,6 +345,7 @@ pub(crate) fn start_owned(
     });
     let images = crate::images::Images::default();
     let turns = crate::local_review::TurnChanges::default();
+    let view = ViewState::with_response_formatting(true);
     let runtime = Runtime {
         turns: turns.clone(),
         images: images.clone(),
@@ -329,7 +360,14 @@ pub(crate) fn start_owned(
         events: None,
         cleanup_complete: true,
         exit_observed: true,
-        view: ViewState::default(),
+        view,
+        progress: progress::Progress::default(),
+        formatter,
+        response_model,
+        format_candidate: None,
+        response_replies: crate::response_format::ReplyText::default(),
+        run_started: None,
+        response_evidence: crate::response_format::EvidenceCollector::default(),
         commands: Vec::new(),
         settings: AgentSettings::default(),
         background: crate::background::Background::default(),
@@ -348,6 +386,7 @@ pub(crate) fn start_owned(
         jobs: JoinSet::new(),
         dialogs: VecDeque::new(),
         head: None,
+        read_pending: false,
         revision: 0,
         settled: 0,
         push,
@@ -428,6 +467,7 @@ impl Runtime {
             .collect();
         self.jobs.abort_all();
         while self.jobs.join_next().await.is_some() {}
+        let formatter_clean = self.formatter.shutdown().await;
         if let Some(process) = &self.process {
             for id in dialog_ids {
                 let _ = tokio::time::timeout(
@@ -456,6 +496,7 @@ impl Runtime {
                 );
             }
         }
+        self.cleanup_complete &= formatter_clean;
         if self.cleanup_complete {
             self.ownership.release(&self.metadata.app_id);
         }
@@ -487,6 +528,29 @@ impl Runtime {
     }
     fn control(&mut self, control: Control) {
         match control {
+            Control::ReadHistory(request, reply, budget) => {
+                let valid_id = |id: &str| !id.is_empty() && id.len() <= 1024 && !id.chars().any(char::is_control);
+                let valid = match &request {
+                    HistoryRequest::Page { cursor, start } => cursor.as_deref().is_none_or(valid_id) && start.as_deref().is_none_or(valid_id) && !(cursor.is_some() && start.is_some()),
+                    HistoryRequest::Original { cursor, source_key } => cursor.as_deref().is_none_or(valid_id) && source_key.len() == 64 && source_key.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                };
+                // Frozen pages and completed originals do not depend on live streaming revisions.
+                let from_live = matches!(&request, HistoryRequest::Page { cursor: None, .. });
+                if !valid {
+                    let _ = reply.send(Err("Invalid history request".into()));
+                } else if self.read_pending || self.head.is_some() || self.jobs.len() >= 32 || self.status.process != ProcessStatus::Ready || (from_live && self.activity() != Activity::Idle) || self.status.history_warning.is_some() {
+                    let _ = reply.send(Err("History is busy; wait for Pi to settle and try again".into()));
+                } else {
+                    let (boundary, exchanges) = self.view.page_boundary();
+                    let skip = match &request {
+                        HistoryRequest::Page { cursor: None, start: Some(start) } if Some(start.as_str()) == boundary => exchanges,
+                        HistoryRequest::Page { cursor: None, start: Some(_) } => { let _ = reply.send(Err("The live history changed; try again".into())); return; }
+                        _ => 0,
+                    };
+                    self.read_pending = true;
+                    self.request_head(HeadPurpose::Read(request, skip, reply, budget));
+                }
+            }
             Control::GroupingConfig(reply) => {
                 let result = if self.status.process != ProcessStatus::Ready
                     || self.setting_pending.is_some()
@@ -599,6 +663,19 @@ impl Runtime {
             Ok(Admission::Fresh(token)) => token,
         };
         match message.action {
+            BrowserAction::RetryResponse { message_id } => {
+                let messages = self.view.messages();
+                let message = messages.iter().find(|message| message.id == message_id);
+                if self.status.process != ProcessStatus::Ready || self.jobs.len() >= 32 {
+                    self.result(&id, false, "formatter_unavailable", None, None);
+                } else if let Some(message) = message.filter(|message| message.complete && !message.truncated && matches!(message.presentation, Some(crate::response_format::ResponsePresentation::Error { retryable: true, .. }))) {
+                    let source = crate::response_format::query_text(&messages, &message.id, self.view.older_history);
+                    self.format_response(message_id, source, true, None, None);
+                    self.result(&id, true, "accepted", None, None);
+                } else {
+                    self.result(&id, false, "response_not_retryable", None, None);
+                }
+            }
             BrowserAction::RefreshCodexUsage => {
                 self.request_quota();
                 self.result(&id, true, "accepted", None, None);
@@ -666,6 +743,10 @@ impl Runtime {
                     Ok(images) => images,
                     Err(code) => { self.result(&id, false, code, None, None); return; }
                 };
+                self.clear_progress();
+                self.run_started = Some(Instant::now());
+                self.response_evidence.begin();
+                self.response_replies = crate::response_format::ReplyText::default();
                 self.view.activity = Activity::Submitting;
                 self.status.error = None;
                 self.status.last_outcome = None;
@@ -801,7 +882,11 @@ impl Runtime {
                 invalidate_jobs(&mut self.jobs);
                 self.head = None;
                 self.requests = Requests::default();
-                self.view = ViewState::default();
+                self.view = ViewState::with_response_formatting(true);
+                self.format_candidate = None;
+                self.response_replies = crate::response_format::ReplyText::default();
+                self.run_started = None;
+                self.clear_progress();
                 self.background = crate::background::Background::default();
                 self.commands.clear();
                 self.reset_settings();
@@ -1001,6 +1086,16 @@ impl Runtime {
             return;
         }
         match done {
+            Done::Formatted(epoch, id, presentation) => {
+                if epoch == self.epoch {
+                    let patches = self.view.present(&id, Some(presentation));
+                    self.push_patches(patches);
+                    if self.metadata.persisted {
+                        let patches = self.view.release_originals();
+                        self.push_patches(patches);
+                    }
+                }
+            }
             Done::QuotaAck(token, response) => {
                 self.quota.ack(
                     &token,
@@ -1100,6 +1195,7 @@ impl Runtime {
                                     && state["isCompacting"] == false
                                 {
                                     self.view.activity = Activity::Idle;
+                                    self.run_started = None;
                                 }
                                 self.result(&id, true, "accepted", Some("handled".into()), None);
                             }
@@ -1185,6 +1281,16 @@ impl Runtime {
                 }
                 self.finish_head();
             }
+            Done::ReadHistory(epoch, result, reply) => {
+                if epoch != self.epoch { let _ = reply.send(Err("The conversation changed while reading history".into())); return; }
+                match result {
+                    Ok(scan) if !scan.strict || scan.revision == self.revision && self.activity() == Activity::Idle => self.request_head(HeadPurpose::ReadAfter(scan, reply)),
+                    result => {
+                        self.read_pending = false;
+                        let _ = reply.send(Err(result.err().unwrap_or_else(|| "History changed while loading; try again".into())));
+                    }
+                }
+            },
             Done::History(result) => match result {
                 Ok(scan) => self.request_head(HeadPurpose::After(scan)),
                 Err(error) => self.history_error(&error),
@@ -1216,6 +1322,7 @@ impl Runtime {
                     Err(rpc::Error::Command { .. }) => {
                         if self.view.activity == Activity::Submitting {
                             self.view.activity = Activity::Idle;
+                            self.run_started = None;
                         }
                         self.result(&id, false, "prompt_rejected", None, None);
                         self.dirty = true;
@@ -1290,7 +1397,17 @@ impl Runtime {
             Done::Terminated(exit) => self.exited(exit),
         }
     }
+    /// Clears live categories when a prompt, process, or transcript is replaced.
+    fn clear_progress(&mut self) {
+        self.progress = progress::Progress::default();
+        self.status.work_phase = None;
+    }
     fn event(&mut self, event: Value) {
+        let phase = self.progress.apply(&event);
+        if self.status.work_phase != phase {
+            self.status.work_phase = phase;
+            self.dirty = true;
+        }
         if event["type"] == "extension_ui_request" {
             self.extension(event);
             return;
@@ -1316,12 +1433,18 @@ impl Runtime {
             self.request_state(StateReason::Compaction);
         }
         if event["type"] == "agent_start" {
+            if self.run_started.is_none() {
+                self.response_evidence.begin();
+                self.response_replies = crate::response_format::ReplyText::default();
+                self.turns.reset(); // Unsolicited runs have no before-snapshot of their own.
+            }
+            self.format_candidate = None;
+            self.run_started.get_or_insert_with(Instant::now);
             self.push_run_active = true;
         }
+        self.response_evidence.observe(&event, self.run_started.map_or(0, |start| start.elapsed().as_millis().min(9_007_199_254_740_991) as u64));
+        let settling_run = self.push_run_active;
         if event["type"] == "agent_settled" {
-            let turns = self.turns.clone(); let root = self.config.cwd.clone();
-            let generation = turns.generation();
-            self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
             // This gate belongs to the runtime epoch, independent of attached clients.
             if std::mem::take(&mut self.push_run_active) && event["aborted"] != true {
                 if let Some(push) = &self.push {
@@ -1360,16 +1483,90 @@ impl Runtime {
                 tasks: self.background.tasks(),
             });
         }
+        let source = (event["type"] == "message_end" && event["message"]["role"] == "assistant")
+            .then(|| {
+                self.response_replies.push(&event["message"]);
+                crate::response_format::assistant_text(&event["message"])
+            });
+        let settled = event["type"] == "agent_settled";
+        let run_started = if settled { self.run_started.take() } else { None };
+        let recorded = settled.then(|| self.response_evidence.finish());
+        let aborted = event["aborted"] == true;
         let mut display_event = event;
         if let Some(message) = display_event.get_mut("message") {
             self.images.project_message(message);
         }
         let patches = self.view.apply(&display_event);
+        if let Some(source) = source {
+            self.format_candidate = patches.iter().rev().find_map(|patch| match patch {
+                ViewPatch::Message { message } if message.role == "assistant" && message.presentation == Some(crate::response_format::ResponsePresentation::Hidden) => Some(message.id.clone()),
+                _ => None,
+            }).map(|id| (id, source));
+        }
         if !patches.is_empty() {
             self.revision = self.revision.wrapping_add(1);
             self.push_patches(patches);
         }
+        let replies = settled.then(|| self.response_replies.take());
+        if settled && (settling_run || self.format_candidate.is_some()) {
+            let candidate = self.format_candidate.take().or_else(|| self.view.messages().into_iter().rev()
+                .find(|message| !message.complete && message.presentation == Some(crate::response_format::ResponsePresentation::Hidden))
+                .map(|message| (message.id, Err("This response was interrupted before it finished"))));
+            if let Some((id, source)) = candidate {
+                self.format_response(id, if aborted { Err("This run was cancelled. View the original for details.") } else { source.and(replies.unwrap()) }, false, run_started, recorded);
+            } else {
+                let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
+                self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
+            }
+        }
         self.finish_cancel();
+    }
+    /// Presents HTML previews directly; other replies get derived presentation with the settled run's clock.
+    fn format_response(&mut self, id: String, source: Result<String, &'static str>, retry: bool, run_started: Option<Instant>, recorded: Option<crate::response_format::RecordedEvidence>) {
+        if source.as_ref().is_ok_and(|text| crate::response_format::has_html_preview(text)) {
+            if recorded.is_some() {
+                let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
+                self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
+            }
+            let patches = self.view.present(&id, None);
+            self.push_patches(patches);
+            return;
+        }
+        let source = if self.jobs.len() >= 32 { Err("Simple response workers are busy. Retry shortly.") } else { source };
+        let source = source.and_then(|text| resolve_executable(&self.config).map(|executable| (executable, text)).map_err(|_| "Configured Pi executable is unavailable"));
+        match source {
+            Ok((executable, text)) => {
+                let formatter = self.formatter.with_model(self.response_model.borrow().clone());
+                let epoch = self.epoch.clone();
+                let source_key = self.view.messages().iter().find(|message| message.id == id).map(|message| crate::response_format::scoped_source_key(message, &epoch));
+                let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
+                let prepare_started = Instant::now();
+                let patches = self.view.present(&id, Some(crate::response_format::ResponsePresentation::Pending));
+                self.push_patches(patches);
+                self.jobs.spawn(async move {
+                    let context = if let Some(mut recorded) = recorded {
+                        let _ = tokio::time::timeout_at(prepare_started + Duration::from_secs(5), turns.finish(&root, generation)).await;
+                        turns.response_files(generation, &mut recorded);
+                        crate::response_format::FormatContext { source_key, recorded, prepare_started: Some(prepare_started) }
+                    } else {
+                        let reader = formatter.clone(); let answer = text.clone();
+                        match tokio::task::spawn_blocking(move || reader.saved_context(source_key, &answer)).await {
+                            Ok(mut context) => { context.prepare_started = Some(prepare_started); context },
+                            Err(_) => return Done::Formatted(epoch, id, crate::response_format::error("Saved simple reply worker failed. View Original.")),
+                        }
+                    };
+                    Done::Formatted(epoch, id, formatter.format(executable, text, retry, run_started, context).await)
+                });
+            }
+            Err(message) => {
+                if recorded.is_some() {
+                    let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
+                    self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
+                }
+                let patches = self.view.present(&id, Some(crate::response_format::ResponsePresentation::Error { message: message.into(), retryable: false, timings: None }));
+                self.push_patches(patches);
+            }
+        }
     }
     /// Acknowledging abort is not completion: retain the admission gate until Pi settles.
     fn finish_cancel(&mut self) {
@@ -1620,20 +1817,51 @@ impl Runtime {
             self.history_error("Pi identity changed during history loading");
             return;
         }
-        if !head.idle {
+        if !head.idle && !matches!(&wait.purpose, HeadPurpose::Read(..) | HeadPurpose::ReadAfter(..)) {
             self.history_error("History loading was superseded by live work");
             return;
         }
         match wait.purpose {
+            HeadPurpose::Read(request, skip, reply, budget) => {
+                if let HistoryRequest::Page { cursor: None, start } = &request {
+                    if !head.idle || self.activity() != Activity::Idle || start.as_deref().is_some_and(|start| self.view.page_boundary().0 != Some(start)) {
+                        self.read_pending = false;
+                        let _ = reply.send(Err("The live history changed; try again".into()));
+                        return;
+                    }
+                }
+                let revision = self.revision; let epoch = self.epoch.clone();
+                let roots = self.config.session_roots.clone(); let cwd = self.config.cwd.clone();
+                let images = self.images.clone(); let formatter = self.formatter.with_model(self.response_model.borrow().clone());
+                self.jobs.spawn(async move {
+                    let read_epoch = epoch.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _budget = budget;
+                        history::read(head, revision, epoch, roots, cwd, images, formatter, request, skip)
+                    }).await.unwrap_or_else(|_| Err("History worker failed".into()));
+                    Done::ReadHistory(read_epoch, result, reply)
+                });
+            }
+            HeadPurpose::ReadAfter(scan, reply) => {
+                self.read_pending = false;
+                let unchanged = scan.head.session_id == head.session_id && scan.head.session_file == head.session_file
+                    && (!scan.strict || scan.head == head && scan.revision == self.revision)
+                    && history::fingerprint(&scan.file.0).is_ok_and(|after| after == scan.file.1);
+                let _ = reply.send(if unchanged { Ok(scan.response) } else { Err("History changed while loading; try again".into()) });
+            }
             HeadPurpose::Before => {
                 let revision = self.revision;
                 let roots = self.config.session_roots.clone();
                 let cwd = self.config.cwd.clone();
                 let images = self.images.clone();
+                let formatter = self.formatter.with_model(self.response_model.borrow().clone());
                 self.jobs.spawn(async move {
                     Done::History(
                         tokio::task::spawn_blocking(move || {
-                            history::scan(head, revision, roots, cwd, images)
+                            let mut scan = history::scan(head, revision, roots, cwd, images)?;
+                            formatter.restore(&mut scan.messages, scan.older);
+                            crate::view::compact_ready(&mut scan.messages, scan.older);
+                            Ok(scan)
                         })
                         .await
                         .unwrap_or_else(|_| Err("History worker failed".into())),
@@ -1766,8 +1994,13 @@ impl Runtime {
         self.settings.model = settings::model(&state["model"]);
         self.settings.thinking_level = serde_json::from_value(state["thinkingLevel"].clone()).ok();
         self.requests = Requests::default();
-        self.view = ViewState::default();
+        self.view = ViewState::with_response_formatting(true);
+        self.format_candidate = None;
+        self.response_replies = crate::response_format::ReplyText::default();
+        self.run_started = None;
+        self.clear_progress();
         self.head = None;
+        self.read_pending = false;
         self.state_requests = 0;
         self.seq = 0;
         self.revision = 0;
@@ -1797,6 +2030,13 @@ impl Runtime {
         self.request_head(HeadPurpose::Before);
     }
     fn history_error(&mut self, message: &str) {
+        if self.read_pending {
+            self.read_pending = false;
+            if let Some(wait) = self.head.take() {
+                if let HeadPurpose::Read(_, _, reply, _) | HeadPurpose::ReadAfter(_, reply) = wait.purpose { let _ = reply.send(Err(clip(message, 512))); }
+            }
+            return;
+        }
         self.head = None;
         self.status.history_warning = Some(clip(message, 512));
         self.dirty = true;
@@ -1853,6 +2093,7 @@ impl Runtime {
                 tasks: self.background.tasks(),
             });
         }
+        self.clear_progress();
         self.status.process = ProcessStatus::Failed;
         self.status.error = Some(clip(message, 512));
         self.status.last_outcome = Some("error".into());
@@ -1865,6 +2106,7 @@ impl Runtime {
         }
     }
     fn exited(&mut self, exit: rpc::Exit) {
+        self.clear_progress();
         if self.background.interrupt() {
             self.send(ServerBody::BackgroundTasks {
                 tasks: self.background.tasks(),

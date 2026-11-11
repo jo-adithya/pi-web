@@ -8,7 +8,7 @@ it("advertises a credential-free standalone app with usable launcher icons", () 
   const manifest = JSON.parse(readFileSync(`public${link!.getAttribute("href")}`, "utf8"));
   expect(manifest).toMatchObject({ id: "/", name: "Pi Web", short_name: "Pi", start_url: "/", scope: "/", display: "standalone" });
   expect(page.title).toBe("Pi Web");
-  expect(page.querySelector('meta[name="theme-color"]')?.getAttribute("content")).toBe("#ffffff");
+  expect(page.querySelector('meta[name="theme-color"]')?.getAttribute("content")).toBe("#fafbf5");
   expect(manifest.theme_color).toBeUndefined();
   for (const size of [192, 512]) {
     const icon = manifest.icons.find((item: { sizes: string }) => item.sizes === `${size}x${size}`);

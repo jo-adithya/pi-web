@@ -19,7 +19,15 @@ export interface ReviewFileLineStats { added: number; removed: number }
  * Includes files omitted by display limits; unavailable files have no numeric count.
  */
 export interface ReviewLineStats extends ReviewFileLineStats { totalAdded: number; totalRemoved: number; unavailableFiles: number }
-export interface ReviewSnapshot { files: ReviewEntry[]; truncated: boolean; note: string | null; lineStats?: ReviewLineStats; nextCursor?: string; snapshotKey?: string }
+/** Nearest unconflicted local jj bookmarks, across all parents at the same minimum distance. */
+export interface ReviewJjContext {
+  /** Stable short working-copy change ID; null when jj details are unavailable. */
+  changeId: string | null;
+  bookmarks: string[];
+  /** Parent hops: 0 means attached to the working copy, 1–3 means inferred, null means no match. */
+  distance: number | null;
+}
+export interface ReviewSnapshot { files: ReviewEntry[]; truncated: boolean; note: string | null; lineStats?: ReviewLineStats; nextCursor?: string; snapshotKey?: string; /** Checkout branch at snapshot capture; null means detached HEAD. */ currentBranch?: string | null; jjContext?: ReviewJjContext }
 /** Only loaded patches can be used by context, structural review and Ask Pi. */
 export const hasPatch = (file: ReviewEntry): file is ReviewFile => file.patch !== null && file.fingerprint !== null;
 const statuses = new Set(["added", "deleted", "renamed", "copied", "typechanged", "unmerged", "modified", "untracked"]);
@@ -41,6 +49,16 @@ export async function fetchReview(id: string, request: ReviewLoadRequest, signal
       !("truncated" in value) || typeof value.truncated !== "boolean" || !("note" in value) || (value.note !== null && typeof value.note !== "string")) throw new Error("Invalid local review response.");
   if ("nextCursor" in value && (typeof value.nextCursor !== "string" || !value.nextCursor || value.nextCursor.length > 256 || request.path !== undefined || !value.files.length)) throw new Error("Invalid review continuation.");
   if ("snapshotKey" in value && (typeof value.snapshotKey !== "string" || !/^[a-f0-9]{64}$/.test(value.snapshotKey))) throw new Error("Invalid review snapshot identity.");
+  if ("currentBranch" in value && value.currentBranch !== null && (typeof value.currentBranch !== "string" || !value.currentBranch || value.currentBranch.length > 4096 || /[\x00-\x1f\x7f]/.test(value.currentBranch))) throw new Error("Invalid review branch.");
+  let jjContext: ReviewJjContext | undefined;
+  if ("jjContext" in value) {
+    const context = value.jjContext;
+    if (!context || typeof context !== "object" || !("changeId" in context) || (context.changeId !== null && (typeof context.changeId !== "string" || !/^[k-z]{8}$/.test(context.changeId))) ||
+        !("bookmarks" in context) || !Array.isArray(context.bookmarks) || !context.bookmarks.every((name: unknown) => typeof name === "string" && !!name && !/[\x00-\x1f\x7f-\x9f]/.test(name)) ||
+        new Set(context.bookmarks).size !== context.bookmarks.length || !("distance" in context) || (context.distance !== null && (!Number.isInteger(context.distance) || (context.distance as number) < 0 || (context.distance as number) > 3)) ||
+        (context.bookmarks.length > 0) !== (context.distance !== null) || (context.changeId === null && context.bookmarks.length > 0) || new TextEncoder().encode(JSON.stringify(context)).length > 65536) throw new Error("Invalid jj checkout context.");
+    jjContext = { changeId: context.changeId, bookmarks: context.bookmarks, distance: context.distance as number | null };
+  }
   let lineStats: ReviewLineStats | undefined;
   if ("lineStats" in value) {
     const stats = value.lineStats;
@@ -73,7 +91,7 @@ export async function fetchReview(id: string, request: ReviewLoadRequest, signal
   });
   if (request.path !== undefined && (files.length !== 1 || files[0].path !== request.path || !hasPatch(files[0]))) throw new Error("Invalid selected-file response.");
   if (new Set(files.map(file => file.path)).size !== files.length) throw new Error("Duplicate review files.");
-  return { files, truncated: value.truncated, note: value.note, ...("snapshotKey" in value ? { snapshotKey: value.snapshotKey as string } : {}), ...(lineStats ? { lineStats } : {}), ...("nextCursor" in value ? { nextCursor: value.nextCursor as string } : {}) };
+  return { files, truncated: value.truncated, note: value.note, ...(jjContext ? { jjContext } : {}), ...("currentBranch" in value ? { currentBranch: value.currentBranch as string | null } : {}), ...("snapshotKey" in value ? { snapshotKey: value.snapshotKey as string } : {}), ...(lineStats ? { lineStats } : {}), ...("nextCursor" in value ? { nextCursor: value.nextCursor as string } : {}) };
 }
 
 /** Session-local lazy patches with a 1 MiB LRU budget. Refresh discards loaded content;

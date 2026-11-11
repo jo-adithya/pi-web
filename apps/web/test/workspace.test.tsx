@@ -11,7 +11,7 @@ const epoch = "20000000-0000-4000-8000-000000000001";
 const wa = "30000000-0000-4000-8000-000000000001", wb = "30000000-0000-4000-8000-000000000002";
 const workspace = (workspaceId = wa, name = "Alpha", path = "/projects/alpha") => ({ workspaceId, name, path });
 const item = (sessionId: string, title: string, workspaceId = wa): CatalogItem => ({ sessionId, workspaceId, title, lifecycle: "open", runtime: { epoch, process: "ready", activity: "idle" } });
-const catalog = () => ({ v: 2, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: a, selectedWorkspace: wa, workspaces: [workspace()], sessions: [item(a, "Conversation 1"), item(b, "Conversation 2")] });
+const catalog = () => ({ v: 2, responseModel: { provider: "openai-codex", id: "gpt-6-luna" }, groupingSettings: { model: null, maxCalls: 6, maxRequestBytes: 524288, includeGenerated: false }, requestId: null, ok: true, code: "catalog", target: null, selected: a, selectedWorkspace: wa, workspaces: [workspace()], sessions: [item(a, "Conversation 1"), item(b, "Conversation 2")] });
 const grouped = () => ({ ...catalog(), workspaces: [workspace(), workspace(wb, "Beta", "/projects/beta")], sessions: [item(a, "Conversation 1"), item(b, "Conversation 2", wb)] });
 function frames(sessionId: string): ServerMessage[] { return [
   { v: 1, sessionId, epoch, body: { type: "hello", project: "fixture", process: "ready" } },
@@ -41,6 +41,95 @@ it.each([
   { ...catalog().groupingSettings, model: { provider: "test", id: "--unsafe" } },
 ])("rejects invalid server grouping settings %j", groupingSettings => {
   expect(() => decodeWorkspace(JSON.stringify({ ...catalog(), groupingSettings }))).toThrow("Invalid global grouping settings");
+});
+
+it.each([undefined, null, {}, { provider: "openai", id: "--unsafe" }, { provider: "openai", id: "bad model" }, { provider: "é".repeat(129), id: "model" }])("rejects invalid simple response models %j", responseModel => {
+  expect(() => decodeWorkspace(JSON.stringify({ ...catalog(), responseModel }))).toThrow("Invalid simple response model");
+});
+
+it("saves the simple response model only after server confirmation and accepts remote changes", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const frame of frames(a)) socket.emit(frame);
+  socket.emit({ v: 1, sessionId: a, epoch, body: { type: "settings", settings: { models: [{ provider: "test", id: "cheap", name: "Cheap", images: false }], model: { provider: "test", id: "chat", name: "Chat", images: false }, thinkingLevel: "off", thinkingLevels: ["off"], codexFast: null } } });
+  fireEvent.click(page.getByRole("button", { name: /^Settings$/ })); flush();
+  const picker = () => page.getByRole("button", { name: /^Simple response model / }) as HTMLButtonElement;
+  expect(picker().textContent).toContain("gpt-6-luna");
+  fireEvent.keyDown(picker(), { key: "Enter" }); flush();
+  fireEvent.keyDown(screen.getByRole("option", { name: "Cheap · test" }), { key: "Enter" }); flush();
+  const update = JSON.parse(socket.send.mock.calls.at(-1)![0]);
+  expect(update.action).toEqual({ type: "set_response_model", model: { provider: "test", id: "cheap" } });
+  expect(picker().textContent).toContain("gpt-6-luna");
+  expect(picker().disabled).toBe(true);
+  socket.emit({ ...catalog(), code: "response_model_updated", requestId: update.requestId, responseModel: update.action.model });
+  expect(picker().textContent).toContain("Cheap");
+  expect(picker().disabled).toBe(false);
+  socket.emit({ ...catalog(), responseModel: { provider: "remote", id: "remote-model" } });
+  expect(picker().textContent).toContain("remote-model");
+});
+
+it("collapses the project shelf without changing the conversation or its draft", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const frame of frames(a)) socket.emit(frame);
+  fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "Keep my idea" } }); flush();
+  const toggle = page.getByRole("button", { name: "Toggle project shelf" });
+  fireEvent.click(toggle); flush();
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  expect(page.queryByRole("complementary", { name: "Sessions" })).toBeNull();
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep my idea");
+  fireEvent.click(toggle); flush();
+  expect(page.getByRole("complementary", { name: "Sessions" })).toBeTruthy();
+  expect(page.getByRole("button", { name: /^Conversation 1,/ }).getAttribute("aria-pressed")).toBe("true");
+});
+
+it("hands the mobile drawer to command search while preserving the draft", async () => {
+  vi.stubGlobal("matchMedia", vi.fn((query: string) => ({ matches: query === "(max-width: 760px)", media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const frame of frames(a)) socket.emit(frame);
+  fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "Keep my mobile draft" } }); flush();
+  fireEvent.click(page.getByRole("button", { name: "Open sessions" })); flush();
+  fireEvent.click(within(screen.getByRole("dialog", { name: "Sessions" })).getByRole("button", { name: "Search conversations and commands" })); flush();
+  await vi.waitFor(() => expect(screen.queryByRole("dialog", { name: "Sessions" })).toBeNull());
+  expect(screen.getByRole("dialog", { name: "Command palette" })).toBeTruthy();
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("combobox", { name: "Search commands and conversations" })));
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep my mobile draft");
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "Search commands and conversations" }), { key: "Escape" }); flush();
+  await vi.waitFor(() => expect(document.activeElement).toBe(page.getByRole("button", { name: "Open sessions" })));
+});
+
+it.each([false, true])("dismisses only the active mobile workspace layer (menu=%s)", async fromMenu => {
+  vi.stubGlobal("matchMedia", vi.fn((query: string) => ({ matches: query === "(max-width: 760px)", media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  fireEvent.click(page.getByRole("button", { name: "Open sessions" })); flush();
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close sessions" })));
+  const switcher = within(screen.getByRole("dialog", { name: "Sessions" })).getByRole("button", { name: "Switch workspace" });
+  switcher.focus(); fireEvent.click(switcher); flush();
+  if (fromMenu) {
+    const options = screen.getByRole("button", { name: "Workspace options for Beta" });
+    options.focus(); fireEvent.keyDown(options, { key: "Enter" }); flush();
+    const action = await screen.findByRole("menuitem", { name: "Delete workspace…" });
+    action.focus(); fireEvent.keyDown(action, { key: "Escape" }); flush();
+    await vi.waitFor(() => expect(screen.queryByRole("menuitem", { name: "Delete workspace…" })).toBeNull());
+    expect(screen.getByRole("dialog", { name: "Workspaces" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Sessions" })).toBeTruthy();
+    await vi.waitFor(() => expect(document.activeElement).toBe(options));
+    return;
+  }
+  fireEvent.keyDown(screen.getByRole("dialog", { name: "Workspaces" }), { key: "Escape" }); flush();
+  await vi.waitFor(() => expect(screen.queryByRole("dialog", { name: "Workspaces" })).toBeNull());
+  expect(screen.getByRole("dialog", { name: "Sessions" })).toBeTruthy();
+  await vi.waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Switch workspace" })));
 });
 
 it("shows the current project and conversation in the mobile switcher", async () => {
@@ -105,38 +194,39 @@ it("keeps hidden-tab completions unread until visible and forgets deleted conver
   expect(page.queryByRole("button", { name: /Conversation 2,.*unread/ })).toBeNull();
 });
 
-it("keeps workspace folding usable when local storage is blocked", async () => {
+it("keeps conversation search usable when local storage is blocked", async () => {
   vi.spyOn(localStorage, "getItem").mockImplementation(() => { throw new Error("blocked"); });
   vi.spyOn(localStorage, "setItem").mockImplementation(() => { throw new Error("blocked"); });
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   Socket.instances[0].onopen?.(); Socket.instances[0].emit(grouped());
-  fireEvent.click(page.getByRole("button", { name: "Collapse workspace Beta" })); flush();
-  expect(page.queryByRole("button", { name: /^Conversation 2,/ })).toBeNull();
-  fireEvent.click(page.getByRole("button", { name: "Expand workspace Beta" })); flush();
+  fireEvent.input(page.getByRole("searchbox", { name: "Filter conversations" }), { target: { value: "beta" } }); flush();
+  expect(page.queryByRole("button", { name: /^Conversation 1,/ })).toBeNull();
   expect(page.getByRole("button", { name: /^Conversation 2,/ })).toBeTruthy();
+  fireEvent.click(page.getByRole("button", { name: "Clear conversation filter" })); flush();
+  expect(page.getByRole("button", { name: /^Conversation 1,/ })).toBeTruthy();
 });
 
-it("remembers collapsed workspaces locally while keeping the selected conversation visible", async () => {
+it("filters the flat conversation list without changing selection or drafts", async () => {
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
-  fireEvent.click(page.getByRole("button", { name: "Collapse workspace Beta" })); flush();
+  for (const frame of frames(a)) socket.emit(frame);
+  fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "Keep this draft" } }); flush();
+  fireEvent.click(page.getByRole("button", { name: "This project" })); flush();
   expect(page.queryByRole("button", { name: /^Conversation 2,/ })).toBeNull();
-  expect(page.getByRole("button", { name: "Expand workspace Beta" }).getAttribute("aria-expanded")).toBe("false");
-  fireEvent.click(page.getByRole("button", { name: "Collapse workspace Alpha" })); flush();
-  expect(page.getByRole("button", { name: /^Conversation 1,/ })).toBeTruthy();
-  expect(JSON.parse(localStorage.getItem("pi-web.collapsed-workspaces.v1")!)).toEqual([wb, wa]);
-  page.unmount();
-  const next = render(() => <App />);
-  await vi.waitFor(() => expect(Socket.instances).toHaveLength(2));
-  Socket.instances[1].onopen?.(); Socket.instances[1].emit(grouped());
-  expect(next.getByRole("button", { name: "Expand workspace Beta" })).toBeTruthy();
-  expect(next.queryByRole("button", { name: /^Conversation 2,/ })).toBeNull();
-  fireEvent.click(next.getByRole("button", { name: "Expand workspace Beta" })); flush();
-  expect(next.getByRole("button", { name: /^Conversation 2,/ })).toBeTruthy();
+  expect(page.getByRole("button", { name: /^Conversation 1,/ }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(page.getByRole("button", { name: "All projects" })); flush();
+  fireEvent.input(page.getByRole("searchbox", { name: "Filter conversations" }), { target: { value: "beta conversation 2" } }); flush();
+  expect(page.queryByRole("button", { name: /^Conversation 1,/ })).toBeNull();
+  expect(page.getByRole("button", { name: /^Conversation 2,/ })).toBeTruthy();
+  fireEvent.input(page.getByRole("searchbox", { name: "Filter conversations" }), { target: { value: "no such conversation" } }); flush();
+  expect(page.getByText("No matching conversations.")).toBeTruthy();
+  fireEvent.click(page.getByRole("button", { name: "Clear conversation filter" })); flush();
+  expect(page.getByRole("button", { name: /^Conversation 1,/ }).getAttribute("aria-pressed")).toBe("true");
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep this draft");
 });
 
 it("opens the command palette, searches conversations, and preserves drafts", async () => {
@@ -439,8 +529,8 @@ it("shows live sidebar activity beside titles without status labels", async () =
   for (const frame of frames(a)) socket.emit(frame);
   const first = page.getByRole("button", { name: /^Conversation 1/ });
   const second = page.getByRole("button", { name: /^Conversation 2/ });
-  expect(first.textContent).toBe("Conversation 1");
-  expect(second.textContent).toBe("Conversation 2");
+  expect(first.querySelector(".session-title")?.textContent).toBe("Conversation 1");
+  expect(second.querySelector(".session-title")?.textContent).toBe("Conversation 2");
   expect(first.classList.contains("stopped")).toBe(false);
   expect(second.classList.contains("stopped")).toBe(true);
   expect(second.getAttribute("aria-label")).toContain("stopped");
@@ -463,8 +553,9 @@ it("deletes a workspace only after confirmation and selects a remaining conversa
   for (const id of [a, b]) for (const frame of frames(id)) socket.emit(frame);
   for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...value, requestId: JSON.parse(wire).requestId });
   fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "discard this draft" } }); flush();
+  fireEvent.click(page.getByRole("button", { name: "Switch workspace" })); flush();
   const open = async () => {
-    fireEvent.keyDown(page.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
+    fireEvent.keyDown(screen.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
     fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Delete workspace…" }), { key: "Enter" }); flush();
     return screen.getByRole("dialog", { name: "Delete workspace" });
   };
@@ -479,7 +570,7 @@ it("deletes a workspace only after confirmation and selects a remaining conversa
   const request = JSON.parse(socket.send.mock.calls.at(-1)![0]);
   expect(request.action).toEqual({ type: "delete_workspace", workspaceId: wb, expectedSessions: { [b]: item(b, "Conversation 2", wb).runtime!.epoch }, confirmed: true });
   socket.emit({ ...catalog(), sessions: [item(a, "Conversation 1")], requestId: request.requestId, code: "workspace_deleted" });
-  expect(page.queryByRole("group", { name: "Beta" })).toBeNull();
+  expect(screen.queryByRole("group", { name: "Beta" })).toBeNull();
   expect(page.getByRole("button", { name: /^Conversation 1/ }).getAttribute("aria-pressed")).toBe("true");
   expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("");
 });
@@ -490,7 +581,8 @@ it("disables deletion of the last workspace and explains how to remove it", asyn
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
   for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...catalog(), requestId: JSON.parse(wire).requestId });
-  fireEvent.keyDown(page.getByLabelText("Workspace options for Alpha"), { key: "Enter" }); flush();
+  fireEvent.click(page.getByRole("button", { name: "Switch workspace" })); flush();
+  fireEvent.keyDown(screen.getByLabelText("Workspace options for Alpha"), { key: "Enter" }); flush();
   const deletion = await screen.findByRole("menuitem", { name: "Delete workspace…" });
   expect(deletion.getAttribute("aria-disabled")).toBe("true");
   expect(screen.getByText(/Keep at least one workspace/)).toBeTruthy();
@@ -502,7 +594,8 @@ it.each(["changed runtime", "disconnected"])("prevents workspace confirmation wh
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
   for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...grouped(), requestId: JSON.parse(wire).requestId });
-  fireEvent.keyDown(page.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
+  fireEvent.click(page.getByRole("button", { name: "Switch workspace" })); flush();
+  fireEvent.keyDown(screen.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
   fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Delete workspace…" }), { key: "Enter" }); flush();
   const confirm = screen.getByRole("button", { name: "Delete workspace" }) as HTMLButtonElement;
   expect(confirm.disabled).toBe(false);
@@ -524,32 +617,33 @@ it("retains the workspace and draft when workspace deletion fails", async () => 
   for (const id of [a, b]) for (const frame of frames(id)) socket.emit(frame);
   for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...value, requestId: JSON.parse(wire).requestId });
   fireEvent.input(page.getByLabelText("Message Pi"), { target: { value: "keep my draft" } }); flush();
-  fireEvent.keyDown(page.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
+  fireEvent.click(page.getByRole("button", { name: "Switch workspace" })); flush();
+  fireEvent.keyDown(screen.getByLabelText("Workspace options for Beta"), { key: "Enter" }); flush();
   fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Delete workspace…" }), { key: "Enter" }); flush();
   fireEvent.click(screen.getByRole("button", { name: "Delete workspace" })); flush();
   const request = JSON.parse(socket.send.mock.calls.at(-1)![0]);
   socket.emit({ ...value, requestId: request.requestId, ok: false, code: "workspace_write_failed", sessions: [item(a, "Conversation 1"), { ...item(b, "Conversation 2", wb), lifecycle: "stopped", runtime: null }] });
-  expect(page.getByRole("group", { name: "Beta" })).toBeTruthy();
+  expect(screen.getByRole("group", { name: "Beta" })).toBeTruthy();
   expect(page.getByText("Workspace command not completed: workspace write failed.")).toBeTruthy();
   expect(page.getByText("Unsent draft: keep my draft")).toBeTruthy();
 });
 
-it("groups conversations by workspace and creates in the chosen folder", async () => {
+it("switches projects from the picker and creates in the chosen folder", async () => {
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
   await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
   for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...grouped(), requestId: JSON.parse(wire).requestId });
-  expect(within(page.getByRole("group", { name: "Alpha" })).getByRole("button", { name: /^Conversation 1/ })).toBeTruthy();
-  const beta = within(page.getByRole("group", { name: "Beta" }));
-  expect(beta.queryByRole("button", { name: /^Conversation 1/ })).toBeNull();
-  expect(beta.getByRole("button", { name: /^Conversation 2/ })).toBeTruthy();
+  expect(page.getByRole("button", { name: /^Conversation 1/ }).textContent).toContain("Alpha");
+  expect(page.getByRole("button", { name: /^Conversation 2/ }).textContent).toContain("Beta");
+  fireEvent.click(page.getByRole("button", { name: "Switch workspace" })); flush();
+  const beta = within(screen.getByRole("group", { name: "Beta" }));
   fireEvent.click(beta.getByRole("button", { name: "Select workspace Beta" })); flush();
   const select = JSON.parse(socket.send.mock.calls.at(-1)![0]);
   expect(select.action).toEqual({ type: "select_workspace", workspaceId: wb });
   // The immutable target wins even when another controller moved global selection.
   socket.emit({ ...grouped(), requestId: select.requestId, code: "workspace_selected", target: b });
-  expect(within(page.getByRole("group", { name: "Beta" })).getByRole("button", { name: /^Conversation 2/ }).getAttribute("aria-pressed")).toBe("true");
+  expect(page.getByRole("button", { name: /^Conversation 2/ }).getAttribute("aria-pressed")).toBe("true");
   fireEvent.click(page.getByRole("button", { name: "New conversation" })); flush();
   expect(JSON.parse(socket.send.mock.calls.at(-1)![0]).action).toEqual({ type: "create_in", workspaceId: wb });
 });

@@ -8,6 +8,7 @@ const boundedText = (value: unknown, max: number): value is string => typeof val
 export function validWorkspacePath(value: unknown): value is string {
   return boundedText(value, 1024) && value.startsWith("/") && !value.includes("\0");
 }
+const modelIdentifier = (part: unknown) => boundedText(part, 256) && part.length > 0 && !part.startsWith("-") && !/[\s\p{Cc}]/u.test(part);
 /** Checks the server-wide grouping budget and optional model identity. */
 function validGroupingSettings(value: unknown): boolean {
   if (!object(value) || typeof value.maxCalls !== "number" || !Number.isInteger(value.maxCalls) || value.maxCalls < 1 || value.maxCalls > 100 || typeof value.maxRequestBytes !== "number" || !Number.isInteger(value.maxRequestBytes) || value.maxRequestBytes < 1024 || value.maxRequestBytes > 16 * 1024 * 1024 || typeof value.includeGenerated !== "boolean") return false;
@@ -20,6 +21,7 @@ export function decodeWorkspace(text: string): WorkspaceReply {
   const value: unknown = JSON.parse(text);
   if (!object(value) || value.v !== 2 || typeof value.ok !== "boolean" || !boundedText(value.code, 128) || !(value.requestId === null || boundedText(value.requestId, 64)) || !id(value.selected) || !id(value.selectedWorkspace) || !(value.target === null || id(value.target)) || !Array.isArray(value.sessions) || value.sessions.length > 512 || !Array.isArray(value.workspaces) || value.workspaces.length === 0 || value.workspaces.length > 16) throw new Error("Invalid workspace envelope");
   if (!validGroupingSettings(value.groupingSettings)) throw new Error("Invalid global grouping settings");
+  if (!object(value.responseModel) || !modelIdentifier(value.responseModel.provider) || !modelIdentifier(value.responseModel.id)) throw new Error("Invalid simple response model");
   const workspaces = new Map<string, number>();
   for (const workspace of value.workspaces) {
     if (!object(workspace) || !id(workspace.workspaceId) || workspaces.has(workspace.workspaceId) || !boundedText(workspace.name, 64) || !validWorkspacePath(workspace.path)) throw new Error("Invalid workspace entry");

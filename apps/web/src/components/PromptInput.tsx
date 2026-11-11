@@ -3,6 +3,7 @@ import { Listbox } from "@kobalte/core/listbox";
 import { TextField } from "@kobalte/core/text-field";
 import type { SlashCommand } from "../generated/protocol";
 import type { WorkspaceFiles } from "../workspace-files";
+import { createMediaQuery } from "../theme";
 
 interface PromptInputProps {
   id: string;
@@ -36,11 +37,13 @@ function fileReference(value: string, caret: number) {
 
 /** A multiline prompt editor with slash commands and workspace @ references.
  * Selection preserves surrounding prose; async file lookups are cancelled when
- * the token or eligibility changes. Enter sends; Shift+Enter adds a newline.
+ * the token or eligibility changes. Enter sends on desktop and adds a newline
+ * on mobile; command selection and Ctrl/⌘+Enter keep their keyboard shortcuts.
  * The editor owns token matching and keyboard navigation; Listbox keeps pointer
  * selection and option semantics while virtual focus stays in the textarea.
  */
 export function PromptInput(props: PromptInputProps) {
+  const mobile = createMediaQuery("(max-width: 760px)");
   let input!: HTMLTextAreaElement;
   let list!: HTMLUListElement;
   const [focused, setFocused] = createSignal(false);
@@ -109,6 +112,7 @@ export function PromptInput(props: PromptInputProps) {
   }
   function keyDown(event: KeyboardEvent) {
     if (event.isComposing || composing()) return;
+    if (event.key === "Enter" && mobile() && !event.ctrlKey && !event.metaKey && !matches().length) return;
     if (event.key === "Enter" && !event.shiftKey && !event.altKey) {
       event.preventDefault();
       if (matches().length && !event.ctrlKey && !event.metaKey) choose(matches()[active()]);
@@ -130,7 +134,7 @@ export function PromptInput(props: PromptInputProps) {
     {/* The hidden grid cell sizes the editor without collapsing its live scroll box.
         A trailing space preserves the height of an empty final line. */}
     <div class="prompt-size" aria-hidden="true">{props.value + " "}</div>
-    <TextField.TextArea ref={input} id={props.id} rows={1} maxlength={32_768}
+    <TextField.TextArea ref={input} id={props.id} rows={1} maxlength={32_768} enterkeyhint={mobile() ? "enter" : undefined}
       placeholder={props.placeholder ?? "What would you like to work on?"}
       role="combobox" aria-autocomplete="list" aria-expanded={matches().length > 0 ? "true" : "false"}
       aria-controls={matches().length ? listId : undefined}
@@ -150,7 +154,7 @@ export function PromptInput(props: PromptInputProps) {
       onDragOver={(event: DragEvent) => { if (props.onImages && event.dataTransfer?.types.includes("Files")) event.preventDefault(); }}
       onDrop={(event: DragEvent) => { if (props.onImages && event.dataTransfer?.files.length) { event.preventDefault(); props.onImages(Array.from(event.dataTransfer.files)); } }}
       onKeyDown={keyDown} />
-    <TextField.Description id={`${props.id}-hint`} class="sr-only">Commands begin with /; workspace files begin with @. Use arrow keys to navigate, Tab or Enter to insert, Escape to dismiss. Enter sends; Shift+Enter adds a new line.</TextField.Description>
+    <TextField.Description id={`${props.id}-hint`} class="sr-only">Commands begin with /; workspace files begin with @. Use arrow keys to navigate, Tab or Enter to insert, Escape to dismiss. {mobile() ? "Enter adds a new line; use the send button to submit." : "Enter sends; Shift+Enter adds a new line."}</TextField.Description>
     <Show when={matches().length > 0 || (fileQuery() !== undefined && fileStatus())}>
       <div class="command-suggestions">
       <Show when={matches().length > 0}>

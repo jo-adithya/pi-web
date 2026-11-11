@@ -17,4 +17,5 @@ base64 = "=0.22.1"
 p256 = "=0.13.2"
 
 [dev-dependencies]
+tokio = { version = "=1.54.1", features = ["test-util"] }
 tower = { version = "=0.5.3", features = ["util"] }

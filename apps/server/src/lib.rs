@@ -12,6 +12,7 @@ pub mod rpc;
 pub mod session;
 pub mod session_manager;
 pub mod view;
+pub mod response_format;
 
 mod workspaces;
 mod workspace_files;

@@ -11,6 +11,7 @@ import { fetchBranches } from "./branch-review";
 import { fetchReviewGroups } from "./review-groups";
 import { loadCapability } from "./browser-auth";
 import { applyServer, initialState } from "./client-state";
+import { readHistory } from "./history";
 import { formatReply, type ReplyQuote } from "./reply-quote";
 import type { CodeLocation } from "./code-reference";
 import { feedbackText, feedbackFits, restoreSessionDraft, savePromptDraft, saveFeedbackDraft, type FeedbackNote } from "./session-draft";
@@ -60,6 +61,10 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     return snapshot.files[0] as ReviewFile; // Selected-path responses are validated by fetchReview.
   };
   const [state, setState] = createStore(initialState());
+  const [historyPage, setHistoryPage] = createSignal<{ cursor: string; older: string | null; trail: string[]; index: number }>();
+  const [historyBusy, setHistoryBusy] = createSignal(false);
+  const [newReplies, setNewReplies] = createSignal(false);
+  let historyRead: AbortController | undefined; let historyVersion = 0;
   const [draft, setDraft] = createSignal(restored.prompt.text);
   const [notice, setNotice] = createSignal(restored.warning || (promptUncertain || feedbackUncertain ? "Previous delivery is uncertain. Inspect the transcript before resending restored work." : ""));
   const [quote, setQuote] = createSignal<ReplyQuote | undefined>(restored.prompt.quote);
@@ -104,7 +109,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     if (transport({ v: 1, sessionId: id, epoch, requestId, action })) return requestId;
   }
   const online = () => connected() && state.synced;
-  const canConfigure = () => online() && state.status.process === "ready" && state.status.activity === "idle" && !pending() && !settingsPending();
+  const canConfigure = () => online() && state.status.process === "ready" && state.status.activity === "idle" && !pending() && !settingsPending() && !historyBusy();
   /** Sends a validated idle-only selection; display stays on confirmed server settings. */
   function configure(action: BrowserAction) {
     if (!canConfigure() || settingsRequest) return;
@@ -116,6 +121,55 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   }
   function setThinkingLevel(level: ThinkingLevel) {
     if (state.settings.thinkingLevels.includes(level)) configure({ type: "set_thinking_level", level });
+  }
+  /** Requests a fresh live snapshot before releasing history; false preserves the page on transport failure. */
+  function latestHistory(): boolean {
+    historyRead?.abort(); historyVersion++; setHistoryBusy(false);
+    if (!historyPage()) { setNewReplies(false); return true; }
+    if (!send({ type: "attach" })) { setNotice("Reconnect before returning to the latest replies."); return false; }
+    setHistoryPage(undefined); setNewReplies(false); setStick(true);
+    setState(value => { value.messages = {}; value.order = []; value.older = false; value.canvasReadyId = null; });
+    return true;
+  }
+  /** Loads one replacement page; breadcrumbs retain only SDK cursor strings, not messages. */
+  async function navigateHistory(direction: "older" | "newer") {
+    if (!online() || historyBusy() || !historyPage() && state.status.activity !== "idle") return;
+    const previous = historyPage();
+    if (direction === "newer" && (!previous || previous.index <= 1)) { latestHistory(); return; }
+    if (direction === "older" && !(previous ? previous.older : state.older)) return;
+    const index = previous ? previous.index + (direction === "older" ? 1 : -1) : 1;
+    const cursor = previous ? direction === "older" ? previous.older : previous.trail[index] : null;
+    const start = previous ? null : state.order[0] ?? null;
+    const controller = new AbortController(); historyRead?.abort(); historyRead = controller;
+    const version = ++historyVersion; const expectedEpoch = state.epoch;
+    setHistoryBusy(true); setNotice("");
+    try {
+      const page = await readHistory(id, { type: "page", cursor, start }, expectedEpoch, controller.signal, capability());
+      if (disposed || version !== historyVersion || expectedEpoch !== state.epoch) return;
+      if (page.type !== "page") throw new Error("Invalid history page.");
+      if (!page.messages.length) {
+        setState(value => { value.older = false; });
+        if (previous) setHistoryPage({ ...previous, older: null });
+        setNotice("No earlier displayed exchanges remain."); return;
+      }
+      const trail = previous ? previous.trail.slice() : [page.latestCursor];
+      trail[index] = page.cursor;
+      setHistoryPage({ cursor: page.cursor, older: page.olderCursor, trail, index }); setStick(false);
+      setState(value => { value.messages = Object.fromEntries(page.messages.map(message => [message.id, message])); value.order = page.messages.map(message => message.id); value.older = page.olderCursor !== null; value.canvasReadyId = null; });
+    } catch (error) {
+      if (!controller.signal.aborted && !disposed && version === historyVersion) {
+        if (!previous) setNewReplies(false);
+        setNotice(error instanceof Error ? error.message : "History is unavailable.");
+      }
+    }
+    finally { if (version === historyVersion) setHistoryBusy(false); }
+  }
+  /** Original text belongs only to its mounted reader and is never retained in the model. */
+  async function loadOriginal(sourceKey: string, signal: AbortSignal): Promise<string> {
+    const expectedEpoch = state.epoch;
+    const value = await readHistory(id, { type: "original", cursor: historyPage()?.cursor ?? null, sourceKey }, expectedEpoch, signal, capability());
+    if (value.type !== "original" || disposed || state.epoch !== expectedEpoch) throw new Error("Original reply changed; try again.");
+    return value.text;
   }
   /** Uploads serially within one draft budget; a failed upload never sends a prompt. */
   async function addImages(files: File[]) {
@@ -142,7 +196,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   }
   /** Releases previews; confirmed deletion also discards this conversation’s saved unsent work. */
   function dispose(discardDraft = false) {
-    disposed = true; review.cancel(); for (const image of attachments()) removeImage(image.id);
+    disposed = true; historyRead?.abort(); historyVersion++; review.cancel(); for (const image of attachments()) removeImage(image.id);
     if (discardDraft) { prompt = undefined; promptUncertain = feedbackUncertain = false; setDraft(""); setQuote(undefined); setFeedback([]); }
     flush(); stopSaving(); setQuote(undefined);
     if (discardDraft) { savePromptDraft(id, { text: "", uncertain: false }); saveFeedbackDraft(id, { notes: [], uncertain: false }); }
@@ -152,6 +206,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   const canSend = () => (canConfigure() || canSteer()) && !settingsRequest && (!!draft().trim() || attachments().length > 0) && !uploading() && (!attachments().length || !!state.settings.model?.images) && new TextEncoder().encode(formatReply(draft(), quote())).length <= 32_768;
   function submit() {
     if (prompt || !canSend()) return;
+    if (!latestHistory()) return;
     const text = draft(); const submittedQuote = quote(); const images = attachments().map(image => image.id); const requestId = send({ type: canSteer() ? "steer" : "prompt", text: formatReply(text, submittedQuote), images });
     if (requestId) { prompt = { id: requestId, text, quote: submittedQuote, images }; promptUncertain = true; setPending(true); setNotice(""); setStick(true); }
   }
@@ -160,6 +215,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
    */
   function submitReview(text: string, feedbackIds?: string[]): boolean {
     if (disposed || prompt || settingsRequest || (!canConfigure() && !(feedbackIds && canSteer())) || !text.trim() || new TextEncoder().encode(text).length > 32_768) return false;
+    if (!latestHistory()) return false;
     const requestId = send({ type: canSteer() ? "steer" : "prompt", text, images: [] });
     if (!requestId) return false;
     prompt = { id: requestId, text, quote: undefined, images: [], standalone: true, feedbackIds };
@@ -170,6 +226,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   }
   function preserveReviewQuestion(text: string) { setDraft(previous => previous ? `${previous}\n\n${text}` : text); }
   function disconnected() {
+    historyRead?.abort(); historyVersion++; setHistoryBusy(false);
     setState(value => { value.synced = false; value.dialogs = []; });
     const interrupted = prompt; prompt = undefined;
     if (interrupted) {
@@ -180,7 +237,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     settingsRequest = undefined; setSettingsPending(false);
   }
   function stopped() {
-    disconnected(); epoch = ""; setNoticeDismissed(false);
+    disconnected(); epoch = ""; setHistoryPage(undefined); setNewReplies(false); setNoticeDismissed(false);
     // Stopped catalog records retain drafts, not four active-runtime budgets of transcript each.
     setState(value => { Object.assign(value, initialState()); value.status.process = "exited"; });
   }
@@ -189,16 +246,21 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     if (message.sessionId !== id) return false;
     if (message.body.type === "hello") {
       if (attachmentNotice) { setNotice(""); attachmentNotice = false; }
-      if (message.epoch !== epoch) { if (prompt || settingsRequest) disconnected(); completedRun = 0n; setStick(true); }
+      if (message.epoch !== epoch) {
+        historyRead?.abort(); historyVersion++; setHistoryBusy(false); setHistoryPage(undefined); setNewReplies(false);
+        setState(value => { value.messages = {}; value.order = []; });
+        if (prompt || settingsRequest) disconnected(); completedRun = 0n; setStick(true);
+      }
       epoch = message.epoch;
     }
     const applied: { action: ReturnType<typeof applyServer>; noticeChanged: boolean; live: boolean } = { action: "ignore", noticeChanged: false, live: false };
     setState(value => {
       const previousNotice = value.status.notice; const previousEpoch = value.epoch;
-      applied.action = applyServer(value, message);
+      applied.action = applyServer(value, message, !!historyPage());
       applied.noticeChanged = value.status.notice !== previousNotice || value.epoch !== previousEpoch;
       applied.live = applied.action === "applied" && value.synced;
     });
+    if ((historyPage() || historyBusy()) && applied.action === "applied" && message.body.type === "event" && message.body.patches.some(patch => patch.kind === "message" || patch.kind === "delta")) setNewReplies(true);
     if (applied.noticeChanged) setNoticeDismissed(false);
     if (applied.action === "resync") send({ type: "attach" });
     if (message.epoch !== epoch) return false;
@@ -232,6 +294,6 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     }
     return true;
   }
-  return { id, dispose, loadSource: (path: string, line: number, signal: AbortSignal) => loadSource(id, path, line, signal, capability()), feedback, addFeedback, editFeedback, removeFeedback, submitFeedback, codeLocation, openCode, review, reviewCards, loadReviewPreview, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, canSteer, send, submit, submitReview, receive, disconnected, stopped, scroll: 0, reviewPosition: { filter: "", needsReview: false, groupKey: "", view: "files" as "files" | "overview", scroll: 0, identity: "" } };
+  return { id, dispose, historyPage, historyBusy, newReplies, navigateHistory, latestHistory, loadOriginal, loadSource: (path: string, line: number, signal: AbortSignal) => loadSource(id, path, line, signal, capability()), feedback, addFeedback, editFeedback, removeFeedback, submitFeedback, codeLocation, openCode, review, reviewCards, loadReviewPreview, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, canSteer, send, submit, submitReview, receive, disconnected, stopped, scroll: 0, reviewPosition: { filter: "", needsReview: false, groupKey: "", view: "files" as "files" | "overview", scroll: 0, identity: "" } };
 }
 export type SessionModel = ReturnType<typeof createSessionModel>;

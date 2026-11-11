@@ -76,10 +76,132 @@ export type BlockKind = "text" | "thinking" | "notice" | "image";
 export type DisplayBlock = { kind: BlockKind, text: string, };
 
 /**
+ * Preserves the source's distinction between confirmed, skipped and unverified checks.
+ */
+
+export type ResponseCheckStatus = "passed" | "failed" | "skipped" | "unverified";
+
+/**
+ * A verification outcome reported by Pi, independent of checks run by this UI.
+ */
+
+export type ResponseCheck = { status: ResponseCheckStatus, text: string, };
+
+/**
+ * A short, plain-text label and value reported by Pi for a compact facts row.
+ */
+
+export type ResponseFact = { label: string, value: string, };
+
+export type ToolOutcome = "completed" | "error" | "unconfirmed";
+
+export type RecordedTool = { id: string, label: string, outcome: ToolOutcome, durationMs: number, };
+
+export type FileCaptureState = "captured" | "unavailable";
+
+export type FileChangeKind = "added" | "modified" | "deleted";
+
+/**
+ * A content change observed between turn admission and settlement, with optional exact
+ * line counts from its complete captured patch. Paths retain their original spelling.
+ */
+
+export type RecordedFile = { id: string, path: string, change: FileChangeKind, added: number | null, removed: number | null, };
+
+/**
+ * Bounded observations for one completed turn. File capture includes concurrent edits;
+ * completed tool calls establish RPC outcomes, not independently verified test results.
+ */
+
+export type RecordedEvidence = { tools: Array<RecordedTool>, files: Array<RecordedFile>, filesState: FileCaptureState, omittedTools: boolean, omittedFiles: boolean, };
+
+export type CanvasLayout = "result" | "explanation" | "investigation" | "review" | "plan" | "comparison" | "answer";
+
+/**
+ * Selects a reading composition and one primary block by its zero-based index.
+ * The headline is plain text. Warnings and recorded failures remain visible independently.
+ */
+
+export type CanvasPlan = { layout: CanvasLayout, headline: string, focus: number | null, };
+
+export type DiagramNodeKind = "input" | "process" | "store" | "decision" | "output";
+
+/**
+ * A labelled node with a semantic shape, rendered by the app's SVG diagram layout.
+ */
+
+export type DiagramNode = { id: string, label: string, kind: DiagramNodeKind, };
+
+export type DiagramRelation = "direct" | "hypothesis";
+
+/**
+ * A directed connection. Hypotheses use a dashed stroke and an explicit legend.
+ */
+
+export type DiagramEdge = { from: string, to: string, label: string, relation: DiagramRelation, };
+
+/**
+ * Source-reported decimal text. Keeping the original spelling preserves precision and units.
+ */
+
+export type ChartValue = { label: string, value: string, };
+
+export type TimelineKind = "reported" | "hypothesis" | "next";
+
+export type TimelineItem = { label: string, text: string, kind: TimelineKind, };
+
+export type FindingSeverity = "critical" | "high" | "medium" | "low";
+
+/**
+ * A Pi-authored assessment; severity conveys priority rather than independent verification.
+ */
+
+export type ResponseFinding = { severity: FindingSeverity, title: string, text: string, location?: string, };
+
+export type ResponseCard = { "type": "checklist", title: string, items: Array<string>, } | { "type": "steps", title: string, items: Array<string>, } | { "type": "note", title: string, text: string, } | { "type": "code", title: string, language?: string, code: string, } | { "type": "warning", title: string, text: string, } | { "type": "details", title: string, text: string, } | { "type": "checks", title: string, items: Array<ResponseCheck>, } | { "type": "table", title: string, columns: Array<string>, rows: Array<Array<string>>, } | { "type": "facts", title: string, items: Array<ResponseFact>, } | { "type": "comparison", title: string, before: string, after: string, } | { "type": "flow", title: string, items: Array<string>, } | { "type": "diagram", title: string, nodes: Array<DiagramNode>, edges: Array<DiagramEdge>, } | { "type": "chart", title: string, unit: string, items: Array<ChartValue>, } | { "type": "timeline", title: string, items: Array<TimelineItem>, } | { "type": "findings", title: string, items: Array<ResponseFinding>, } | { "type": "evidence", title: string, items: Array<string>, };
+
+/**
+ * Markdown in app-owned sections, rendered with the browser's safe Markdown policy.
+ */
+
+export type SimpleResponse = { summary: string, blocks: Array<ResponseCard>, canvas?: CanvasPlan, recorded?: RecordedEvidence, };
+
+/**
+ * Server elapsed milliseconds for Pi work and formatting, before cache save and delivery.
+ * `work_ms` spans prompt admission (or observed agent start) through presentation preparation;
+ * absent values were not recorded. `total_ms` covers formatting only, including its queue.
+ * Model time includes first-text waiting. Cached results retain the original run's timings.
+ */
+
+export type ResponseTimings = { model: string, cached: boolean, workMs?: number, totalMs: number, captureMs?: number, queueMs: number, startupMs: number | null, modelMs: number | null, firstTextMs: number | null, cleanupMs: number, };
+
+/**
+ * A presentation selected by the server, independent of the original assistant text.
+ */
+
+export type ResponsePresentation = { "state": "pending" } | { "state": "hidden" } | { "state": "ready", response: SimpleResponse, timings?: ResponseTimings, } | { "state": "error", message: string, retryable: boolean, timings?: ResponseTimings, };
+
+/**
  * A bounded message preview. `id` belongs to this view, not necessarily Pi storage.
  */
 
-export type DisplayMessage = { id: string, role: string, blocks: Array<DisplayBlock>, complete: boolean, error: string | null, truncated: boolean, };
+export type DisplayMessage = { id: string, role: string, blocks: Array<DisplayBlock>, complete: boolean, error: string | null, truncated: boolean, presentation?: ResponsePresentation, 
+/**
+ * Opaque identity for matching this SDK reply to its own saved observations.
+ */
+sourceKey?: string, };
+
+/**
+ * Disk-backed history navigation. Cursors identify entries in this session, never paths.
+ */
+
+export type HistoryRequest = { "type": "page", cursor: string | null, start: string | null, } | { "type": "original", cursor: string | null, sourceKey: string, };
+
+/**
+ * One replacement page or one explicitly requested original. Neither invokes a model.
+ */
+
+export type HistoryResponse = { "type": "page", epoch: string, cursor: string, latestCursor: string, olderCursor: string | null, messages: Array<DisplayMessage>, } | { "type": "original", epoch: string, text: string, };
 
 /**
  * Bounded changes published by the runtime; history replacement uses a snapshot
@@ -166,7 +288,7 @@ export type RunOutcome = "success" | "error" | "aborted";
  * Only the controlling browser may issue these bounded, session-scoped actions.
  */
 
-export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, images: Array<string>, } | { "type": "steer", text: string, images: Array<string>, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
+export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "retry_response", messageId: string, } | { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, images: Array<string>, } | { "type": "steer", text: string, images: Array<string>, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
 
 /**
  * Browser envelope. Shape decoding precedes bounds, version, subscription and epoch checks.
@@ -175,10 +297,21 @@ export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "set_m
 export type BrowserMessage = { v: number, sessionId: string, epoch: string, requestId: string, action: BrowserAction, };
 
 /**
+ * App-owned live categories derived from event kinds and known tool names.
+ * Raw commands, arguments, results, and reasoning text remain outside this status.
+ */
+
+export type WorkPhase = "thinking" | "writing" | "reading" | "editing" | "searching" | "executing" | "researching" | "checking" | "delegating" | "tools";
+
+/**
  * Independent process/activity/outcome states; a lost browser is not a stopped agent.
  */
 
-export type RuntimeStatus = { process: ProcessStatus, activity: Activity, lastOutcome: string | null, error: string | null, historyWarning: string | null, persistence: boolean, cancelUnconfirmed: boolean, notice: string | null, 
+export type RuntimeStatus = { process: ProcessStatus, activity: Activity, 
+/**
+ * Latest observed work category; absent when no detailed phase is known.
+ */
+workPhase?: WorkPhase, lastOutcome: string | null, error: string | null, historyWarning: string | null, persistence: boolean, cancelUnconfirmed: boolean, notice: string | null, 
 /**
  * Latest plain-text LSP extension status, at most 512 UTF-8 bytes; null when unavailable.
  */
@@ -250,7 +383,13 @@ maxCalls: number,
  */
 maxRequestBytes: number, includeGenerated: boolean, };
 
-export type WorkspaceAction = { "type": "list" } | { "type": "set_grouping_settings", settings: GroupingSettings, } | { "type": "create" } | { "type": "create_in", workspaceId: string, } | { "type": "add_workspace", path: string, confirmed: boolean, } | { "type": "select_workspace", workspaceId: string, } | { "type": "delete_workspace", workspaceId: string, 
+/**
+ * Chat model used to turn coding answers into simple response cards.
+ */
+
+export type ResponseModel = { provider: string, id: string, };
+
+export type WorkspaceAction = { "type": "list" } | { "type": "set_grouping_settings", settings: GroupingSettings, } | { "type": "set_response_model", model: ResponseModel, } | { "type": "create" } | { "type": "create_in", workspaceId: string, } | { "type": "add_workspace", path: string, confirmed: boolean, } | { "type": "select_workspace", workspaceId: string, } | { "type": "delete_workspace", workspaceId: string, 
 /**
  * Approved conversation IDs mapped to runtime epochs, or null for stopped conversations.
  */
@@ -270,5 +409,5 @@ target: string | null,
 /**
  * Current workspace selection; periodic snapshots may change this independently.
  */
-selected: string, sessions: Array<CatalogItem>, workspaces: Array<WorkspaceItem>, selectedWorkspace: string, groupingSettings: GroupingSettings, };
+selected: string, sessions: Array<CatalogItem>, workspaces: Array<WorkspaceItem>, selectedWorkspace: string, groupingSettings: GroupingSettings, responseModel: ResponseModel, };
 

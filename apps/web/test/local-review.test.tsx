@@ -14,6 +14,76 @@ const snapshot = (files: ReviewEntry[] = [file]): ReviewSnapshot => ({ files, tr
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+it("shows the checkout branch and updates it on refresh, including detached HEAD", async () => {
+  let currentBranch: string | null = "feature/<branch>";
+  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => new Response(JSON.stringify({ ...snapshot(), currentBranch: JSON.parse(init.body as string).path ? null : currentBranch }))));
+  const model = createSessionModel("branch-heading", () => true, () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  const label = await page.findByLabelText("Repository branch");
+  expect(label.textContent).toContain("Current branch: feature/<branch>");
+  expect(label.closest("header")).toBe(page.getByRole("heading", { name: "Local changes" }).closest("header"));
+  expect(label.querySelector("branch")).toBeNull();
+  currentBranch = null;
+  fireEvent.click(page.getByRole("button", { name: "Refresh" })); flush();
+  await waitFor(() => expect(label.textContent).toContain("Current branch: Detached HEAD"));
+  fireEvent.click(page.getByRole("button", { name: "Last turn" })); flush();
+  await waitFor(() => expect(page.getByLabelText("Repository branch").textContent).toContain("Branch at capture: Detached HEAD"));
+});
+
+it.each([
+  [{ changeId: "zzzzzzzz", bookmarks: ["feature/<bookmark>"], distance: 0 }, "Bookmarks: feature/<bookmark>"],
+  [{ changeId: "zzzzzzzz", bookmarks: ["main"], distance: 1 }, "Based on main (1 commit back)"],
+  [{ changeId: "zzzzzzzz", bookmarks: ["left", "right"], distance: 3 }, "Based on left, right (3 commits back)"],
+  [{ changeId: "zzzzzzzz", bookmarks: [], distance: null }, "No bookmark within 3 commits"],
+  [{ changeId: null, bookmarks: [], distance: null }, "Jujutsu details unavailable"],
+] as const)("labels jj bookmark inference without pretending it is an active branch (%j)", async (jjContext, label) => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...snapshot(), currentBranch: null, jjContext }))));
+  const model = createSessionModel("jj-heading", () => true, () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  const context = await page.findByLabelText("Repository change");
+  expect(context.textContent).toContain(label);
+  expect(context.textContent).not.toContain("Detached HEAD");
+  expect(context.querySelector("bookmark")).toBeNull();
+  if (jjContext.changeId) expect(context.textContent).toContain("zzzzzzzz");
+  fireEvent.click(page.getByRole("button", { name: "Last turn" })); flush();
+  await waitFor(() => expect(page.getByLabelText("Repository change").textContent).toContain("At capture"));
+});
+
+it.each([
+  null, {},
+  { changeId: "bad-id", bookmarks: [], distance: null },
+  { changeId: "zzzzzzzz", bookmarks: ["main"], distance: 4 },
+  { changeId: "zzzzzzzz", bookmarks: [], distance: 0 },
+  { changeId: null, bookmarks: ["main"], distance: 0 },
+  { changeId: "zzzzzzzz", bookmarks: ["bad\nname"], distance: 1 },
+  { changeId: "zzzzzzzz", bookmarks: ["main", "main"], distance: 1 },
+])("rejects malformed jj context (%j)", async jjContext => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...snapshot(), jjContext }))));
+  await expect(fetchReview("s", { scope: "unstaged" }, new AbortController().signal, "cap")).rejects.toThrow("Invalid jj checkout context");
+});
+
+it.each([42, {}, [], "", "bad\nbranch"])("rejects malformed branch metadata (%j)", async currentBranch => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...snapshot(), currentBranch }))));
+  await expect(fetchReview("s", { scope: "unstaged" }, new AbortController().signal, "cap")).rejects.toThrow("Invalid review branch");
+});
+
+it("keeps refresh beside the page heading and reloads the selected scope", async () => {
+  const request = vi.fn(async (_url: string, _init: RequestInit) => new Response(JSON.stringify(snapshot())));
+  vi.stubGlobal("fetch", request);
+  const model = createSessionModel("heading-refresh", () => true, () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("heading", { name: file.path });
+  const refresh = page.getByRole("button", { name: "Refresh" });
+  expect(refresh.closest("header")).toBe(page.getByRole("heading", { name: "Local changes" }).closest("header"));
+  expect(page.getByRole("group", { name: "Change scope" }).contains(refresh)).toBe(false);
+  fireEvent.click(page.getByRole("button", { name: "Staged" })); flush();
+  await waitFor(() => { flush(); expect(model.review.busy()).toBe(false); });
+  request.mockClear();
+  fireEvent.click(refresh); flush();
+  await waitFor(() => expect(request).toHaveBeenCalledOnce());
+  expect(JSON.parse(request.mock.calls[0][1].body as string).scope).toBe("staged");
+});
+
 it.each([false, true])("restores filters after visiting chat and restores position only for unchanged diffs (changed=%s)", async changed => {
   let different = false;
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot([{ ...file, fingerprint: different ? "updated" : file.fingerprint }])))));

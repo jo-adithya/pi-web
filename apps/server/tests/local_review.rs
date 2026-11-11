@@ -141,6 +141,96 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn review_names_the_checkout_branch_including_unborn_and_detached_heads() {
+    let f = Fixture::new().await;
+    f.git(&["init", "-q", "-b", "unborn-feature"]);
+    let (status, review) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(review["currentBranch"], "unborn-feature");
+
+    f.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    f.init();
+    f.git(&["checkout", "-qb", "feature/branch-label"]);
+    let commit = fs::read_to_string(f.root.join(".git/refs/heads/main")).unwrap();
+    for request in [serde_json::json!({"scope":"unstaged"}), serde_json::json!({"scope":"staged"}), serde_json::json!({"scope":"branch","base":"main"}), serde_json::json!({"scope":"commit","commit":commit.trim()})] {
+        let (status, review) = f.request(&request.to_string(), true, true).await;
+        assert_eq!(status, StatusCode::OK, "{review}");
+        assert_eq!(review["currentBranch"], "feature/branch-label", "the checkout, not the comparison base");
+    }
+    f.git(&["checkout", "--detach", "-q"]);
+    let (status, review) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(review.get("currentBranch").unwrap().is_null());
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn unavailable_jj_context_keeps_the_git_snapshot_readable() {
+    let f = Fixture::new().await;
+    f.init();
+    fs::create_dir(f.root.join(".jj")).unwrap();
+    fs::write(f.root.join("file.txt"), "changed\n").unwrap();
+    let (status, review) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["jjContext"], serde_json::json!({"changeId":null,"bookmarks":[],"distance":null}));
+    assert!(review["files"].as_array().unwrap().iter().any(|file| file["path"] == "file.txt"));
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the jj CLI with JSON templates"]
+async fn jj_bookmark_context_uses_nearest_local_ancestors_within_three_parent_hops() {
+    let f = Fixture::new().await;
+    f.init();
+    let jj = |args: &[&str]| {
+        let output = Command::new("jj").current_dir(&f.root)
+            .env("JJ_CONFIG", "").args(["--no-pager", "--config", "user.name=Fixture", "--config", "user.email=fixture@example.invalid"])
+            .args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    jj(&["git", "init", "--colocate"]);
+    jj(&["bookmark", "delete", "main"]);
+    jj(&["bookmark", "create", "older"]);
+    for distance in 0..=4 {
+        if distance > 0 { jj(&["new", "-m", "next"]); }
+        let (status, review) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+        assert_eq!(status, StatusCode::OK, "{review}");
+        assert!(review["currentBranch"].is_null());
+        assert_eq!(review["jjContext"]["changeId"].as_str().unwrap().len(), 8);
+        if distance <= 3 {
+            assert_eq!(review["jjContext"]["bookmarks"], serde_json::json!(["older"]));
+            assert_eq!(review["jjContext"]["distance"], distance);
+        } else {
+            assert_eq!(review["jjContext"]["bookmarks"], serde_json::json!([]));
+            assert!(review["jjContext"]["distance"].is_null());
+        }
+    }
+    jj(&["new", "older", "-m", "left"]);
+    jj(&["bookmark", "create", "left"]);
+    jj(&["new", "older", "-m", "right"]);
+    jj(&["bookmark", "create", "right"]);
+    jj(&["new", "left", "right", "-m", "merge"]);
+    fs::write(f.root.join("file.txt"), "not snapshotted\n").unwrap();
+    let operation = ["--ignore-working-copy", "--at-op=@", "op", "log", "--no-graph", "--limit", "1", "-T", "self.id()"];
+    let before = jj(&operation);
+    let git_head = fs::read(f.root.join(".git/HEAD")).unwrap();
+    let git_index = fs::read(f.root.join(".git/index")).unwrap();
+    let (status, review) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["jjContext"]["bookmarks"], serde_json::json!(["left", "right"]));
+    assert_eq!(review["jjContext"]["distance"], 1);
+    assert_eq!(jj(&operation), before, "reading context must not snapshot or integrate operations");
+    assert_eq!(fs::read(f.root.join(".git/HEAD")).unwrap(), git_head);
+    assert_eq!(fs::read(f.root.join(".git/index")).unwrap(), git_index);
+    jj(&["bookmark", "create", "here"]);
+    let (_, review) = f.request(r#"{"scope":"unstaged"}"#, true, true).await;
+    assert_eq!(review["jjContext"]["bookmarks"], serde_json::json!(["here"]));
+    assert_eq!(review["jjContext"]["distance"], 0);
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn source_references_are_authenticated_bounded_and_never_follow_symlinks() {
     let f = Fixture::new().await;
     fs::write(f.root.join("source.ts"), (1..=100).map(|line| format!("line {line}\n")).collect::<String>()).unwrap();

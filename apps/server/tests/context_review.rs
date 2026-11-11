@@ -516,7 +516,8 @@ async fn lazy_listing_and_context_cache_skip_expanded_git_work() {
                 .all(|f| f["patch"].is_null())
         );
         let commands = fs::read_to_string(&log).unwrap();
-        assert_eq!(commands.lines().count(), 7, "{commands}");
+        assert_eq!(commands.lines().count(), 8, "{commands}");
+        assert_eq!(commands.matches("branch --show-current").count(), 1);
         assert_eq!(commands.matches("--numstat").count(), 1);
         // Metadata stays lazy; one bounded full diff supplies content identity, not per-file patches.
         assert_eq!(commands.matches("--patch").count(), 1);

@@ -66,6 +66,7 @@ async fn refreshed_reply(manager: &SessionManager, mut reply: WorkspaceReply) ->
     reply.sessions = current.sessions;
     reply.selected = current.selected;
     reply.grouping_settings = current.grouping_settings;
+    reply.response_model = current.response_model;
     reply
 }
 

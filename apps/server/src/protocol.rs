@@ -2,6 +2,7 @@
 //! Decoding these shapes does not authorize commands or validate session identity.
 
 use crate::view::{Activity, BlockKind, DisplayBlock, DisplayMessage, ViewPatch};
+use crate::response_format::{ResponsePresentation, ResponseTimings, SimpleResponse, ResponseCard, ResponseFact, ResponseCheck, ResponseCheckStatus, CanvasPlan, CanvasLayout, DiagramNode, DiagramNodeKind, DiagramEdge, DiagramRelation, ChartValue, TimelineItem, TimelineKind, ResponseFinding, FindingSeverity, RecordedEvidence, RecordedTool, RecordedFile, ToolOutcome, FileCaptureState, FileChangeKind};
 use serde::{Deserialize, Serialize};
 use ts_rs::{Config, TS};
 
@@ -195,6 +196,8 @@ pub enum RunOutcome {
 )]
 pub enum BrowserAction {
     RefreshCodexUsage,
+    /// Retries a failed derived presentation; never re-prompts the coding session.
+    RetryResponse { message_id: String },
     SetModel {
         provider: String,
         model_id: String,
@@ -225,6 +228,22 @@ pub enum BrowserAction {
     Restart {
         confirmed: bool,
     },
+}
+
+/// Disk-backed history navigation. Cursors identify entries in this session, never paths.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum HistoryRequest {
+    Page { cursor: Option<String>, start: Option<String> },
+    Original { cursor: Option<String>, source_key: String },
+}
+
+/// One replacement page or one explicitly requested original. Neither invokes a model.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub enum HistoryResponse {
+    Page { epoch: String, cursor: String, latest_cursor: String, older_cursor: Option<String>, messages: Vec<DisplayMessage> },
+    Original { epoch: String, text: String },
 }
 
 /// Browser envelope. Shape decoding precedes bounds, version, subscription and epoch checks.
@@ -258,12 +277,33 @@ pub struct Dialog {
     pub initial: String,
 }
 
+/// App-owned live categories derived from event kinds and known tool names.
+/// Raw commands, arguments, results, and reasoning text remain outside this status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkPhase {
+    Thinking,
+    Writing,
+    Reading,
+    Editing,
+    Searching,
+    Executing,
+    Researching,
+    Checking,
+    Delegating,
+    Tools,
+}
+
 /// Independent process/activity/outcome states; a lost browser is not a stopped agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
     pub process: ProcessStatus,
     pub activity: Activity,
+    /// Latest observed work category; absent when no detailed phase is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub work_phase: Option<WorkPhase>,
     pub last_outcome: Option<String>,
     pub error: Option<String>,
     pub history_warning: Option<String>,
@@ -411,6 +451,8 @@ pub enum WorkspaceAction {
     SetGroupingSettings {
         settings: GroupingSettings,
     },
+    /// Persists the model used by future simple-response calls across all sessions.
+    SetResponseModel { model: crate::config::ResponseModel },
     Create,
     CreateIn {
         workspace_id: String,
@@ -501,6 +543,7 @@ pub struct WorkspaceReply {
     pub workspaces: Vec<WorkspaceItem>,
     pub selected_workspace: String,
     pub grouping_settings: GroupingSettings,
+    pub response_model: crate::config::ResponseModel,
 }
 
 /// Generates shared declarations without writing files.
@@ -520,7 +563,33 @@ pub fn typescript_bindings() -> String {
         (Activity::docs(), Activity::decl(&config)),
         (BlockKind::docs(), BlockKind::decl(&config)),
         (DisplayBlock::docs(), DisplayBlock::decl(&config)),
+        (ResponseCheckStatus::docs(), ResponseCheckStatus::decl(&config)),
+        (ResponseCheck::docs(), ResponseCheck::decl(&config)),
+        (ResponseFact::docs(), ResponseFact::decl(&config)),
+        (ToolOutcome::docs(), ToolOutcome::decl(&config)),
+        (RecordedTool::docs(), RecordedTool::decl(&config)),
+        (FileCaptureState::docs(), FileCaptureState::decl(&config)),
+        (FileChangeKind::docs(), FileChangeKind::decl(&config)),
+        (RecordedFile::docs(), RecordedFile::decl(&config)),
+        (RecordedEvidence::docs(), RecordedEvidence::decl(&config)),
+        (CanvasLayout::docs(), CanvasLayout::decl(&config)),
+        (CanvasPlan::docs(), CanvasPlan::decl(&config)),
+        (DiagramNodeKind::docs(), DiagramNodeKind::decl(&config)),
+        (DiagramNode::docs(), DiagramNode::decl(&config)),
+        (DiagramRelation::docs(), DiagramRelation::decl(&config)),
+        (DiagramEdge::docs(), DiagramEdge::decl(&config)),
+        (ChartValue::docs(), ChartValue::decl(&config)),
+        (TimelineKind::docs(), TimelineKind::decl(&config)),
+        (TimelineItem::docs(), TimelineItem::decl(&config)),
+        (FindingSeverity::docs(), FindingSeverity::decl(&config)),
+        (ResponseFinding::docs(), ResponseFinding::decl(&config)),
+        (ResponseCard::docs(), ResponseCard::decl(&config)),
+        (SimpleResponse::docs(), SimpleResponse::decl(&config)),
+        (ResponseTimings::docs(), ResponseTimings::decl(&config)),
+        (ResponsePresentation::docs(), ResponsePresentation::decl(&config)),
         (DisplayMessage::docs(), DisplayMessage::decl(&config)),
+        (HistoryRequest::docs(), HistoryRequest::decl(&config)),
+        (HistoryResponse::docs(), HistoryResponse::decl(&config)),
         (ViewPatch::docs(), ViewPatch::decl(&config)),
         (DialogAnswer::docs(), DialogAnswer::decl(&config)),
         (Dialog::docs(), Dialog::decl(&config)),
@@ -540,6 +609,7 @@ pub fn typescript_bindings() -> String {
         (RunOutcome::docs(), RunOutcome::decl(&config)),
         (BrowserAction::docs(), BrowserAction::decl(&config)),
         (BrowserMessage::docs(), BrowserMessage::decl(&config)),
+        (WorkPhase::docs(), WorkPhase::decl(&config)),
         (RuntimeStatus::docs(), RuntimeStatus::decl(&config)),
         (CommandResult::docs(), CommandResult::decl(&config)),
         (
@@ -555,6 +625,7 @@ pub fn typescript_bindings() -> String {
         (WorkspaceItem::docs(), WorkspaceItem::decl(&config)),
         (GroupModel::docs(), GroupModel::decl(&config)),
         (GroupingSettings::docs(), GroupingSettings::decl(&config)),
+        (crate::config::ResponseModel::docs(), crate::config::ResponseModel::decl(&config)),
         (WorkspaceAction::docs(), WorkspaceAction::decl(&config)),
         (WorkspaceCommand::docs(), WorkspaceCommand::decl(&config)),
         (WorkspaceReply::docs(), WorkspaceReply::decl(&config)),

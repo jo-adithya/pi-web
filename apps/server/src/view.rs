@@ -38,6 +38,13 @@ pub struct DisplayMessage {
     pub complete: bool,
     pub error: Option<String>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub presentation: Option<crate::response_format::ResponsePresentation>,
+    /// Opaque identity for matching this SDK reply to its own saved observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_key: Option<String>,
 }
 
 /// Agent activity is independent of process readiness and browser connectivity.
@@ -82,6 +89,8 @@ pub fn normalize_message(id: String, message: &Value, complete: bool) -> Option<
             .as_str().filter(|_| !tool_image)
             .map(|text| clipped(text, 4096).0),
         truncated: false,
+        presentation: None,
+        source_key: (role == "assistant").then(|| crate::response_format::source_key(message)).flatten(),
     };
     let mut remaining = MAX_MESSAGE_BYTES;
     if let Some(text) = message["content"].as_str().filter(|_| !tool_image) {
@@ -158,6 +167,28 @@ pub enum ViewPatch {
     SnapshotNeeded,
 }
 
+/// Releases complete source groups represented by a saved simplified answer.
+/// Truncated, partial and timestamp-less sources stay inline for recovery.
+pub(crate) fn compact_ready(messages: &mut Vec<DisplayMessage>, older: bool) {
+    use crate::response_format::ResponsePresentation;
+    let mut remove = std::collections::HashSet::new();
+    for end in (0..messages.len()).rev() {
+        if messages[end].role != "assistant" || messages[end].source_key.is_none()
+            || !matches!(messages[end].presentation, Some(ResponsePresentation::Ready { .. })) { continue; }
+        let start = messages[..end].iter().rposition(|message| message.role == "user"
+            || message.role == "assistant" && message.presentation.as_ref().is_some_and(|value| !matches!(value, ResponsePresentation::Hidden)))
+            .map_or(0, |index| index + 1);
+        let group = &messages[start..=end];
+        if older && start == 0 || group.iter().any(|message| message.role == "assistant" && (!message.complete || message.truncated))
+            || !group.iter().any(|message| message.role == "assistant" && message.blocks.iter().any(|block| block.kind == BlockKind::Text && !block.text.trim().is_empty())) { continue; }
+        messages[end].blocks.clear();
+        for message in &messages[start..end] {
+            if message.presentation == Some(ResponsePresentation::Hidden) { remove.insert(message.id.clone()); }
+        }
+    }
+    messages.retain(|message| !remove.contains(&message.id));
+}
+
 /// Pure event reducer. It retains previews, never RPC envelopes or cumulative
 /// provider snapshots. Run completion becomes idle only at `agent_settled`.
 pub struct ViewState {
@@ -169,6 +200,9 @@ pub struct ViewState {
     retained: usize,
     pub activity: Activity,
     pub older_history: bool,
+    pub response_formatting: bool,
+    // Latest hidden preview in the active run, retained for interruption recovery.
+    response_candidate: Option<String>,
 }
 impl Default for ViewState {
     fn default() -> Self {
@@ -180,14 +214,55 @@ impl Default for ViewState {
             retained: 0,
             activity: Activity::Idle,
             older_history: false,
+            response_formatting: false,
+            response_candidate: None,
         }
     }
 }
 impl ViewState {
+    /// Creates an empty view with optional derived-response placeholders.
+    pub(crate) fn with_response_formatting(enabled: bool) -> Self {
+        Self { response_formatting: enabled, ..Self::default() }
+    }
     /// Clones the retained view for an attach/rebase snapshot, not for each delta.
     pub fn messages(&self) -> Vec<DisplayMessage> {
         self.messages.iter().map(|(m, _)| m.clone()).collect()
     }
+    /// Publishes a message presentation; `None` restores its original Markdown renderer.
+    pub(crate) fn present(&mut self, id: &str, presentation: Option<crate::response_format::ResponsePresentation>) -> Vec<ViewPatch> {
+        let Some(mut message) = self.messages.iter().find(|(message, _)| message.id == id).map(|(message, _)| message.clone()) else { return Vec::new(); };
+        message.presentation = presentation;
+        let mut patches = Vec::new();
+        self.upsert(message, &mut patches);
+        patches
+    }
+
+    /// Identity and exchange count of the live window, for a race-checked first older page.
+    pub(crate) fn page_boundary(&self) -> (Option<&str>, usize) {
+        (self.messages.front().map(|(message, _)| message.id.as_str()), self.messages.iter().filter(|(message, _)| message.role == "user").count())
+    }
+
+    /// Drops source text already represented by a durable simplified reply.
+    pub(crate) fn release_originals(&mut self) -> Vec<ViewPatch> {
+        let before: HashMap<_, _> = self.messages.iter().map(|(message, _)| (message.id.clone(), !message.blocks.is_empty())).collect();
+        let mut after: Vec<_> = self.messages.drain(..).map(|(message, _)| message).collect();
+        compact_ready(&mut after, self.older_history);
+        let ids: std::collections::HashSet<_> = after.iter().map(|message| message.id.clone()).collect();
+        let cleared: std::collections::HashSet<_> = after.iter().filter(|message| before.get(&message.id) == Some(&true) && message.blocks.is_empty()).map(|message| message.id.clone()).collect();
+        let mut patches: Vec<_> = before.keys().filter(|id| !ids.contains(*id)).map(|id| ViewPatch::Remove { id: id.clone() }).collect();
+        if self.current.get("assistant").is_some_and(|id| cleared.contains(id) || !ids.contains(id)) { self.content_indices.fill(None); }
+        self.current.retain(|_, id| ids.contains(id) && !cleared.contains(id));
+        if self.response_candidate.as_ref().is_some_and(|id| !ids.contains(id) || cleared.contains(id)) { self.response_candidate = None; }
+        self.retained = 0;
+        for message in after {
+            if cleared.contains(&message.id) { patches.push(ViewPatch::Message { message: message.clone() }); }
+            let bytes = serde_json::to_vec(&message).expect("display serialization").len();
+            self.retained += bytes;
+            self.messages.push_back((message, bytes));
+        }
+        patches
+    }
+
     /// Serialized preview bytes, excluding container allocation overhead.
     pub fn retained_bytes(&self) -> usize {
         self.retained
@@ -198,6 +273,7 @@ impl ViewState {
     pub fn replace_history(&mut self, messages: Vec<DisplayMessage>, older: bool) {
         self.messages.clear();
         self.current.clear();
+        self.response_candidate = None;
         self.content_indices.fill(None);
         self.retained = 0;
         self.older_history = older;
@@ -206,16 +282,21 @@ impl ViewState {
         }
     }
 
-    /// Marks unfinished previews interrupted after a confirmed transport/process
-    /// failure. Completed content survives and no prompt is replayed.
+    /// Exposes the last active preview and marks pending summaries interrupted after
+    /// a confirmed process failure. Completed original content survives.
     pub fn interrupt(&mut self, reason: &str) -> Vec<ViewPatch> {
         let mut patches = Vec::new();
         let error = clipped(reason, 4096).0;
+        let candidate = self.response_candidate.take();
         for (message, bytes) in &mut self.messages {
-            if !message.complete {
+            let final_preview = candidate.as_deref() == Some(message.id.as_str());
+            if !message.complete || final_preview || message.presentation == Some(crate::response_format::ResponsePresentation::Pending) {
                 self.retained -= *bytes;
+                if !message.complete { message.error = Some(error.clone()); }
                 message.complete = true;
-                message.error = Some(error.clone());
+                if final_preview || message.presentation == Some(crate::response_format::ResponsePresentation::Pending) {
+                    message.presentation = Some(crate::response_format::ResponsePresentation::Error { message: "The coding session stopped before this response finished".into(), retryable: false, timings: None });
+                }
                 *bytes = serde_json::to_vec(message)
                     .expect("display serialization")
                     .len();
@@ -255,6 +336,7 @@ impl ViewState {
             }
             Some("agent_settled") => {
                 self.current.clear();
+                self.response_candidate = None;
                 self.set_activity(Activity::Idle, &mut patches);
             }
             Some("message_start" | "message_end") => {
@@ -290,6 +372,11 @@ impl ViewState {
                         self.current
                             .insert(message.role.clone(), message.id.clone());
                     }
+                    if self.response_formatting && message.role == "assistant" {
+                        use crate::response_format::ResponsePresentation;
+                        self.response_candidate = Some(message.id.clone());
+                        message.presentation = Some(ResponsePresentation::Hidden);
+                    }
                     self.upsert(message, &mut patches);
                 } else if complete
                     && raw["role"] == "assistant"
@@ -297,6 +384,7 @@ impl ViewState {
                     && let Some(index) = self.messages.iter().position(|(m, _)| m.id == id)
                 {
                     let (_, bytes) = self.messages.remove(index).expect("existing message");
+                    if self.response_candidate.as_deref() == Some(id.as_str()) { self.response_candidate = None; }
                     self.retained -= bytes;
                     patches.push(ViewPatch::Remove { id });
                 }
@@ -329,10 +417,14 @@ impl ViewState {
         self.trim(patches);
     }
     fn trim(&mut self, patches: &mut Vec<ViewPatch>) {
-        while self.messages.len() > MAX_MESSAGES || self.retained > MAX_DISPLAY_BYTES {
+        let mut dropped = false;
+        while self.messages.len() > MAX_MESSAGES || self.retained > MAX_DISPLAY_BYTES
+            || self.messages.iter().filter(|(message, _)| message.role == "user").count() > 10
+            || dropped && self.messages.front().is_some_and(|(message, _)| message.role != "user") && self.messages.iter().any(|(message, _)| message.role == "user") {
             let Some((message, bytes)) = self.messages.pop_front() else {
                 break;
             };
+            dropped = true;
             self.retained -= bytes;
             self.older_history = true;
             self.current.retain(|_, id| *id != message.id);

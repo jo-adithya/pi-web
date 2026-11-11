@@ -3,6 +3,19 @@ fn parse(args: &[&str]) -> std::io::Result<Option<Config>> {
     Config::parse(args.iter().map(|s| (*s).to_owned()))
 }
 #[test]
+fn response_formatting_defaults_to_luna_without_a_startup_flag() {
+    let default = parse(&[]).unwrap().unwrap().response_model;
+    assert_eq!(default.provider, "openai-codex");
+    assert_eq!(default.id, "gpt-6-luna");
+    let model = parse(&["--response-model", "provider/vendor/cheap-model"]).unwrap().unwrap().response_model;
+    assert_eq!(model.provider, "provider");
+    assert_eq!(model.id, "vendor/cheap-model");
+    for value in ["model", "/model", "provider/", "provider/bad model", "provider/bad\nmodel"] {
+        assert!(parse(&["--response-model", value]).is_err(), "{value}");
+    }
+    assert!(parse(&["--response-model", "p/m", "--response-model", "p/m"]).is_err());
+}
+#[test]
 fn explicit_modes_and_loopback_port_validation() {
     assert_eq!(parse(&[]).unwrap().unwrap().startup, Startup::Remembered);
     assert_eq!(parse(&["--new"]).unwrap().unwrap().startup, Startup::New);

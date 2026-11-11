@@ -1,5 +1,7 @@
 //! Bounded, read-only Git snapshots rooted at a registered workspace.
 mod turn;
+mod jj;
+use jj::JjContext;
 pub(crate) use turn::TurnChanges;
 use p256::ecdsa::{
     Signature,
@@ -75,6 +77,11 @@ pub(crate) struct LineStats {
 #[derive(Clone, Serialize)]
 pub(crate) struct Review {
     files: Vec<File>,
+    /// Checkout branch at capture time; null when detached or not read.
+    #[serde(rename = "currentBranch")]
+    current_branch: Option<String>,
+    #[serde(rename = "jjContext", skip_serializing_if = "Option::is_none")]
+    jj_context: Option<JjContext>,
     truncated: bool,
     note: Option<String>,
     /// Absent for selected-file requests, continuation pages, or over-budget statistics.
@@ -115,6 +122,9 @@ pub(crate) async fn review(
         cancelled: &mut cancelled,
     };
     let (args, identity) = prepare_snapshot(&mut git, &request).await?;
+    let (current_branch, jj_context) = if request.path.is_none() && request.cursor.is_none() {
+        git.checkout_context().await?
+    } else { (None, None) };
     let mut listing = args.clone();
     listing.extend(["--name-status".into(), "-z".into(), "--".into()]);
     let bytes = git.strings(&listing, MAX_LIST).await?;
@@ -213,6 +223,8 @@ pub(crate) async fn review(
         line_stats,
         next_cursor: None,
         snapshot_key,
+        current_branch,
+        jj_context,
     };
     let mut seen = std::collections::HashSet::new();
     while let Some(status) = fields.next() {
@@ -366,8 +378,8 @@ fn paginate(review: &mut Review, offset: usize, snapshot: u64) -> Result<(), &'s
     if offset > 0 && offset >= files.len() {
         return Err("Invalid review cursor; refresh review");
     }
-    // Reserve room for statistics, the cursor, and an omission note.
-    let mut total = 1024;
+    // Include checkout metadata and reserve room for a cursor and an omission note.
+    let mut total = 1024 + serde_json::to_vec(&review).map_err(|_| "Cannot encode review metadata")?.len();
     for (index, file) in files.into_iter().enumerate().skip(offset) {
         let size = serde_json::to_vec(&file)
             .map_err(|_| "Cannot encode review file")?
@@ -704,6 +716,13 @@ pub(crate) struct Git<'a> {
     pub(crate) cancelled: &'a mut oneshot::Receiver<()>,
 }
 impl Git<'_> {
+    /// Reads the local checkout name, including unborn branches; detached HEAD has no name.
+    async fn current_branch(&mut self) -> Result<Option<String>, &'static str> {
+        let bytes = self.run(&["branch", "--show-current"], 4096).await?;
+        let name = String::from_utf8(bytes).map_err(|_| "Invalid Git branch name")?;
+        let name = name.trim_end_matches('\n');
+        Ok((!name.is_empty()).then(|| name.to_owned()))
+    }
     pub(crate) async fn strings(
         &mut self,
         args: &[String],
@@ -718,6 +737,10 @@ impl Git<'_> {
         args: &[&str],
         limit: usize,
     ) -> Result<Vec<u8>, &'static str> {
+        self.run_program("git", args, limit).await
+    }
+    /// Runs a bounded local VCS read under the review deadline; errors kill and reap the child.
+    async fn run_program(&mut self, program: &str, args: &[&str], limit: usize) -> Result<Vec<u8>, &'static str> {
         if Instant::now() >= self.deadline {
             return Err("Git review timed out");
         }
@@ -727,7 +750,7 @@ impl Git<'_> {
         ) {
             return Err("Git review cancelled");
         }
-        let mut command = Command::new("git");
+        let mut command = Command::new(program);
         command.current_dir(self.root).env_clear();
         // Keep only executable lookup, not Git overrides or credentials.
         if let Some(path) = std::env::var_os("PATH") {
@@ -742,8 +765,12 @@ impl Git<'_> {
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_LITERAL_PATHSPECS", "1")
-            .env("LC_ALL", "C")
-            .args([
+            .env("LC_ALL", "C");
+        if program == "jj" {
+            // Keep repository/workspace configuration, without user or system defaults.
+            command.env("JJ_CONFIG", "");
+        } else {
+            command.args([
                 "--no-pager",
                 "--no-lazy-fetch",
                 "-c",
@@ -756,8 +783,9 @@ impl Git<'_> {
                 "diff.external=",
                 "-c",
                 "diff.renames=true",
-            ])
-            .args(args)
+            ]);
+        }
+        command.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -876,6 +904,8 @@ mod tests {
             line_stats: None,
             next_cursor: None,
             snapshot_key: None,
+            current_branch: None,
+            jj_context: None,
         };
         let mut total = 1024;
         for _ in 0..100 {
@@ -912,6 +942,8 @@ mod tests {
             line_stats: None,
             next_cursor: None,
             snapshot_key: None,
+            current_branch: Some("\"".repeat(4095)),
+            jj_context: None,
         };
         let mut first = make_review();
         paginate(&mut first, 0, 42).unwrap();

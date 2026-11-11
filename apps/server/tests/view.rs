@@ -1,3 +1,4 @@
+use pi_web::response_format;
 #[path = "../src/view.rs"]
 pub mod view;
 use serde_json::{Value, json};
@@ -5,6 +6,58 @@ use view::*;
 fn start(state: &mut ViewState) {
     state.apply(&json!({"type":"message_start","message":{"role":"assistant","content":[]}}));
 }
+#[test]
+fn releasing_a_previous_original_preserves_the_current_stream_mapping() {
+    use response_format::{ResponsePresentation, SimpleResponse};
+    let mut state = ViewState::with_response_formatting(true);
+    state.apply(&json!({"type":"message_start","message":{"role":"user","content":"First"}}));
+    state.apply(&json!({"type":"message_end","message":{"role":"user","content":"First"}}));
+    start(&mut state);
+    state.apply(&json!({"type":"message_end","message":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":"Original first answer"}]}}));
+    let first = state.messages().last().unwrap().id.clone();
+    state.present(&first, Some(ResponsePresentation::Ready { response: SimpleResponse { summary: "Saved.".into(), blocks: vec![], canvas: None, recorded: None }, timings: None }));
+    state.apply(&json!({"type":"message_start","message":{"role":"user","content":"Second"}}));
+    state.apply(&json!({"type":"message_end","message":{"role":"user","content":"Second"}}));
+    start(&mut state);
+    state.apply(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"stream"}}));
+    state.release_originals();
+    state.apply(&json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"ing"}}));
+    assert_eq!(state.messages().last().unwrap().blocks[0].text, "streaming");
+    assert!(state.messages().iter().find(|message| message.id == first).unwrap().blocks.is_empty());
+}
+#[test]
+fn pending_presentations_hide_intermediate_messages_and_stop_cleanly_on_exit() {
+    use response_format::ResponsePresentation;
+    let mut state = ViewState::with_response_formatting(true);
+    start(&mut state);
+    assert_eq!(state.messages()[0].presentation, Some(ResponsePresentation::Hidden), "streaming previews must stay invisible until settlement");
+    state.apply(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Intermediate"}]}}));
+    assert_eq!(state.messages()[0].presentation, Some(ResponsePresentation::Hidden), "a completed tool turn is not the final reply");
+    start(&mut state);
+    assert!(state.messages().iter().all(|message| message.presentation == Some(ResponsePresentation::Hidden)));
+    state.apply(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Final answer"}]}}));
+    state.interrupt("Process exited");
+    let messages = state.messages();
+    let final_message = messages.last().unwrap();
+    assert!(matches!(final_message.presentation, Some(ResponsePresentation::Error { .. })));
+    assert!(final_message.error.is_none(), "a completed original is not relabeled as a coding failure");
+    assert_eq!(final_message.blocks[0].text, "Final answer");
+}
+#[test]
+fn starting_another_query_preserves_the_previous_queries_formatter() {
+    use response_format::ResponsePresentation;
+    let mut state = ViewState::with_response_formatting(true);
+    start(&mut state);
+    state.apply(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"First final answer"}]}}));
+    state.apply(&json!({"type":"agent_settled"}));
+    let first = state.messages()[0].id.clone();
+    state.present(&first, Some(ResponsePresentation::Pending));
+    state.apply(&json!({"type":"agent_start"}));
+    start(&mut state);
+    assert_eq!(state.messages()[0].presentation, Some(ResponsePresentation::Pending), "a new query must not hide the previous final answer while it is simplifying");
+    assert_eq!(state.messages()[1].presentation, Some(ResponsePresentation::Hidden));
+}
+
 #[test]
 fn final_messages_replace_deltas_and_agent_end_is_not_settlement() {
     let mut state = ViewState::default();

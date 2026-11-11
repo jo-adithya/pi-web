@@ -1,5 +1,5 @@
 .action-dialog.command-palette { padding: .65rem; width: min(92vw, 560px); }
-.palette-search { width: 100%; padding: .85rem; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: transparent; color: var(--foreground); font: inherit; font-size: 16px; }
+.palette-search { width: 100%; padding: .85rem; border: 1px solid var(--border); border-radius: var(--radius); background: transparent; color: var(--foreground); font: inherit; font-size: var(--input-font-size); }
 .palette-results { max-height: min(50dvh, 420px); overflow-y: auto; overscroll-behavior: contain; margin-top: .4rem; }
 .palette-option { display: flex; flex-direction: column; gap: .2rem; padding: .65rem .85rem; border-radius: var(--radius); cursor: pointer; overflow-wrap: anywhere; }
 .palette-option[aria-selected="true"] { background: var(--accent); color: var(--accent-foreground); }
@@ -8,3 +8,6 @@
 .palette-footer { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .6rem .4rem 0; border-top: 1px solid var(--border); }
 .palette-footer button { font-size: .75rem; }
 .palette-empty { padding: .85rem; }
+@media (max-width: 760px) {
+  .palette-option { font-size: var(--input-font-size); }
+}

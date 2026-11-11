@@ -9,11 +9,14 @@ use std::{
 pub const HELP: &str = "pi-web [--cwd PATH] [--new | --session FILE] [--port PORT]\n\
   [--state-dir PATH] [--session-root PATH] [--pi EXECUTABLE]\n\
   [--web-dir PATH] [--head-adapter PATH] [--quota-adapter PATH] [--isolated]\n\
-  [--remote-origin https://HOSTNAME] [--revoke-push]\n\n\
+  [--remote-origin https://HOSTNAME] [--revoke-push]\n\
+  [--response-model PROVIDER/MODEL]\n\n\
 Binds only 127.0.0.1. Open the printed URL to authenticate this browser.\n\
 --remote-origin selects one private HTTPS proxy origin (default port 443; no trailing slash).\n\
 Defaults to the remembered exact session for the canonical project.\n\
 --new creates a new session without deleting prior Pi files.\n\
+Simple responses are always on (default openai-codex/gpt-6-luna); Settings saves the model server-wide.\n\
+--response-model changes the initial default only when no response model has been saved.\n\
 --revoke-push clears persistent phone subscriptions and exits; stop the server first.\n\
 --isolated disables optional extensions, MCP, context discovery and all tools but read.\n";
 
@@ -71,6 +74,20 @@ impl RemoteOrigin {
     }
 }
 
+/// Chat model used to turn coding answers into simple response cards.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseModel {
+    pub provider: String,
+    pub id: String,
+}
+
+impl Default for ResponseModel {
+    fn default() -> Self {
+        Self { provider: "openai-codex".into(), id: "gpt-6-luna".into() }
+    }
+}
+
 /// Validated startup options. Only the project directory may later be selected by a browser.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -89,6 +106,8 @@ pub struct Config {
     pub quota_adapter: PathBuf,
     pub isolated: bool,
     pub revoke_push: bool,
+    /// Initial default when no server-wide response model preference has been saved.
+    pub response_model: ResponseModel,
 }
 impl Config {
     /// Parses without creating files or starting Pi. `None` requests help.
@@ -108,6 +127,7 @@ impl Config {
         let mut quota_adapter = manifest.join("pi/codex-usage.ts");
         let mut isolated = false;
         let mut revoke_push = false;
+        let mut response_model = None;
         while let Some(flag) = args.next() {
             if flag == "--help" || flag == "-h" {
                 return Ok(None);
@@ -139,6 +159,7 @@ impl Config {
                     | "--web-dir"
                     | "--head-adapter"
                     | "--quota-adapter"
+                    | "--response-model"
             ) {
                 return Err(invalid(format!("unknown option: {flag}")));
             }
@@ -169,6 +190,14 @@ impl Config {
                         return Err(invalid("--remote-origin may only be specified once"));
                     }
                     remote_origin = Some(RemoteOrigin::parse(value)?);
+                }
+                "--response-model" => {
+                    if response_model.is_some() { return Err(invalid("--response-model may only be specified once")); }
+                    let (provider, id) = value.split_once('/').ok_or_else(|| invalid("response model must be PROVIDER/MODEL"))?;
+                    if [provider, id].iter().any(|part| part.is_empty() || part.len() > 256 || part.starts_with('-') || part.chars().any(|c| c.is_control() || c.is_whitespace())) {
+                        return Err(invalid("invalid response model identity"));
+                    }
+                    response_model = Some(ResponseModel { provider: provider.into(), id: id.into() });
                 }
                 "--pi" => pi = value.into(),
                 "--web-dir" => web_dir = value.into(),
@@ -217,6 +246,7 @@ impl Config {
             quota_adapter,
             isolated,
             revoke_push,
+            response_model: response_model.unwrap_or_default(),
         }))
     }
     /// Derives runtime options for a registered folder, retaining operator-only options.

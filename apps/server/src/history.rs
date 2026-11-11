@@ -29,6 +29,29 @@ pub struct Projection {
     pub older_history: bool,
 }
 
+/// One bounded exchange page with opaque ancestry cursors and explicit omission markers.
+pub struct Page {
+    pub entries: Vec<serde_json::Value>,
+    pub cursor: Option<String>,
+    pub older_cursor: Option<String>,
+}
+
+/// Reads at most ten exchanges from a Pi-owned ancestry cursor. `skip` is used
+/// only when moving from the live view to its first older page.
+pub fn project_page_images<R: Read + Seek>(reader: R, leaf: &str, skip: usize, project: impl FnMut(&mut serde_json::Value)) -> Result<Page> {
+    project_inner(reader, leaf, 8 * 1024 * 1024, true, Some(skip), None, project)
+}
+
+/// Resumes at a server-issued byte/ancestry cursor, so older pages do not rescan the file tail.
+pub fn resume_page_images<R: Read + Seek>(reader: R, cursor: &str, project: impl FnMut(&mut serde_json::Value)) -> Result<Page> {
+    let mut fields = cursor.splitn(3, ':');
+    if fields.next() != Some("p1") { return Err("invalid history cursor".into()); }
+    let end = fields.next().ok_or("invalid history cursor")?.parse::<u64>()?;
+    let leaf = fields.next().filter(|leaf| !leaf.is_empty()).ok_or("invalid history cursor")?;
+    project_inner(reader, leaf, 8 * 1024 * 1024, true, Some(0), Some(end), project)
+}
+fn page_cursor(end: u64, id: &str) -> String { format!("p1:{end}:{id}") }
+
 struct Metadata {
     kind: String,
     id: Option<String>,
@@ -135,17 +158,17 @@ fn truncated_entry(metadata: &Metadata) -> serde_json::Value {
 /// Returns an error on I/O failures, malformed scanned JSON, missing ancestry,
 /// unsupported headers, selected metadata/depth limits, or scan exhaustion.
 pub fn project<R: Read + Seek>(reader: R, leaf: &str) -> Result<Projection> {
-    project_inner(reader, leaf, MAX_RECORD_BYTES, false, |_| {})
+    project_inner(reader, leaf, MAX_RECORD_BYTES, false, None, None, |_| {}).map(|page| Projection { older_history: page.older_cursor.is_some(), entries: page.entries })
 }
 
 /// Reconstructs image references from bounded persisted records before retention.
 /// One record may be up to 8 MiB, with 16,384 allocation nodes enforced during
 /// decoding; projected records still obey the existing 64 KiB preview limit.
 pub fn project_images<R: Read + Seek>(reader: R, leaf: &str, project: impl FnMut(&mut serde_json::Value)) -> Result<Projection> {
-    project_inner(reader, leaf, 8 * 1024 * 1024, true, project)
+    project_inner(reader, leaf, 8 * 1024 * 1024, true, None, None, project).map(|page| Projection { older_history: page.older_cursor.is_some(), entries: page.entries })
 }
 
-fn project_inner<R: Read + Seek>(mut reader: R, leaf: &str, record_limit: u64, images: bool, mut project: impl FnMut(&mut serde_json::Value)) -> Result<Projection> {
+fn project_inner<R: Read + Seek>(mut reader: R, leaf: &str, record_limit: u64, images: bool, page_skip: Option<usize>, end: Option<u64>, mut project: impl FnMut(&mut serde_json::Value)) -> Result<Page> {
     if leaf.len() > MAX_METADATA_BYTES {
         return Err("history leaf exceeds metadata limit".into());
     }
@@ -159,10 +182,19 @@ fn project_inner<R: Read + Seek>(mut reader: R, leaf: &str, record_limit: u64, i
         return Err("history requires a migrated v3 session".into());
     }
     let mut lines = ReverseLines::new(reader)?;
+    if let Some(end) = end {
+        if end == 0 || end > lines.size { return Err("history cursor is outside the file".into()); }
+        lines.size = end; lines.cursor = end; lines.line_end = end; lines.block_start = end;
+    }
+    let mut last_offset = 0;
     let mut wanted = Some(leaf.to_owned());
     let mut entries = Vec::new();
     let mut retained = 0;
     let mut retained_nodes = 0;
+    let mut skipped = 0;
+    let mut exchanges = 0;
+    let mut cursor = None;
+    let mut stopped = false;
     while let Some(id) = wanted.as_ref() {
         let Some((offset, length)) = lines.next_range()? else {
             break;
@@ -177,6 +209,13 @@ fn project_inner<R: Read + Seek>(mut reader: R, leaf: &str, record_limit: u64, i
             return Err("session header is not an entry".into());
         }
         wanted = metadata.parent_id.take();
+        last_offset = offset;
+        let user = metadata.kind == "message" && metadata.message.as_ref().is_some_and(|message| message.role == "user");
+        if page_skip.is_some_and(|skip| skipped < skip) {
+            if user { skipped += 1; }
+            continue;
+        }
+        if cursor.is_none() { cursor = metadata.id.as_deref().map(|id| page_cursor(offset + length, id)); }
         let visible = match metadata.kind.as_str() {
             "message" => metadata
                 .message
@@ -200,7 +239,8 @@ fn project_inner<R: Read + Seek>(mut reader: R, leaf: &str, record_limit: u64, i
             project(&mut value);
             // Only bounded presentation fields survive; omit signatures, images and details.
             if let Some(message) = value.get_mut("message").and_then(|m| m.as_object_mut()) {
-                message.retain(|k, _| matches!(k.as_str(), "role" | "content" | "errorMessage"));
+                // The SDK timestamp keeps restored replies linked to their saved presentations.
+                message.retain(|k, _| matches!(k.as_str(), "role" | "content" | "errorMessage" | "timestamp"));
                 if let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
                     blocks.retain(|block| {
                         matches!(block["type"].as_str(), Some("text" | "thinking" | "image_ref" | "image_unavailable"))
@@ -246,32 +286,70 @@ fn project_inner<R: Read + Seek>(mut reader: R, leaf: &str, record_limit: u64, i
         let bytes = serde_json::to_vec(&value)?.len();
         if retained + bytes > MAX_RETAINED_BYTES || retained_nodes + nodes > MAX_RETAINED_NODES {
             entries.reverse();
-            return Ok(Projection {
-                entries,
-                older_history: true,
-            });
+            return Ok(Page { entries, cursor, older_cursor: metadata.id.as_deref().map(|id| page_cursor(offset + length, id)) });
         }
         retained += bytes;
         retained_nodes += nodes;
         entries.push(value);
-        if entries.len() == MAX_ENTRIES {
+        if user { exchanges += 1; }
+        if entries.len() == MAX_ENTRIES || page_skip.is_some() && exchanges == 10 {
+            stopped = true;
             break;
         }
     }
-    if wanted.is_some() && entries.len() < MAX_ENTRIES {
+    if wanted.is_some() && !stopped {
         return Err("active ancestor missing from session file".into());
     }
     entries.reverse();
-    Ok(Projection {
-        entries,
-        older_history: wanted.is_some(),
-    })
+    Ok(Page { entries, cursor, older_cursor: wanted.as_deref().map(|id| page_cursor(last_offset, id)) })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn history_pages_replace_ten_exchanges_and_resume_without_gaps() {
+        let mut file = String::from("{\"type\":\"session\",\"version\":3}\n");
+        let mut parent: Option<String> = None;
+        for index in 0..45 {
+            for role in ["user", "assistant", "assistant"] {
+                let id = format!("{index}-{role}-{}", parent.as_deref().unwrap_or("root").len());
+                file.push_str(&serde_json::json!({"type":"message","id":id,"parentId":parent,"message":{"role":role,"content":format!("{index}: {role}")}}).to_string());
+                file.push('\n'); parent = Some(id);
+            }
+        }
+        let latest = project_page_images(Cursor::new(&file), parent.as_deref().unwrap(), 0, |_| {}).unwrap();
+        assert_eq!(latest.entries.iter().filter(|entry| entry["message"]["role"] == "user").count(), 10);
+        assert_eq!(latest.entries[0]["message"]["content"], "35: user");
+        let older = resume_page_images(Cursor::new(&file), latest.older_cursor.as_deref().unwrap(), |_| {}).unwrap();
+        assert_eq!(older.entries[0]["message"]["content"], "25: user");
+        let middle = resume_page_images(Cursor::new(&file), older.older_cursor.as_deref().unwrap(), |_| {}).unwrap();
+        assert_eq!(middle.entries[0]["message"]["content"], "15: user");
+        let earlier = resume_page_images(Cursor::new(&file), middle.older_cursor.as_deref().unwrap(), |_| {}).unwrap();
+        assert_eq!(earlier.entries[0]["message"]["content"], "5: user");
+        let first = resume_page_images(Cursor::new(&file), earlier.older_cursor.as_deref().unwrap(), |_| {}).unwrap();
+        assert_eq!(first.entries.len(), 15);
+        assert!(first.older_cursor.is_none());
+        let skipped = project_page_images(Cursor::new(&file), parent.as_deref().unwrap(), 10, |_| {}).unwrap();
+        assert_eq!(skipped.entries, older.entries);
+        struct PrefixReader { data: Cursor<Vec<u8>>, prefix: u64 }
+        impl Read for PrefixReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let remaining = self.prefix.saturating_sub(self.data.position()) as usize;
+                if remaining == 0 { return Err(std::io::Error::other("cursor rescanned the unrelated tail")); }
+                let size = output.len().min(remaining);
+                self.data.read(&mut output[..size])
+            }
+        }
+        impl Seek for PrefixReader {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> { self.data.seek(position) }
+        }
+        let mut extended = file.as_bytes().to_vec(); extended.extend(vec![b'x'; 128 * 1024]);
+        let reader = PrefixReader { data: Cursor::new(extended), prefix: file.len() as u64 };
+        assert_eq!(resume_page_images(reader, older.cursor.as_deref().unwrap(), |_| {}).unwrap().entries, older.entries);
+    }
 
     fn fixture(entries: &[serde_json::Value]) -> Vec<u8> {
         let mut bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"s\"}\n".to_vec();

@@ -1083,6 +1083,12 @@ async fn delete_last_conversation_removes_transcript_and_replaces_without_launch
     assert!(std::path::Path::new(transcript_path).is_file());
     let project_file = fixture.0.join("project.txt");
     fs::write(&project_file, "project content").unwrap();
+    let presentations = metadata_path.parent().unwrap().join("response-formats");
+    fs::create_dir_all(&presentations).unwrap();
+    fs::write(presentations.join("retained.json"), "{}").unwrap();
+    let old_cache = metadata_path.parent().unwrap().join("response-formats.json");
+    fs::write(&old_cache, "[]").unwrap();
+    fs::set_permissions(&old_cache, fs::Permissions::from_mode(0o600)).unwrap();
     let request = command("delete", serde_json::from_value(serde_json::json!({"type":"delete", "sessionId":first, "epoch":identity.epoch, "confirmed":true})).unwrap());
     let deleted = manager.command(request.clone()).await;
     assert!(deleted.ok, "{deleted:?}");
@@ -1094,6 +1100,8 @@ async fn delete_last_conversation_removes_transcript_and_replaces_without_launch
     assert!(manager.lookup(&first).await.is_none());
     assert_eq!(manager.command(request).await, deleted);
     assert_eq!(fs::read(&metadata_path).unwrap(), metadata);
+    assert!(!presentations.exists(), "deleting a conversation must remove its durable presentations");
+    assert!(!old_cache.exists(), "deletion must also remove its legacy response cache");
     assert!(!std::path::Path::new(transcript_path).exists());
     assert_eq!(fs::read_to_string(project_file).unwrap(), "project content");
     assert!(manager.shutdown().await);
@@ -1112,6 +1120,55 @@ fn delete(session_id: &str, epoch: Option<String>, confirmed: bool) -> Workspace
         epoch,
         confirmed,
     }
+}
+
+#[tokio::test]
+async fn delete_waits_for_the_formatter_to_stop_before_removing_presentation_files() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("formatter-hold"), "").unwrap();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let first = manager.snapshot().await.selected;
+    let handle = manager.lookup(&first).await.unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    handle.dispatch("client".into(), BrowserMessage { v: 1, session_id: identity.session_id.clone(), epoch: identity.epoch.clone(), request_id: "complete".into(), action: BrowserAction::Prompt { text: "complete".into(), images: vec![] } }).unwrap();
+    let launch = fixture.0.join("formatter-launch.json");
+    let info = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(bytes) = fs::read(&launch) && let Ok(info) = serde_json::from_slice::<serde_json::Value>(&bytes) { break info; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("formatter must start before testing deletion");
+    let pid = info["pid"].as_i64().unwrap() as i32;
+    let deleted = manager.command(command("delete-formatting", delete(&first, Some(identity.epoch), true))).await;
+    assert!(deleted.ok, "{deleted:?}");
+    assert!(!fixture.0.join("state/sessions").join(&first).join("response-formats").exists());
+    // Signal zero checks that the task-owned formatter was reaped, without signaling it.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert!(manager.shutdown().await);
+}
+
+#[tokio::test]
+async fn delete_keeps_the_catalog_and_unrelated_files_when_presentation_cleanup_is_unsafe() {
+    let fixture = Fixture::new();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let first = manager.snapshot().await.selected;
+    let handle = manager.lookup(&first).await.unwrap();
+    let mut connection = handle.connect("delete".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    let presentations = fixture.0.join("state/sessions").join(&first).join("response-formats");
+    fs::remove_dir(&presentations).unwrap();
+    let unrelated = fixture.0.join("unrelated"); fs::create_dir(&unrelated).unwrap();
+    fs::write(unrelated.join("keep.txt"), "private unrelated data").unwrap();
+    std::os::unix::fs::symlink(&unrelated, &presentations).unwrap();
+    let failed = manager.command(command("fail-cleanup", delete(&first, Some(identity.epoch), true))).await;
+    assert!(!failed.ok);
+    assert_eq!(failed.code, "presentation_delete_failed");
+    assert!(failed.sessions.iter().any(|entry| entry.session_id == first));
+    assert_eq!(fs::read_to_string(unrelated.join("keep.txt")).unwrap(), "private unrelated data");
+    fs::remove_file(&presentations).unwrap();
+    assert!(manager.command(command("retry-cleanup", delete(&first, None, true))).await.ok);
+    assert!(manager.shutdown().await);
 }
 
 #[tokio::test]
@@ -1259,6 +1316,11 @@ async fn delete_legacy_in_other_workspace_preserves_selection_and_metadata_on_re
         ))
         .await;
     assert!(added.ok);
+    let presentations = fixture.0.join("state/response-formats");
+    fs::create_dir_all(&presentations).unwrap();
+    fs::write(presentations.join("retained.json"), "{}").unwrap();
+    let shared = fixture.0.join("state/shared-settings.json");
+    fs::write(&shared, "shared workspace data").unwrap();
     let deleted = manager
         .command(command("delete", delete(&first, Some(epoch), true)))
         .await;
@@ -1268,6 +1330,8 @@ async fn delete_legacy_in_other_workspace_preserves_selection_and_metadata_on_re
     assert_ne!(deleted.target.as_ref(), Some(&added.selected));
     let replacement = deleted.target.unwrap();
     assert!(manager.lookup(&replacement).await.is_none());
+    assert!(!presentations.exists(), "legacy sessions own only their presentation namespace, not the shared root");
+    assert_eq!(fs::read_to_string(&shared).unwrap(), "shared workspace data");
     assert_eq!(fs::read(&metadata_path).unwrap(), metadata);
     assert!(manager.shutdown().await);
     drop(manager);
@@ -1744,6 +1808,81 @@ async fn rename_validates_utf8_bytes_and_preserves_title_on_save_failure() {
     let resumed = SessionManager::start(fixture.config()).unwrap();
     assert_eq!(resumed.snapshot().await.sessions[0].title, title);
     assert!(resumed.shutdown().await);
+}
+
+#[tokio::test]
+async fn response_model_defaults_persists_and_updates_existing_and_new_sessions() {
+    use pi_web::{config::ResponseModel, response_format::ResponsePresentation, view::ViewPatch};
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("formatter-hold"), "").unwrap();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    assert_eq!(manager.snapshot().await.response_model, ResponseModel::default());
+    let first = manager.snapshot().await.selected;
+    let handle = manager.lookup(&first).await.unwrap();
+    let mut connection = handle.connect("response-test".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    let prompt = |session_id: &str, epoch: &str, request: &str| BrowserMessage {
+        v: 1, session_id: session_id.into(), epoch: epoch.into(), request_id: request.into(),
+        action: BrowserAction::Prompt { text: "complete".into(), images: vec![] },
+    };
+    handle.dispatch("response-test".into(), prompt(&first, &identity.epoch, "first")).unwrap();
+    let calls = fixture.0.join("formatter-calls.jsonl");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !calls.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.unwrap();
+    let mut changes = manager.grouping_changes();
+    let selected = ResponseModel { provider: "fixture".into(), id: "cheap".into() };
+    let reply = manager.command(command("response-model", WorkspaceAction::SetResponseModel { model: selected.clone() })).await;
+    assert!(reply.ok, "{reply:?}");
+    assert_eq!(reply.response_model, selected);
+    assert!(changes.has_changed().unwrap()); changes.borrow_and_update();
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1, "saving preferences must not call a model");
+    fs::remove_file(fixture.0.join("formatter-hold")).unwrap();
+    let simplified = |message: &ServerMessage| matches!(&message.body, ServerBody::Event { patches, .. } if patches.iter().any(|patch| matches!(patch, ViewPatch::Message { message } if matches!(message.presentation, Some(ResponsePresentation::Ready { .. })))));
+    until(&mut connection, simplified).await;
+    handle.dispatch("response-test".into(), prompt(&first, &identity.epoch, "second")).unwrap();
+    until(&mut connection, simplified).await;
+    let added = manager.command(command("new-response-session", WorkspaceAction::Create)).await;
+    assert!(added.ok);
+    let new_id = added.target.unwrap();
+    let new_handle = manager.lookup(&new_id).await.unwrap();
+    let mut new_connection = new_handle.connect("response-test".into()).await.unwrap();
+    let identity = ready(&mut new_connection).await;
+    new_handle.dispatch("response-test".into(), prompt(&new_id, &identity.epoch, "third")).unwrap();
+    until(&mut new_connection, simplified).await;
+    let log: Vec<serde_json::Value> = fs::read_to_string(&calls).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(log.len(), 3, "model changes must use a distinct cache key");
+    let model_arg = |index: usize| { let args = log[index]["args"].as_array().unwrap(); args[args.iter().position(|value| value == "--model").unwrap() + 1].as_str().unwrap() };
+    assert_eq!(model_arg(0), "gpt-6-luna", "running inference keeps its captured model");
+    assert_eq!(model_arg(1), "cheap");
+    assert_eq!(model_arg(2), "cheap");
+    assert!(manager.shutdown().await); drop(manager);
+    let mut options = fixture.config();
+    options.response_model = ResponseModel { provider: "other".into(), id: "startup-default".into() };
+    let restarted = SessionManager::start(options).unwrap();
+    assert_eq!(restarted.snapshot().await.response_model, selected, "saved settings override the startup default");
+    assert!(restarted.shutdown().await);
+}
+
+#[tokio::test]
+async fn response_model_rejects_invalid_values_and_does_not_publish_failed_saves() {
+    use pi_web::config::ResponseModel;
+    let fixture = Fixture::new();
+    let manager = SessionManager::start(fixture.config()).unwrap();
+    let changes = manager.grouping_changes();
+    for (index, id) in ["", "--unsafe", "bad model", "bad\nmodel", &"é".repeat(129)].iter().enumerate() {
+        let reply = manager.command(command(&format!("bad-response-{index}"), WorkspaceAction::SetResponseModel { model: ResponseModel { provider: "fixture".into(), id: (*id).into() } })).await;
+        assert!(!reply.ok);
+        assert_eq!(reply.response_model, ResponseModel::default());
+        assert!(!changes.has_changed().unwrap());
+    }
+    fs::create_dir(fixture.0.join("state/workspaces/response-settings.json")).unwrap();
+    let reply = manager.command(command("failed-response-save", WorkspaceAction::SetResponseModel { model: ResponseModel { provider: "fixture".into(), id: "cheap".into() } })).await;
+    assert!(!reply.ok);
+    assert_eq!(reply.code, "response_settings_write_failed");
+    assert_eq!(reply.response_model, ResponseModel::default());
+    assert!(!changes.has_changed().unwrap());
+    assert!(manager.shutdown().await);
 }
 
 #[tokio::test]

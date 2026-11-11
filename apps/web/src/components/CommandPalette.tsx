@@ -12,8 +12,8 @@ export interface PaletteCommand {
   run: () => void;
 }
 
-/** Search existing actions; keyboard selection stays in the input until explicitly activated. */
-export function CommandPalette(props: { commands: PaletteCommand[]; close: () => void }) {
+/** Search existing actions; returnFocus can anchor dismissal when the launching drawer unmounts. */
+export function CommandPalette(props: { commands: PaletteCommand[]; close: () => void; returnFocus?: Element }) {
   const [query, setQuery] = createSignal("");
   const [selected, setSelected] = createSignal(0);
   const id = createUniqueId();
@@ -27,7 +27,7 @@ export function CommandPalette(props: { commands: PaletteCommand[]; close: () =>
     props.close();
     command.run();
   }
-  return <ActionDialog title="Command palette" description="Find conversations, workspaces, and actions. Use arrow keys and Enter to choose." close={props.close} class="command-palette" hideHeading>
+  return <ActionDialog returnFocus={props.returnFocus} title="Command palette" description="Find conversations, workspaces, and actions. Use arrow keys and Enter to choose." close={props.close} class="command-palette" hideHeading>
     <input class="palette-search" role="combobox" aria-label="Search commands and conversations" aria-expanded="true" aria-autocomplete="list" aria-controls={`${id}-results`} aria-activedescendant={active() >= 0 ? `${id}-${active()}` : undefined}
       placeholder="Search commands and conversations…" autocomplete="off" spellcheck={false} value={query()}
       onInput={event => { setQuery(event.currentTarget.value); setSelected(0); }}

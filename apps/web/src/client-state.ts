@@ -1,11 +1,14 @@
-import type { ServerMessage, RuntimeStatus, DisplayMessage, Dialog, ViewPatch, SlashCommand, AgentSettings, ContextUsage, CodexUsage, BackgroundTask } from "./generated/protocol";
+import type { HistoryResponse, ServerMessage, RuntimeStatus, DisplayMessage, Dialog, ViewPatch, SlashCommand, AgentSettings, ContextUsage, CodexUsage, BackgroundTask } from "./generated/protocol";
+import { validResponse } from "./response-schema";
 export interface ClientState {
   sessionId: string; epoch: string; project: string; seq: number; synced: boolean;
+  /** Latest canvas revealed by a live delta; snapshots preserve the reader's position. */
+  canvasReadyId: string | null;
   status: RuntimeStatus; messages: Record<string, DisplayMessage>; order: string[];
   dialogs: Dialog[]; older: boolean; backgroundTasks: BackgroundTask[];
   commands: SlashCommand[]; settings: AgentSettings; contextUsage: ContextUsage | null; codexUsage: CodexUsage | null;
 }
-export const initialState = (): ClientState => ({ sessionId: "", epoch: "", project: "Pi Web", seq: 0, synced: false,
+export const initialState = (): ClientState => ({ sessionId: "", epoch: "", project: "Pi Web", seq: 0, synced: false, canvasReadyId: null,
   status: { process: "starting", activity: "idle", lastOutcome: null, error: null, historyWarning: null, persistence: false, cancelUnconfirmed: false, notice: null, lspStatus: null },
   messages: {}, order: [], dialogs: [], backgroundTasks: [], older: false, commands: [], settings: emptySettings(), contextUsage: null, codexUsage: null });
 const emptySettings = (): AgentSettings => ({ models: [], model: null, thinkingLevel: null, thinkingLevels: [], codexFast: null });
@@ -13,9 +16,9 @@ const emptySettings = (): AgentSettings => ({ models: [], model: null, thinkingL
 /** Applies only contiguous same-epoch deltas. A gap requests a new snapshot;
  * pending commands are deliberately not replayed after reconnect or epoch change.
  */
-export function applyServer(state: ClientState, message: ServerMessage): "applied" | "ignore" | "resync" {
+export function applyServer(state: ClientState, message: ServerMessage, historical = false): "applied" | "ignore" | "resync" {
   if (message.body.type === "hello") {
-    state.sessionId = message.sessionId; state.epoch = message.epoch; state.project = message.body.project; state.synced = false; state.commands = []; state.settings = emptySettings(); state.contextUsage = null; state.codexUsage = null; state.backgroundTasks = []; return "applied";
+    state.sessionId = message.sessionId; state.epoch = message.epoch; state.project = message.body.project; state.synced = false; state.canvasReadyId = null; state.commands = []; state.settings = emptySettings(); state.contextUsage = null; state.codexUsage = null; state.backgroundTasks = []; return "applied";
   }
   if (message.sessionId !== state.sessionId || message.epoch !== state.epoch) return "ignore";
   if (message.body.type === "background_tasks") { state.backgroundTasks = message.body.tasks; return "applied"; }
@@ -25,16 +28,21 @@ export function applyServer(state: ClientState, message: ServerMessage): "applie
   if (message.body.type === "commands") { state.commands = message.body.commands; return "applied"; }
   if (message.body.type === "snapshot") {
     if (message.epoch === state.epoch && state.synced && message.body.throughSeq < state.seq) return "ignore";
-    state.epoch = message.epoch; state.seq = message.body.throughSeq; state.synced = true;
-    state.messages = Object.fromEntries(message.body.messages.map(m => [m.id, m])); state.order = message.body.messages.map(m => m.id);
-    state.status = message.body.status; state.dialogs = message.body.dialogs; state.older = message.body.olderHistory; return "applied";
+    state.epoch = message.epoch; state.seq = message.body.throughSeq; state.synced = true; state.canvasReadyId = null;
+    if (!historical) {
+      state.messages = Object.fromEntries(message.body.messages.map(m => [m.id, m])); state.order = message.body.messages.map(m => m.id);
+      state.older = message.body.olderHistory;
+    }
+    state.status = message.body.status; state.dialogs = message.body.dialogs; return "applied";
   }
   if (message.epoch !== state.epoch) return "ignore";
   if (message.body.type !== "event") return "applied";
   if (message.body.seq <= state.seq) return "ignore";
   if (!state.synced || message.body.seq !== state.seq + 1 || message.body.patches.some(p => p.kind === "snapshot_needed")) { state.synced = false; return "resync"; }
-  for (const patch of message.body.patches) applyPatch(state, patch);
-  state.seq = message.body.seq; state.status = message.body.status; state.dialogs = message.body.dialogs; state.older = message.body.olderHistory; return "applied";
+  if (!historical) for (const patch of message.body.patches) applyPatch(state, patch);
+  const latest = state.order[state.order.length - 1];
+  if (!historical && message.body.patches.some(patch => patch.kind === "message" && patch.message.id === latest && patch.message.presentation?.state === "ready" && patch.message.presentation.response.canvas)) state.canvasReadyId = latest;
+  state.seq = message.body.seq; state.status = message.body.status; state.dialogs = message.body.dialogs; if (!historical) state.older = message.body.olderHistory; return "applied";
 }
 function applyPatch(state: ClientState, patch: ViewPatch) {
   switch (patch.kind) {
@@ -57,10 +65,34 @@ const array = (v: unknown, max: number, check: (item: unknown) => boolean): bool
 const integer = (v: unknown, max = 0xffffffff): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= max;
 export const processStatus = (v: unknown) => ["starting", "ready", "stopping", "exited", "failed"].includes(String(v));
 export const activity = (v: unknown) => ["idle", "submitting", "reconciling", "running", "retrying", "compacting", "awaiting_input", "cancelling", "failed"].includes(String(v));
-const status = (v: unknown): boolean => object(v) && processStatus(v.process) && activity(v.activity) && [v.lastOutcome, v.error, v.historyWarning, v.notice].every(nullable) && (v.lspStatus === null || catalogText(v.lspStatus, 512)) && typeof v.persistence === "boolean" && typeof v.cancelUnconfirmed === "boolean";
+const workPhase = (v: unknown): boolean => v === undefined || typeof v === "string" && ["thinking", "writing", "reading", "editing", "searching", "executing", "researching", "checking", "delegating", "tools"].includes(v);
+const status = (v: unknown): boolean => object(v) && processStatus(v.process) && activity(v.activity) && workPhase(v.workPhase) && [v.lastOutcome, v.error, v.historyWarning, v.notice].every(nullable) && (v.lspStatus === null || catalogText(v.lspStatus, 512)) && typeof v.persistence === "boolean" && typeof v.cancelUnconfirmed === "boolean";
 const block = (v: unknown): boolean => object(v) && ((v.kind === "image" && typeof v.text === "string" && /^[0-9a-f]{64}$/.test(v.text)) || (["text", "thinking", "notice"].includes(String(v.kind)) && string(v.text)));
 const key = (v: unknown): v is string => string(v, 1024) && !["__proto__", "constructor", "prototype"].includes(v);
-const display = (v: unknown): boolean => object(v) && key(v.id) && string(v.role, 128) && array(v.blocks, 128, block) && typeof v.complete === "boolean" && nullable(v.error) && typeof v.truncated === "boolean";
+/** Validates sequential server stages; first text is an offset inside model time. */
+const responseTimings = (v: unknown): boolean => {
+  if (!object(v) || !catalogText(v.model, 513) || !v.model.trim() || /[\p{Cc}]/u.test(v.model) || typeof v.cached !== "boolean") return false;
+  const { totalMs, queueMs, startupMs, modelMs, firstTextMs, cleanupMs } = v;
+  if (!integer(totalMs, Number.MAX_SAFE_INTEGER) || (v.captureMs !== undefined && !integer(v.captureMs, totalMs))) return false;
+  const stage = (ms: unknown): ms is number | null => ms === null || integer(ms, totalMs);
+  return integer(queueMs, totalMs) && integer(cleanupMs, totalMs) && stage(startupMs) && stage(modelMs) && stage(firstTextMs)
+    && (typeof v.captureMs === "number" ? v.captureMs : 0) + queueMs + (startupMs ?? 0) + (modelMs ?? 0) + cleanupMs <= totalMs
+    && (firstTextMs === null || (modelMs !== null && firstTextMs <= modelMs));
+};
+const presentation = (v: unknown): boolean => {
+  if (!object(v) || (v.timings !== undefined && !responseTimings(v.timings))) return false;
+  if (v.state === "pending" || v.state === "hidden") return true;
+  if (v.state === "error") return catalogText(v.message, 512) && typeof v.retryable === "boolean";
+  return v.state === "ready" && validResponse(v.response);
+};
+const display = (v: unknown): boolean => object(v) && key(v.id) && string(v.role, 128) && array(v.blocks, 128, block) && typeof v.complete === "boolean" && nullable(v.error) && typeof v.truncated === "boolean" && (v.sourceKey === undefined || (typeof v.sourceKey === "string" && /^[a-f0-9]{64}$/.test(v.sourceKey))) && (v.presentation === undefined || (v.role === "assistant" && presentation(v.presentation)));
+/** Validates disk-backed pages with the same message schema as live snapshots. */
+export function validHistoryResponse(value: unknown): value is HistoryResponse {
+  if (!object(value) || !key(value.epoch)) return false;
+  if (value.type === "original") return typeof value.text === "string";
+  return value.type === "page" && key(value.cursor) && key(value.latestCursor)
+    && (value.olderCursor === null || key(value.olderCursor)) && array(value.messages, 500, display);
+}
 const dialog = (v: unknown): boolean => object(v) && [v.id, v.kind, v.title, v.message, v.initial].every(s => string(s)) && array(v.options, 128, s => string(s, 512));
 const utf8 = new TextEncoder();
 /** Validates catalog text against the server's UTF-8 byte limits. */

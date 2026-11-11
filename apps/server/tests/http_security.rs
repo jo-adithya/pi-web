@@ -64,6 +64,27 @@ async fn setup_options(origin: Option<&str>, images: bool) -> (Fixture, Router, 
     (Fixture(root), http::router(state.with_push(push)), runtime)
 }
 #[tokio::test]
+async fn history_requires_same_origin_explicit_proof_and_a_registered_session() {
+    let (_fixture, router, runtime) = setup().await;
+    for (origin, proof, body, expected) in [
+        (None, Some("a".repeat(64)), r#"{"type":"page","cursor":null,"start":null}"#, StatusCode::FORBIDDEN),
+        (Some("https://evil.invalid"), Some("a".repeat(64)), r#"{"type":"page","cursor":null,"start":null}"#, StatusCode::FORBIDDEN),
+        (Some("http://127.0.0.1:9876"), None, r#"{"type":"page","cursor":null,"start":null}"#, StatusCode::UNAUTHORIZED),
+        (Some("http://127.0.0.1:9876"), Some("b".repeat(64)), r#"{"type":"original","cursor":null,"sourceKey":"abc"}"#, StatusCode::UNAUTHORIZED),
+        (Some("http://127.0.0.1:9876"), Some("a".repeat(64)), r#"{"type":"page","cursor":null,"start":null,"path":"/etc/passwd"}"#, StatusCode::BAD_REQUEST),
+        (Some("http://127.0.0.1:9876"), Some("a".repeat(64)), r#"{"type":"page","cursor":null,"start":null}"#, StatusCode::NOT_FOUND),
+    ] {
+        let mut request = Request::builder().method("POST").uri("/history/not-a-session").header("host", "127.0.0.1:9876").header("content-type", "application/json");
+        if let Some(origin) = origin { request = request.header("origin", origin); }
+        if let Some(proof) = proof { request = request.header("x-pi-capability", proof); }
+        let response = router.clone().oneshot(request.body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    assert!(runtime.shutdown().await);
+}
+
+#[tokio::test]
 async fn artifact_viewer_has_its_own_opaque_sandbox_and_restricted_script_policy() {
     let (_fixture, router, runtime) = setup().await;
     let response = router

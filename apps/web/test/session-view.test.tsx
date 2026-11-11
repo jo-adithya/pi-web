@@ -27,6 +27,59 @@ function activity(model: SessionModel, activity: Activity) {
 }
 afterEach(() => { cleanup(); vi.useRealTimers(); });
 
+it.each([
+  ["Explore this project", "Give me a tour of this project. Explain how it is organized, the main entry points, and where to start."],
+  ["Plan a feature", "Help me plan a new feature. First, ask me what I want to build, then explore the relevant code before proposing a plan."],
+  ["Find a bug", "Help me investigate a bug. Ask me about the expected behavior, what actually happens, and how to reproduce it."],
+])("prepares %s in the composer without sending it", (label, prompt) => {
+  const model = session();
+  const view = render(() => <SessionView model={model} />); flush();
+  fireEvent.click(view.getByRole("button", { name: new RegExp(label) })); flush();
+  expect(model.draft()).toBe(prompt);
+  expect(model.pending()).toBe(false);
+  expect(document.activeElement).toBe(view.getByLabelText("Message Pi"));
+});
+
+it("keeps starter actions from replacing an existing draft", () => {
+  const model = session();
+  model.setDraft("My unfinished idea");
+  const view = render(() => <SessionView model={model} />); flush();
+  const starter = view.getByRole("button", { name: /Explore this project/ }) as HTMLButtonElement;
+  expect(starter.disabled).toBe(true);
+  fireEvent.click(starter); flush();
+  expect(model.draft()).toBe("My unfinished idea");
+});
+
+it("opens local changes from the welcome screen without sending a prompt", () => {
+  const model = session();
+  const changes = vi.fn();
+  const view = render(() => <SessionView model={model} changes={changes} />); flush();
+  fireEvent.click(view.getByRole("button", { name: "Review local changes" })); flush();
+  expect(changes).toHaveBeenCalledOnce();
+  expect(model.draft()).toBe("");
+  expect(model.pending()).toBe(false);
+});
+
+it("shows the original composer heading and preserves the editable draft", () => {
+  const model = session();
+  model.setDraft("My unfinished\nidea");
+  const view = render(() => <SessionView model={model} />); flush();
+  expect(view.getByText("Your next move")).toBeTruthy();
+  const input = view.getByLabelText("Message Pi") as HTMLTextAreaElement;
+  expect(input.value).toBe("My unfinished\nidea");
+  fireEvent.input(input, { target: { value: "My revised\nidea" } }); flush();
+  expect(model.draft()).toBe("My revised\nidea");
+  expect(model.pending()).toBe(false);
+});
+
+it("omits recent-prompt controls while keeping conversation history visible", () => {
+  const model = session();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "snapshot", throughSeq: 1, messages: [{ id: "previous", role: "user", complete: true, truncated: false, error: null, blocks: [{ kind: "text", text: "Previous question" }] }], dialogs: [], olderHistory: false, status: { ...model.state.status } } });
+  const view = render(() => <SessionView model={model} />); flush();
+  expect(view.queryByRole("button", { name: "Recent prompts" })).toBeNull();
+  expect(view.getByText("Previous question")).toBeTruthy();
+});
+
 it("shows extension notices as transient toasts without hiding errors", () => {
   vi.useFakeTimers();
   const model = session(); flush();
@@ -148,6 +201,50 @@ it.each(["submitting", "running", "retrying", "compacting", "reconciling", "awai
   expect(view.queryByRole("button", { name: "Stop" })).toBeNull();
   activity(model, "failed");
   expect(view.getByRole("button", { name: "Send" })).toBeTruthy();
+});
+
+it.each([
+  ["thinking", "Thinking…"], ["writing", "Writing…"], ["reading", "Reading files…"],
+  ["editing", "Editing files…"], ["searching", "Searching…"], ["executing", "Running a command…"],
+  ["researching", "Researching…"], ["checking", "Checking code…"], ["delegating", "Delegating work…"], ["tools", "Running tools…"],
+] as const)("shows short %s progress without changing the draft or cancellation controls", (workPhase, label) => {
+  const model = session(); model.setDraft("Keep my draft");
+  const view = render(() => <SessionView model={model} />); flush();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [], dialogs: [], olderHistory: false,
+    status: { ...model.state.status, activity: "running", notice: null, ...{ workPhase } } } }); flush();
+  expect(view.getByRole("status", { name: "Agent activity" }).textContent).toBe(label);
+  expect(model.draft()).toBe("Keep my draft");
+  expect(view.getByRole("button", { name: "Steer Pi" })).toBeTruthy();
+  activity(model, "cancelling");
+  expect(view.getByRole("status", { name: "Agent activity" }).textContent).toBe("Stopping…");
+  activity(model, "idle");
+  expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
+});
+
+it("hides stale work labels until a reconnect snapshot confirms the current phase", () => {
+  const model = session();
+  const view = render(() => <SessionView model={model} />); flush();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [], dialogs: [], olderHistory: false,
+    status: { ...model.state.status, activity: "running", notice: null, workPhase: "reading" } } }); flush();
+  expect(view.getByRole("status", { name: "Agent activity" }).textContent).toBe("Reading files…");
+  model.receive({ v: 1, sessionId, epoch, body: { type: "hello", project: "fixture", process: "ready" } }); flush();
+  expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "snapshot", throughSeq: model.state.seq + 1, messages: [], dialogs: [], olderHistory: false,
+    status: { ...model.state.status, activity: "running", workPhase: "executing" } } }); flush();
+  expect(view.getByRole("status", { name: "Agent activity" }).textContent).toBe("Running a command…");
+});
+
+it("shows formatting as a distinct phase until the answer is ready", () => {
+  const model = session();
+  const view = render(() => <SessionView model={model} />); flush();
+  model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [{ kind: "message", message: {
+    id: "formatting", role: "assistant", complete: true, truncated: false, error: null, blocks: [], presentation: { state: "pending" },
+  } }], dialogs: [], olderHistory: false, status: { ...model.state.status, activity: "idle", notice: null } } }); flush();
+  expect(view.getByRole("status", { name: "Agent activity" }).textContent).toBe("Preparing your answer…");
+  model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [{ kind: "message", message: {
+    id: "formatting", role: "assistant", complete: true, truncated: false, error: null, blocks: [], presentation: { state: "ready", response: { summary: "Done.", blocks: [] } },
+  } }], dialogs: [], olderHistory: false, status: { ...model.state.status } } }); flush();
+  expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
 });
 
 it("shows prompt submission immediately and hides stale activity after disconnection", () => {

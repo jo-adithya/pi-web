@@ -60,7 +60,7 @@ pub(super) fn scan(
         .map_err(|_| "History path/header validation failed")?;
     let before = fingerprint(&path)?;
     let file = File::open(&path).map_err(|_| "History file could not be opened")?;
-    let projection = history::project_images(file, leaf, |entry| {
+    let projection = history::project_page_images(file, leaf, 0, |entry| {
         if entry["type"] == "message" { images.project_message(&mut entry["message"]); }
         else if entry["type"] == "custom_message" { images.project_message(entry); }
     })
@@ -73,10 +73,63 @@ pub(super) fn scan(
             result.messages.push(message);
         }
     }
-    result.older = projection.older_history;
+    result.older = projection.older_cursor.is_some();
     result.file = Some((path, before));
     Ok(result)
 }
+pub(super) struct ReadScan {
+    pub head: HistoryHead,
+    pub revision: u64,
+    pub file: (PathBuf, Fingerprint),
+    pub response: crate::protocol::HistoryResponse,
+    pub strict: bool,
+}
+
+/// Reads one replacement page on a blocking worker, scoped to the validated Pi file.
+pub(super) fn read(
+    head: HistoryHead, revision: u64, epoch: String, roots: Vec<PathBuf>, cwd: PathBuf,
+    images: crate::images::Images, formatter: crate::response_format::Formatter,
+    request: crate::protocol::HistoryRequest, skip: usize,
+) -> Result<ReadScan, String> {
+    use crate::protocol::{HistoryRequest, HistoryResponse};
+    let path = head.session_file.as_deref().ok_or("No saved history is available")?;
+    let latest = head.leaf_id.as_deref().ok_or("No saved history is available")?;
+    let path = metadata::validate_session(Path::new(path), &roots, &cwd).map_err(|_| "History path/header validation failed")?;
+    let before = fingerprint(&path)?;
+    let cursor = match &request { HistoryRequest::Page { cursor, .. } | HistoryRequest::Original { cursor, .. } => cursor.as_deref().unwrap_or(latest) };
+    let file = File::open(&path).map_err(|_| "History file is unavailable")?;
+    let project = |entry: &mut serde_json::Value| {
+        if entry["type"] == "message" { images.project_message(&mut entry["message"]); }
+        else if entry["type"] == "custom_message" { images.project_message(entry); }
+    };
+    let resumed = match &request { HistoryRequest::Page { cursor, .. } | HistoryRequest::Original { cursor, .. } => cursor.is_some() };
+    let page = if resumed { history::resume_page_images(file, cursor, project) } else { history::project_page_images(file, cursor, skip, project) }
+        .map_err(|_| "History page could not be read within safe limits")?;
+    if fingerprint(&path)? != before { return Err("History changed while loading; try again".into()); }
+    let strict = matches!(&request, HistoryRequest::Page { cursor: None, .. });
+    let response = match request {
+        HistoryRequest::Original { source_key, .. } => {
+            let text = formatter.original_text(&page.entries, &source_key, page.older_cursor.is_some()).map_err(str::to_owned)?;
+            HistoryResponse::Original { epoch, text }
+        }
+        HistoryRequest::Page { .. } => {
+            let mut messages = Vec::new();
+            for entry in page.entries { if let Some(message) = display_entry(entry)? { messages.push(message); } }
+            formatter.restore(&mut messages, page.older_cursor.is_some());
+            for message in &mut messages {
+                if let Some(crate::response_format::ResponsePresentation::Error { message, retryable, .. }) = &mut message.presentation {
+                    *retryable = false;
+                    if message == "This saved reply has not been simplified. Retry or choose Original." { *message = "This saved reply has not been simplified. View Original.".into(); }
+                }
+            }
+            crate::view::compact_ready(&mut messages, page.older_cursor.is_some());
+            if serde_json::to_vec(&messages).map_err(|_| "History serialization failed")?.len() > crate::view::MAX_DISPLAY_BYTES { return Err("This page exceeds the display memory budget".into()); }
+            HistoryResponse::Page { epoch, cursor: page.cursor.ok_or("No earlier exchanges are available")?, latest_cursor: latest.to_owned(), older_cursor: page.older_cursor, messages }
+        }
+    };
+    Ok(ReadScan { head, revision, file: (path, before), response, strict })
+}
+
 /// Converts the bounded projection's entries into browser presentation, preserving
 /// explicit omission markers instead of silently hiding unavailable content.
 fn display_entry(entry: serde_json::Value) -> Result<Option<DisplayMessage>, String> {

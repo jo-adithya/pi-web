@@ -8,9 +8,9 @@ import { Collapsible } from "@kobalte/core/collapsible";
 import { reviewLineKey } from "./review-history";
 import type { EvidenceCitation, ExplanationEvidence } from "./review-explanations";
 import type { ReviewQuestion } from "./local-review";
-import { createEffect, createMemo, createSignal, flush, For, onSettled, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, createUniqueId, flush, For, onSettled, Show } from "solid-js";
 import { Checkbox } from "@kobalte/core/checkbox";
-import { hasPatch, reviewLineRanges, type ReviewScope } from "./local-review";
+import { hasPatch, reviewLineRanges, type ReviewScope, type ReviewSnapshot } from "./local-review";
 import { ReviewRows } from "./ReviewRows";
 import { ReviewOverview } from "./ReviewOverview";
 import { groupingUsageLabel } from "./review-costs";
@@ -34,9 +34,24 @@ const scopeHelp = {
   commit: "The selected commit against its first parent; root commits against an empty tree. Uncommitted edits are excluded.",
 };
 
+/** Shows checkout identity and labels ancestor-derived jj bookmarks as ancestry hints. */
+function ReviewCheckout(props: { snapshot?: ReviewSnapshot; captured: boolean }) {
+  return <Show when={props.snapshot?.jjContext} fallback={<Show when={props.snapshot?.currentBranch !== undefined}>
+    <p class="review-branch" role="note" aria-label="Repository branch"><Icon name="branch" /><span>{props.captured ? "Branch at capture" : "Current branch"}: <code>{props.snapshot?.currentBranch ?? "Detached HEAD"}</code></span></p>
+  </Show>}>{context => <p class="review-branch" role="note" aria-label="Repository change"><Icon name="branch" /><span>
+    <Show when={props.captured}>At capture · </Show>
+    <Show when={context().changeId} fallback="Jujutsu details unavailable">{changeId => <>
+      Jujutsu · <code>{changeId()}</code> · <Show when={context().bookmarks.length} fallback="No bookmark within 3 commits">
+        <span title="Nearest local bookmarks at the same ancestry depth; not an active branch.">{context().distance === 0 ? "Bookmarks: " : "Based on "}{context().bookmarks.join(", ")}<Show when={context().distance}>{distance => <> ({distance()} {distance() === 1 ? "commit" : "commits"} back)</>}</Show></span>
+      </Show>
+    </>}</Show>
+  </span></p>}</Show>;
+}
+
 /** Read-only workspace snapshot browser with explicit questions about selected code. */
 export function LocalReview(props: { model: SessionModel; conversation: () => void }) {
   const review = props.model.review;
+  const toolbarId = createUniqueId();
   const structural = review.structural, context = review.context;
   const [notice, setNotice] = createSignal("");
   const savedPosition = props.model.reviewPosition;
@@ -293,11 +308,13 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
               <SelectField class="review-group-picker" label="Review group" visibleLabel value={activeGroup() ? String(review.grouping.value()!.indexOf(activeGroup()!)) : ""} options={[{ value: "", label: "All groups" }, ...(review.grouping.value() ?? []).map((group, index) => ({ value: String(index), label: `${group.title} (${group.paths.length})` }))]} change={key => { const group = key === "" ? undefined : review.grouping.value()?.[Number(key)]; if (group) startGroup(group.paths); else setGroupKey(""); }} />
               <Show when={activeGroup()}><Button type="button" onClick={() => { setGroupKey(""); setFilter(""); setNeedsReview(false); }}>Show all files</Button></Show>
             </Show>
-            <div class="review-filter"><TextField value={filter()} onChange={value => { setFilter(value); flush(); }}><TextField.Input type="search" aria-label="Filter files" placeholder="Filter files…" /></TextField><Show when={filter()}><Button type="button" onClick={() => setFilter("")} aria-label="Clear filter">×</Button></Show></div>
-            <div class="review-needs-filter" role="group" aria-label="Filter by review status">
-        <Button type="button" aria-pressed={!needsReview() ? "true" : "false"} onClick={() => setNeedsReview(false)}>All files</Button>
-        <Button type="button" aria-pressed={needsReview() ? "true" : "false"} onClick={() => setNeedsReview(true)}>Unreviewed</Button>
-      </div>
+            <div class="review-file-filters">
+              <div class="review-filter"><TextField value={filter()} onChange={value => { setFilter(value); flush(); }}><TextField.Input type="search" aria-label="Filter files" placeholder="Filter files…" /></TextField><Show when={filter()}><Button type="button" onClick={() => setFilter("")} aria-label="Clear filter">×</Button></Show></div>
+              <div class="review-needs-filter" role="group" aria-label="Filter by review status">
+                <Button type="button" aria-pressed={!needsReview() ? "true" : "false"} onClick={() => setNeedsReview(false)}>All files</Button>
+                <Button type="button" aria-pressed={needsReview() ? "true" : "false"} onClick={() => setNeedsReview(true)}>Unreviewed</Button>
+              </div>
+            </div>
             <Show when={needsReview()}><p class="review-group-status">Unloaded files stay visible until their fingerprints are checked.</p></Show>
             <Show when={visibleFiles().length} fallback={<p class="review-filter-empty">No files match your filter.</p>}>
               <For each={groups()}>{group => <section>
@@ -326,6 +343,11 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
     setSelectionQuestion({ file: selected, target, lines: onlySelection ? selectedLines() : undefined, question, returnFocus: returnFocus ?? dialogReturnFocus() ?? undefined });
   }
   return <section class="local-review" aria-label="Local changes" aria-busy={review.busy() ? "true" : "false"}>
+    <header class="studio-page-heading review-page-heading"><div><span class="page-heading-label"><Icon name="branch" />Workspace review</span><h1>Local changes</h1><p>See the whole change. Get the details right.</p><ReviewCheckout snapshot={review.snapshot()} captured={review.target()?.scope === "turn"} /></div>
+      <div class="review-heading-actions"><span class="review-readonly"><Icon name="info" />Read-only</span>
+        <Show when={review.scope() !== "branch"}><Button class="review-refresh review-refresh-icon" type="submit" form={toolbarId} aria-label={review.busy() ? "Loading…" : "Refresh"} title={review.busy() ? "Loading…" : "Refresh"} disabled={review.busy()}><Icon name="refresh" /></Button></Show>
+      </div>
+    </header>
     <Toast message={props.model.visibleNotice()} dismiss={props.model.dismissNotice} />
     <Show when={sourceLocation()} keyed>{location => <SourceReferenceDialog location={location} load={props.model.loadSource} close={() => setSourceLocation(undefined)} />}</Show>
     <Show when={selectionQuestion()} keyed>{selection => <AskSelectionDialog selection={selection} model={props.model} close={() => setSelectionQuestion(undefined)} conversation={props.conversation} />}</Show>
@@ -336,7 +358,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
       </details>
       <Button type="button" disabled={props.model.pending() || (!props.model.canConfigure() && !props.model.canSteer())} onClick={() => { if (props.model.submitFeedback()) props.conversation(); }}>Send feedback to Pi</Button>
     </section></Show>
-    <form class="review-toolbar" onSubmit={event => { event.preventDefault(); setNotice(""); void review.refresh(); }}>
+    <form id={toolbarId} class="review-toolbar" onSubmit={event => { event.preventDefault(); setNotice(""); void review.refresh(); }}>
       <div class="review-scopes" role="group" aria-label="Change scope">
         <For each={[["unstaged", "Unstaged"], ["staged", "Staged"], ["branch", "Branch"], ["commit", "Commit"], ["turn", "Last turn"]] as const}>{([scope, label]) =>
           <Button type="button" aria-pressed={review.scope() === scope ? "true" : "false"} title={scopeHelp[scope]} onClick={() => changeScope(scope)}>{label}</Button>
@@ -362,8 +384,7 @@ export function LocalReview(props: { model: SessionModel; conversation: () => vo
           ]} />
         <Button type="button" disabled={review.busy() || review.history.busy()} onClick={() => void reloadCommits()}>Reload commits</Button>
       </Show>
-      <Button class={review.scope() === "branch" ? "review-refresh" : "review-refresh review-refresh-icon"} type="submit" aria-label={review.busy() ? "Loading…" : review.scope() === "branch" ? "Compare" : "Refresh"} title={review.busy() ? "Loading…" : review.scope() === "branch" ? "Compare" : "Refresh"} disabled={review.busy() || (review.scope() === "branch" && !review.base().trim())}><Show when={review.scope() === "branch"} fallback={<Icon name="refresh" />}>{review.busy() ? "Loading…" : "Compare"}</Show></Button>
-      <span class="review-readonly">Read-only</span>
+      <Show when={review.scope() === "branch"}><Button type="submit" disabled={review.busy() || !review.base().trim()}>{review.busy() ? "Loading…" : "Compare"}</Button></Show>
     </form>
     <Show when={review.scope() === "branch"}>
       <Show when={review.snapshot() && (review.target()?.scope !== "branch" || review.target()?.base !== review.base().trim())}><p class="review-help" role="status">Comparison not applied. The files below still show the previous snapshot.</p></Show>

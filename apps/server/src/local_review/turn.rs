@@ -71,6 +71,29 @@ impl TurnChanges {
             state.before = None;
         }
     }
+    /// Copies bounded file metadata for the expected settled turn. Concurrent edits are
+    /// included; stale or unavailable captures stay explicitly unavailable.
+    pub(crate) fn response_files(&self, expected: u64, recorded: &mut crate::response_format::RecordedEvidence) {
+        use crate::response_format::{FileCaptureState, FileChangeKind, RecordedFile};
+        let state = self.0.lock().unwrap();
+        if state.generation != expected { return; }
+        let Some(Ok(review)) = &state.result else { return; };
+        recorded.files_state = FileCaptureState::Captured;
+        recorded.omitted_files = review.truncated;
+        for file in &review.files {
+            if recorded.files.len() == 8 || file.path.len() > 512 || file.path.chars().any(char::is_control) {
+                recorded.omitted_files = true; continue;
+            }
+            let change = match file.status { "added" => FileChangeKind::Added, "deleted" => FileChangeKind::Deleted, _ => FileChangeKind::Modified };
+            let counts = file.patch.as_ref().filter(|patch| patch.starts_with("--- a/")).map(|patch| {
+                let hunks = patch.find("\n@@").map_or("", |index| &patch[index + 1..]);
+                (hunks.lines().filter(|line| line.starts_with('+')).count() as u32, hunks.lines().filter(|line| line.starts_with('-')).count() as u32)
+            });
+            recorded.files.push(RecordedFile { id: format!("file:{}", recorded.files.len()), path: file.path.clone(), change,
+                added: counts.map(|value| value.0), removed: counts.map(|value| value.1) });
+        }
+    }
+
     pub(crate) fn review(&self, request: &Request) -> Result<Review, &'static str> {
         if request.base.is_some()
             || request.commit.is_some()
@@ -245,8 +268,9 @@ async fn comparison(root: &Path, before: &Baseline) -> Result<Review, &'static s
     let scratch = Scratch(directory);
     let old_path = scratch.0.join("before");
     let new_path = scratch.0.join("after");
-    let mut review = Review { files: Vec::new(), truncated: false, note: Some("Captured from turn start to settlement, including any concurrent edits. Content only; not an attribution or filesystem transaction. Snapshots are runtime-only. Binary, symlink and oversized content is omitted.".into()), line_stats: None, next_cursor: None, snapshot_key: None };
-    let mut total = 1024;
+    let (current_branch, jj_context) = git.checkout_context().await?;
+    let mut review = Review { files: Vec::new(), truncated: false, note: Some("Captured from turn start to settlement, including any concurrent edits. Content only; not an attribution or filesystem transaction. Snapshots are runtime-only. Binary, symlink and oversized content is omitted.".into()), line_stats: None, next_cursor: None, snapshot_key: None, current_branch, jj_context };
+    let mut total = 1024 + serde_json::to_vec(&review).map_err(|_| "Cannot encode review metadata")?.len();
     for path in paths {
         if Instant::now() >= git.deadline {
             return Err("Turn comparison timed out");
@@ -367,6 +391,7 @@ mod tests {
     #[tokio::test]
     async fn comparison_excludes_preexisting_edits_and_is_frozen_after_settlement() {
         let root = fixture();
+        git(&root.0, &["checkout", "-qb", "captured-branch"]);
         std::fs::write(root.0.join("main.ts"), "already dirty\n").unwrap();
         std::fs::write(root.0.join("existing.ts"), "already untracked\n").unwrap();
         let turns = TurnChanges::default();
@@ -377,6 +402,13 @@ mod tests {
         turns.finish(&root.0, turns.generation()).await;
         let review = turns.review(&request()).unwrap();
         assert_eq!(review.files.len(), 3);
+        assert_eq!(review.current_branch.as_deref(), Some("captured-branch"));
+        let mut recorded = crate::response_format::RecordedEvidence::default();
+        turns.response_files(turns.generation(), &mut recorded);
+        assert_eq!(recorded.files.len(), 3);
+        let file = recorded.files.iter().find(|file| file.path == "main.ts").unwrap();
+        assert_eq!((file.added, file.removed), (Some(1), Some(1)));
+        assert!(!serde_json::to_string(&recorded).unwrap().contains("already dirty"));
         let main = review
             .files
             .iter()
@@ -400,8 +432,10 @@ mod tests {
                 .any(|file| file.path == "other.ts" && file.status == "deleted")
         );
         std::fs::write(root.0.join("main.ts"), "after settlement\n").unwrap();
+        git(&root.0, &["checkout", "-qb", "later-branch"]);
         turns.finish(&root.0, turns.generation()).await;
         let frozen = turns.review(&request()).unwrap();
+        assert_eq!(frozen.current_branch.as_deref(), Some("captured-branch"), "branch metadata stays with the captured turn");
         assert_eq!(
             frozen
                 .files
@@ -413,8 +447,13 @@ mod tests {
                 .unwrap(),
             main
         );
+        let old = turns.generation();
         turns.reset();
         assert!(turns.review(&request()).is_err());
+        let mut unavailable = crate::response_format::RecordedEvidence::default();
+        turns.response_files(old, &mut unavailable);
+        assert_eq!(unavailable.files_state, crate::response_format::FileCaptureState::Unavailable);
+        assert!(unavailable.files.is_empty());
     }
     #[tokio::test]
     async fn stale_capture_cannot_replace_a_new_turn_and_symlinks_are_not_read() {

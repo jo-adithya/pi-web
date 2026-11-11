@@ -1,5 +1,7 @@
 import { Button } from "@kobalte/core/button";
 import { CopyButton } from "./components/CopyButton";
+import { SimpleResponse } from "./components/SimpleResponse";
+import { renderMarkdownParts } from "./markdown";
 import { ImageLightbox } from "./components/ImageLightbox";
 import { For, Show, createMemo, createSignal, onSettled } from "solid-js";
 import type { DisplayMessage } from "./generated/protocol";
@@ -12,18 +14,32 @@ import { reviewMessageContent, type ReviewCard } from "./review-cards";
 import { ReviewDiffCard, type ReviewPreviewLoader } from "./components/ReviewDiffCard";
 import type { CodeLocation } from "./code-reference";
 
-interface ReviewPresentation { openCode?: (location: CodeLocation) => void; reviewCards?: readonly ReviewCard[]; loadReviewPreview?: ReviewPreviewLoader }
+interface ReviewPresentation { loadOriginal?: (sourceKey: string, signal: AbortSignal) => Promise<string>; retryResponse?: (messageId: string) => void; openCode?: (location: CodeLocation) => void; reviewCards?: readonly ReviewCard[]; loadReviewPreview?: ReviewPreviewLoader }
 
-/** Starts with the latest 100 messages; explicitly revealed history stays expanded while mounted. */
-export function MessageList(props: ReviewPresentation & { state: Pick<ClientState, "order" | "messages">; loadImage?: (id: string) => Promise<Blob>; onReply?: (quote: ReplyQuote) => void; mobileReplyTarget?: HTMLDivElement }) {
-  const [count, setCount] = createSignal(100);
-  return <ChatSelectionReply onReply={props.onReply} mobileReplyTarget={props.mobileReplyTarget}><Show when={props.state.order.length > count()}><Button class="history-marker" onClick={() => setCount(value => value + 100)}>Show earlier retained messages</Button></Show>
-    <For each={props.state.order.slice(-count())}>{id => <Message message={props.state.messages[id]} openCode={props.openCode} loadImage={props.loadImage} reviewCards={props.reviewCards} loadReviewPreview={props.loadReviewPreview} />}</For></ChatSelectionReply>;
+/** Collects retained assistant replies up to this answer, bounded by a user prompt or an earlier presented answer. */
+function replyGroup(state: Pick<ClientState, "order" | "messages">, id: string): DisplayMessage[] {
+  const end = state.order.indexOf(id);
+  let start = end;
+  while (start > 0) {
+    const previous = state.messages[state.order[start - 1]];
+    if (previous.role === "user" || previous.role === "assistant" && previous.presentation && previous.presentation.state !== "hidden") break;
+    start--;
+  }
+  return state.order.slice(start, end + 1).map(key => state.messages[key]).filter(message => message.role === "assistant");
 }
 
-/** Renders responses and warnings, with compaction summaries tucked into a disclosure. */
-function Message(props: ReviewPresentation & { message: DisplayMessage; loadImage?: (id: string) => Promise<Blob> }) {
-  const visible = () => props.message.role === "user" || props.message.blocks.some(block => block.kind !== "thinking") || props.message.error || props.message.truncated;
+/** Renders the server-owned page; navigation replaces rather than accumulates messages. */
+export function MessageList(props: ReviewPresentation & { state: Pick<ClientState, "order" | "messages">; loadImage?: (id: string) => Promise<Blob>; onReply?: (quote: ReplyQuote) => void; mobileReplyTarget?: HTMLDivElement }) {
+  return <ChatSelectionReply onReply={props.onReply} mobileReplyTarget={props.mobileReplyTarget}>
+    <For each={props.state.order}>{id => <Message message={props.state.messages[id]} replies={replyGroup(props.state, id)} loadOriginal={props.loadOriginal} retryResponse={props.retryResponse} openCode={props.openCode} loadImage={props.loadImage} reviewCards={props.reviewCards} loadReviewPreview={props.loadReviewPreview} />}</For></ChatSelectionReply>;
+}
+
+/** Keeps HTML previews original and text replies simplified, with compaction summaries collapsed. */
+function Message(props: ReviewPresentation & { message: DisplayMessage; replies?: DisplayMessage[]; loadImage?: (id: string) => Promise<Blob> }) {
+  const originalPreview = createMemo(() => props.message.role === "assistant" && props.message.complete && !props.message.truncated && props.message.presentation !== undefined && props.message.presentation.state !== "hidden"
+    && (props.replies ?? [props.message]).some(message => !message.truncated && message.blocks.some(block => block.kind === "text" && block.text.includes("html preview") && renderMarkdownParts(block.text).some(part => part.kind === "artifact"))));
+  const presentation = () => originalPreview() ? undefined : props.message.presentation;
+  const visible = () => props.message.presentation?.state !== "hidden" && (props.message.presentation || props.message.role === "user" || props.message.blocks.some(block => block.kind !== "thinking") || props.message.error || props.message.truncated);
   const review = createMemo(() => {
     const cards: ReviewCard[] = [];
     if (props.message.role !== "user") return { cards, message: props.message };
@@ -35,11 +51,14 @@ function Message(props: ReviewPresentation & { message: DisplayMessage; loadImag
     });
     return { cards, message: cards.length ? { ...props.message, blocks } : props.message };
   });
+  const originals = () => props.message.role === "assistant" ? props.replies ?? [props.message] : [review().message];
+  const originalText = () => originals().flatMap(message => message.blocks.filter(block => block.kind === "text").map(block => block.text)).join("\n\n");
+  const original = () => <For each={originals()}>{message => <MessageBody message={message} openCode={props.openCode} loadImage={props.loadImage} />}</For>;
   return <Show when={visible()}><Show when={props.message.role === "compactionSummary"} fallback={<>
     <Show when={review().cards.length}><div class="chat-review-attachments" role="group" aria-label="Referenced changes"><For each={review().cards}>{card => <ReviewDiffCard card={card} load={props.loadReviewPreview} />}</For></div></Show>
-    <Show when={review().message.blocks.length || props.message.error || props.message.truncated || !review().cards.length}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`} data-reply-author={props.message.role === "assistant" ? "Pi" : "You"}><h2>{props.message.role === "assistant" ? "Pi" : props.message.role}</h2>
-      <MessageBody message={review().message} openCode={props.openCode} loadImage={props.loadImage} />
-      <Show when={props.message.role === "assistant" && props.message.complete && props.message.blocks.some(block => block.kind === "text" && block.text)}><div class="answer-actions"><CopyButton label="Copy answer" text={() => props.message.blocks.filter(block => block.kind === "text").map(block => block.text).join("\n\n")} /></div></Show>
+    <Show when={review().message.blocks.length || props.message.error || props.message.truncated || !review().cards.length}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`} data-message-id={props.message.id} data-reply-author={props.message.role === "assistant" ? "Pi" : "You"}><header class="message-heading"><h2><span class="message-avatar" aria-hidden="true">{props.message.role === "user" ? "↗" : "π"}</span>{props.message.role === "assistant" ? "Pi" : props.message.role === "user" ? "You" : props.message.role}</h2>
+      <Show when={props.message.role === "assistant" && !presentation() && props.message.complete && props.message.blocks.some(block => block.kind === "text" && block.text)}><div class="answer-actions"><CopyButton label="Copy answer" text={originalText} /></div></Show>
+      </header><div class="message-content"><Show when={presentation()} fallback={original()}><SimpleResponse message={props.message} openCode={props.openCode} retry={props.retryResponse ? () => props.retryResponse?.(props.message.id) : undefined} loadOriginal={props.message.blocks.length === 0 && props.message.sourceKey && props.loadOriginal ? signal => props.loadOriginal!(props.message.sourceKey!, signal) : undefined} original={original} originalText={originalText} /></Show></div>
     </article></Show>
   </>}><CompactionSummary message={props.message} openCode={props.openCode} loadImage={props.loadImage} /></Show></Show>;
 }
