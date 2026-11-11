@@ -5,6 +5,7 @@ import { Dialog } from "@kobalte/core/dialog";
 import { Button } from "@kobalte/core/button";
 import { DropdownMenu } from "@kobalte/core/dropdown-menu";
 import { SessionSidebar } from "./components/SessionSidebar";
+import { CommandPalette, type PaletteCommand } from "./components/CommandPalette";
 import { DismissibleAlert } from "./components/DismissibleAlert";
 import { Icon } from "./components/Icon";
 import { createMediaQuery, createTheme } from "./theme";
@@ -47,6 +48,18 @@ export default function App() {
   const [view, setView] = createSignal<"conversation" | "changes" | "settings">("conversation");
   const [settingsReview, setSettingsReview] = createSignal("");
   const [workspaces, setWorkspaces] = createSignal<WorkspaceItem[]>([]);
+  let savedCollapsed: string[] = [];
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem("pi-web.collapsed-workspaces.v1") ?? "[]");
+    if (Array.isArray(saved) && saved.length <= 16 && saved.every(id => typeof id === "string" && id.length <= 128)) savedCollapsed = saved;
+  } catch { /* Workspace folding stays available when browser storage is blocked. */ }
+  const [collapsedWorkspaces, setCollapsedWorkspaces] = createSignal(savedCollapsed);
+  const [unread, setUnread] = createSignal<string[]>([]);
+  function toggleWorkspace(id: string) {
+    const next = collapsedWorkspaces().includes(id) ? collapsedWorkspaces().filter(value => value !== id) : [...collapsedWorkspaces().filter(value => workspaces().some(workspace => workspace.workspaceId === value)), id];
+    setCollapsedWorkspaces(next);
+    try { localStorage.setItem("pi-web.collapsed-workspaces.v1", JSON.stringify(next)); } catch { /* Keep the page-local choice. */ }
+  }
   const [addingWorkspace, setAddingWorkspace] = createSignal(false);
   const [connection, setConnection] = createSignal("Connecting");
   const [loginOpen, setLoginOpen] = createSignal(false);
@@ -74,7 +87,7 @@ export default function App() {
   function modelFor(id: string) {
     let model = models.get(id);
     if (!model) {
-      model = createSessionModel(id, transport, () => connection() === "Connected", notifications.completed, () => capability);
+      model = createSessionModel(id, transport, () => connection() === "Connected", completed, () => capability);
       if (groupingSettings()) model.review.grouping.setOptions(groupingSettings()!);
       models.set(id, model);
     }
@@ -90,6 +103,20 @@ export default function App() {
     }
     setSidebarOpen(false);
   }
+  /** Marks only new live completions; opening the visible transcript clears its marker. */
+  function completed(id: string, outcome: "success" | "error" | "aborted") {
+    notifications.completed(id, outcome);
+    if (outcome !== "aborted" && !(id === selected() && transcriptVisible())) setUnread(previous => previous.includes(id) ? previous : [...previous, id]);
+  }
+  const transcriptVisible = () => view() === "conversation" && !loginOpen() && entry()?.lifecycle === "open" && document.visibilityState === "visible";
+  function markVisibleRead() {
+    if (transcriptVisible()) setUnread(previous => previous.filter(id => id !== selected()));
+  }
+  createEffect(() => [selected(), view(), loginOpen(), entry()?.lifecycle], markVisibleRead);
+  onSettled(() => {
+    document.addEventListener("visibilitychange", markVisibleRead);
+    return () => document.removeEventListener("visibilitychange", markVisibleRead);
+  });
   const canShowSidebar = () => mobile() && !current()?.state.dialogs.length;
   onSettled(() => listenForSidebarSwipes(() => canShowSidebar() && !pinchZoomed(), sidebarOpen, setSidebarOpen, setSidebarDrag));
   // Close for extension modals or desktop layout; ordinary stream updates preserve the drawer.
@@ -129,7 +156,7 @@ export default function App() {
           setManagementPending(pending.size);
           const remaining = new Set(reply.sessions.map(item => item.sessionId));
           for (const [id, model] of models) if (!remaining.has(id)) {
-            model.stopped(); model.dispose(); models.delete(id); subscriptions.delete(id); blocked.delete(id); notifications.forget(id);
+            model.stopped(); model.dispose(true); models.delete(id); subscriptions.delete(id); blocked.delete(id); notifications.forget(id);
           }
           for (const item of reply.sessions) {
             const model = modelFor(item.sessionId);
@@ -144,6 +171,7 @@ export default function App() {
           }
           setWorkspaces(reply.workspaces);
           setCatalog(reply.sessions);
+          setUnread(previous => previous.filter(id => remaining.has(id)));
           if (reply.ok && action?.type === "add_workspace") { setAddingWorkspace(false); setNotice(""); setSidebarOpen(false); }
           if (reply.ok && (action?.type === "delete" || action?.type === "delete_workspace")) setNotice("");
           if (reply.ok && reply.requestId === selectionRequest && reply.target !== null) setSelected(reply.target);
@@ -273,13 +301,36 @@ export default function App() {
   }
   /** Reloads only this page, confirming loss of unsent content across all conversations. */
   function reloadApp() {
-    const unsent = [...models.values()].some(model => model.draft().length > 0 || model.attachments().length > 0 || model.uploading() || model.quote());
+    const unsent = [...models.values()].some(model => model.draft().length > 0 || model.attachments().length > 0 || model.uploading() || model.quote() || model.feedback().length > 0);
     if (unsent) setReloadConfirmation({ returnFocus: dialogReturnFocus() });
     else window.location.reload();
   }
   const canManage = () => connection() === "Connected" && managementPending() === 0;
   const canCreate = () => canManage() && Boolean(entry()) && catalog().filter(item => item.lifecycle !== "stopped").length < 4 && catalog().filter(item => item.workspaceId === entry()?.workspaceId).length < 32;
-  const sidebar = () => <SessionSidebar catalog={catalog()} workspaces={workspaces()} selected={selected()} selectedWorkspace={entry()?.workspaceId ?? ""} canCreate={canCreate()}
+  const [paletteOpen, setPaletteOpen] = createSignal(false);
+  function openPalette() {
+    // Keep extension prompts and other modal tasks in control of keyboard focus.
+    if (document.querySelector('[role="dialog"], [role="alertdialog"]')) return;
+    setPaletteOpen(true);
+  }
+  onSettled(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || event.repeat || event.altKey || event.shiftKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "k") return;
+      if (paletteOpen()) { event.preventDefault(); setPaletteOpen(false); }
+      else if (!document.querySelector('[role="dialog"], [role="alertdialog"]')) { event.preventDefault(); openPalette(); }
+    };
+    window.addEventListener("keydown", shortcut);
+    return () => window.removeEventListener("keydown", shortcut);
+  });
+  const paletteCommands = createMemo<PaletteCommand[]>(() => [
+    { id: "new", label: "New conversation", detail: "Action · Current workspace", disabled: !canCreate(), run: () => { const workspaceId = entry()?.workspaceId; if (canCreate() && workspaceId) command({ type: "create_in", workspaceId }); } },
+    { id: "conversation", label: "Open conversation", detail: "Action · Current conversation", disabled: !current(), run: () => setView("conversation") },
+    { id: "changes", label: "Open Changes", detail: "Action · Review local changes", disabled: !current(), run: () => setView("changes") },
+    { id: "settings", label: "Open Settings", detail: "Action · Appearance and AI review", run: openSettings },
+    ...workspaces().map(workspace => ({ id: workspace.workspaceId, label: workspace.name, detail: `Workspace · ${workspace.path}`, disabled: !canManage(), run: () => { if (canManage()) command({ type: "select_workspace", workspaceId: workspace.workspaceId }); } })),
+    ...catalog().map(item => ({ id: item.sessionId, label: item.title, detail: `Conversation · ${workspaces().find(workspace => workspace.workspaceId === item.workspaceId)?.name ?? ""} · ${item.lifecycle}`, run: () => choose(item) })),
+  ]);
+  const sidebar = () => <SessionSidebar collapsed={collapsedWorkspaces()} toggleWorkspace={toggleWorkspace} unread={id => unread().includes(id)} catalog={catalog()} workspaces={workspaces()} selected={selected()} selectedWorkspace={entry()?.workspaceId ?? ""} canCreate={canCreate()}
     rename={renameConversation} remove={deleteConversation} removeWorkspace={deleteWorkspace}
     canManage={canManage()} adding={addingWorkspace()} setAdding={value => { setNotice(""); setAddingWorkspace(value); }} notice={notice()}
     addWorkspace={path => { setNotice(""); command({ type: "add_workspace", path, confirmed: true }); }}
@@ -298,21 +349,27 @@ export default function App() {
       </Show>
       <main class="chat-panel">
         <div class="workspace-controls">
-          <Show when={mobile()}><Dialog.Trigger class="icon-button" aria-label="Open sessions" disabled={!canShowSidebar()}><Icon name="panel" /></Dialog.Trigger></Show>
+          <Show when={mobile()}><Dialog.Trigger class="icon-button" aria-label="Open sessions" disabled={!canShowSidebar()}><Icon name="panel" /></Dialog.Trigger>
+            <Show when={entry()}>{item => <Button class="workspace-context" aria-label={`Switch conversation: ${workspaces().find(workspace => workspace.workspaceId === item().workspaceId)?.name ?? ""} / ${item().title}`} title="Switch workspace or conversation" onClick={openPalette}>
+              <strong>{workspaces().find(workspace => workspace.workspaceId === item().workspaceId)?.name}</strong><span>{item().title}</span>
+            </Button>}</Show>
+          </Show>
           <Show when={current()}><div class="workspace-views" role="group" aria-label="Workspace view">
             <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Conversation" title="Conversation" aria-pressed={view() === "conversation" ? "true" : "false"} onClick={() => setView("conversation")}><Show when={mobile()} fallback="Conversation"><Icon name="chat" /></Show></Button>
-            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Changes" title="Changes" aria-pressed={view() === "changes" ? "true" : "false"} onClick={() => setView("changes")}><Show when={mobile()} fallback="Changes"><Icon name="code" /></Show></Button>
+            <Button type="button" class={mobile() ? "icon-button" : undefined} aria-label="Changes" aria-describedby={current()?.feedback().length ? "pending-feedback-description" : undefined} title="Changes" aria-pressed={view() === "changes" ? "true" : "false"} onClick={() => setView("changes")}><Show when={mobile()} fallback="Changes"><Icon name="code" /></Show><Show when={current()?.feedback().length}>{count => <><span class="feedback-count" aria-hidden="true">{count()}</span><span id="pending-feedback-description" class="sr-only">{count()} unsent feedback {count() === 1 ? "note" : "notes"}</span></>}</Show></Button>
           </div></Show>
           <div class="session-controls">
-            <div class="statuses" aria-live="polite"><span class={["connection", { connected: connection() === "Connected" }]}>{connection()}</span>
+            <Show when={!mobile() || !entry()}><Button type="button" class="icon-button" aria-label="Command palette" title="Command palette (Ctrl/⌘ K)" aria-keyshortcuts="Control+k Meta+k" onClick={openPalette}><Icon name="search" /></Button></Show>
+            <div class="statuses" aria-live="polite"><span class={["connection", { connected: connection() === "Connected" }]} title={connection()}><span class="connection-label">{connection()}</span></span>
             </div>
-            <Show when={(connection() === "Disconnected" || connection() === "Connecting") && capability !== null && !loginOpen()}>
+            <Show when={(!mobile() || !entry()) && (connection() === "Disconnected" || connection() === "Connecting") && capability !== null && !loginOpen()}>
               <Button type="button" onClick={() => setLoginOpen(true)}>Update login link</Button>
             </Show>
             <Show when={entry()}>{item => <DropdownMenu placement="bottom-end" gutter={8} modal={false}>
               <DropdownMenu.Trigger class="icon-button session-options-trigger" aria-label="Session options" title="Session options"><Icon name="more" /></DropdownMenu.Trigger>
               <DropdownMenu.Portal><DropdownMenu.Content class="session-menu session-actions">
                 <DropdownMenu.Item onSelect={reloadApp}>Reload app</DropdownMenu.Item>
+                <Show when={mobile() && (connection() === "Disconnected" || connection() === "Connecting") && capability !== null && !loginOpen()}><DropdownMenu.Item onSelect={() => setLoginOpen(true)}>Update login link</DropdownMenu.Item></Show>
                 <DropdownMenu.Item class="danger" disabled={!canManage() || !["open", "stopped"].includes(item().lifecycle)} onSelect={() => deleteConversation(item())}>Delete conversation…</DropdownMenu.Item>
                 <DropdownMenu.Item disabled={!notifications.supported} title="Notify when an agent finishes while this app is open" onSelect={() => void notifications.toggle()}>{notifications.enabled() ? "Disable notifications" : "Enable notifications"}</DropdownMenu.Item>
                 <DropdownMenu.Item disabled={phonePush.busy() || !phonePush.supported} onSelect={() => void phonePush.enable()}>{phonePush.enabled() ? "Renew phone push" : "Enable phone push"}</DropdownMenu.Item>
@@ -332,7 +389,7 @@ export default function App() {
         <div style={{ display: view() === "settings" ? "none" : "contents" }}>
         <Show when={(view() !== "settings" || settingsReview() === current()?.id) && connection() !== "Authentication required" && !loginOpen()}><Show when={current()} keyed>{model => <Show when={view() === "conversation"} fallback={<LocalReview model={model} conversation={() => setView("conversation")} />}><Show when={entry()?.lifecycle === "open"} fallback={<section class="empty workspace-empty"><span class="empty-mark">π</span><h2>{entry()?.lifecycle === "stopped" ? "Session stopped" : "Session cleanup in progress"}</h2><p>Saved history and your unsent draft are retained. Reopen to continue.</p>
           <Show when={entry()?.lifecycle === "stopped"}><Button disabled={connection() !== "Connected" || managementPending() > 0} onClick={() => command({ type: "open", sessionId: model.id })}>Reopen conversation</Button></Show>
-          <Show when={model.draft()}><p class="preserve">Unsent draft: {model.draft()}</p></Show></section>}><SessionView model={model} /></Show></Show>}</Show></Show>
+          <Show when={model.draft()}><p class="preserve">Unsent draft: {model.draft()}</p></Show></section>}><SessionView model={model} changes={() => setView("changes")} /></Show></Show>}</Show></Show>
         </div>
         <Show when={(view() !== "settings" && connection() === "Authentication required") || loginOpen()}>
           <section class="empty workspace-empty">
@@ -358,7 +415,8 @@ export default function App() {
         <Show when={view() !== "settings" && !catalog().length && connection() !== "Authentication required" && !loginOpen()}><section class="empty workspace-empty"><span class="empty-mark">π</span><h2>Connecting to your workspace</h2><p>Keep the computer and Pi Web server running.</p></section></Show>
       </main>
     </div>
-    <Show when={reloadConfirmation()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Reload app?" description="Unsent drafts, attached images, and reply quotes in all conversations will be discarded. Saved history is retained. This reloads the page without sending a stop or restart command." action="Reload app" close={() => setReloadConfirmation(null)} confirm={() => window.location.reload()} />}</Show>
+    <Show when={paletteOpen()}><CommandPalette commands={paletteCommands()} close={() => setPaletteOpen(false)} /></Show>
+    <Show when={reloadConfirmation()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Reload app?" description="Draft text, reply quotes, and feedback restore from this tab’s storage when available. Attached images and any work this browser could not save will be lost. Saved history is retained. Nothing is sent, stopped, or restarted." action="Reload app" close={() => setReloadConfirmation(null)} confirm={() => window.location.reload()} />}</Show>
     <Show when={workspaceRemoval()} keyed>{target => <ConfirmationDialog returnFocus={target.returnFocus} title="Delete workspace" description={`Remove “${target.item.name}” (${target.item.path}) from Pi? All sessions in this workspace will be stopped and unsent drafts discarded. Project files and saved history will be retained.`} action="Delete workspace" disabled={!workspaceRemovalEligible()} close={() => setWorkspaceRemoval(null)} confirm={submitWorkspaceRemoval} />}</Show>
     <Show when={action()} keyed>{target => <Show when={target.kind === "rename"} fallback={<ConfirmationDialog returnFocus={target.returnFocus} title={target.kind === "delete" ? "Delete conversation" : "Stop session"} description={target.description} action={target.kind === "delete" ? "Delete conversation" : "Stop session"} disabled={!eligible()} close={() => setAction(null)} confirm={submitAction} />}>
       <ActionDialog returnFocus={target.returnFocus} title="Rename conversation" description={target.description} close={() => setAction(null)}>

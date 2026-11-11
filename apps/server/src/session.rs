@@ -47,6 +47,7 @@ pub struct Connection {
 #[derive(Clone)]
 pub struct SessionHandle {
     pub(crate) images: crate::images::Images,
+    pub(crate) turns: crate::local_review::TurnChanges,
     tx: mpsc::Sender<Control>,
     stop: watch::Sender<bool>,
     stopped: watch::Receiver<Option<bool>>,
@@ -180,11 +181,14 @@ enum Done {
     HeadAck(String, Result<Value, rpc::Error>),
     History(Result<history::Scan, String>),
     Prompt(String, u64, Result<Value, rpc::Error>),
+    Steer(String, Result<Value, rpc::Error>),
+    TurnCaptured,
     Cancel(String, u64, Result<Option<String>, rpc::Error>),
     Ui(String, Result<(), rpc::Error>),
     Terminated(rpc::Exit),
 }
 struct Runtime {
+    turns: crate::local_review::TurnChanges,
     images: crate::images::Images,
     config: Config,
     store: Arc<MetadataStore>,
@@ -310,7 +314,9 @@ pub(crate) fn start_owned(
         activity: Activity::Idle,
     });
     let images = crate::images::Images::default();
+    let turns = crate::local_review::TurnChanges::default();
     let runtime = Runtime {
+        turns: turns.clone(),
         images: images.clone(),
         config,
         store,
@@ -365,6 +371,7 @@ pub(crate) fn start_owned(
     });
     Ok(SessionHandle {
         images,
+        turns,
         tx,
         stop,
         stopped,
@@ -670,7 +677,9 @@ impl Runtime {
                     request_id: id.clone(),
                     written: notice,
                 });
+                let turns = self.turns.clone(); let root = self.config.cwd.clone();
                 self.jobs.spawn(async move {
+                    turns.begin(&root).await;
                     Done::Prompt(
                         id,
                         settled,
@@ -682,6 +691,34 @@ impl Runtime {
                             )
                             .await,
                     )
+                });
+            }
+            BrowserAction::Steer { text, images } => {
+                let queued = self.events.as_ref().map_or(0, rpc::Events::pending);
+                for _ in 0..queued {
+                    if let Some(event) = self.events.as_mut().and_then(rpc::Events::try_recv) { self.event(event); }
+                }
+                if self.status.process != ProcessStatus::Ready || self.cancelling
+                    || self.state_requests != 0 || self.setting_pending.is_some() || self.prompt_write.is_some()
+                    || !matches!(self.view.activity, Activity::Running | Activity::Retrying)
+                {
+                    self.result(&id, false, "not_running", None, None);
+                    return;
+                }
+                if !images.is_empty() && !self.settings.model.as_ref().is_some_and(|model| model.images) {
+                    self.result(&id, false, "model_does_not_support_images", None, None); return;
+                }
+                let images = match self.images.prompt(&images) {
+                    Ok(images) => images,
+                    Err(code) => { self.result(&id, false, code, None, None); return; }
+                };
+                let process = self.process.as_ref().unwrap().clone();
+                let (written, notice) = oneshot::channel();
+                self.prompt_write = Some(PromptWrite { request_id: id.clone(), written: notice });
+                self.jobs.spawn(async move {
+                    Done::Steer(id, process.request_with_write_notice(
+                        RpcCommand::Steer { message: text, images }, RPC_DEADLINE, written,
+                    ).await)
                 });
             }
             BrowserAction::Cancel => {
@@ -772,6 +809,7 @@ impl Runtime {
                 self.revision = 0;
                 self.settled = 0;
                 self.push_run_active = false;
+                self.turns.reset();
                 self.patches.clear();
                 self.patch_bytes = 0;
                 self.state_requests = 0;
@@ -1189,6 +1227,23 @@ impl Runtime {
                     }
                 }
             }
+            Done::TurnCaptured => {},
+            Done::Steer(id, response) => {
+                if self.prompt_write.as_ref().is_some_and(|pending| pending.request_id == id) {
+                    self.prompt_write = None;
+                }
+                match response {
+                    Ok(data) if matches!(data["disposition"].as_str(), Some("queued" | "handled")) => {
+                        self.result(&id, true, "accepted", data["disposition"].as_str().map(str::to_owned), None);
+                    }
+                    Err(rpc::Error::Command { .. }) => self.result(&id, false, "steer_rejected", None, None),
+                    _ => {
+                        self.result(&id, false, "delivery_unknown", None, None);
+                        self.status.error = Some("Steering delivery is unknown. Inspect the transcript before resending.".into());
+                        self.dirty = true;
+                    }
+                }
+            }
             Done::Cancel(id, settled_before, answer) => match answer {
                 Ok(draft) => {
                     // The reader queues preceding events before resolving the RPC response.
@@ -1264,6 +1319,9 @@ impl Runtime {
             self.push_run_active = true;
         }
         if event["type"] == "agent_settled" {
+            let turns = self.turns.clone(); let root = self.config.cwd.clone();
+            let generation = turns.generation();
+            self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
             // This gate belongs to the runtime epoch, independent of attached clients.
             if std::mem::take(&mut self.push_run_active) && event["aborted"] != true {
                 if let Some(push) = &self.push {
@@ -1703,6 +1761,7 @@ impl Runtime {
         self.prompt_write = None;
         self.cancel_dialogs();
         self.epoch = epoch;
+        self.turns.reset();
         self.reset_settings();
         self.settings.model = settings::model(&state["model"]);
         self.settings.thinking_level = serde_json::from_value(state["thinkingLevel"].clone()).ok();

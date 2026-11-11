@@ -13,7 +13,7 @@ import { AgentControls } from "./components/AgentControls";
 import { Toast } from "./components/Toast";
 
 /** Only the selected conversation mounts its transcript and modal dialogs. */
-export function SessionView(props: { model: SessionModel }) {
+export function SessionView(props: { model: SessionModel; changes?: () => void }) {
   const model = props.model;
   const { state, draft, setDraft, visibleNotice, dismissNotice, pending, stick, setStick, online, canSend, send, submit } = model;
   const [confirmation, setConfirmation] = createSignal<{ kind: "terminate" | "restart"; epoch: string | null } | null>(null);
@@ -43,7 +43,8 @@ export function SessionView(props: { model: SessionModel }) {
     return usage?.tokens != null ? `${Math.round(usage.tokens / usage.contextWindow * 1000) / 10}%` : "—";
   };
   const [replyTarget, setReplyTarget] = createSignal<HTMLDivElement>();
-  let scroller!: HTMLDivElement; let reading!: HTMLDivElement; let composer!: HTMLFormElement;
+  let scroller!: HTMLDivElement; let reading!: HTMLDivElement; let composer!: HTMLFormElement; let imagePicker!: HTMLInputElement;
+  const canAttach = () => model.canConfigure() && !!state.settings.model?.images && !model.uploading() && model.attachments().length < 4;
   const scrollRoot = document.documentElement;
   const scrollToLatest = () => { scrollRoot.scrollTop = scrollRoot.scrollHeight; };
   const trackScroll = () => setStick(scrollRoot.scrollHeight - scrollRoot.scrollTop - scrollRoot.clientHeight < 80);
@@ -91,7 +92,7 @@ export function SessionView(props: { model: SessionModel }) {
               <Show when={state.older}><p class="history-marker">Earlier history is not displayed. Pi still owns the full session.</p></Show>
               <DismissibleAlert class="warning" message={state.status.historyWarning} />
               <Show when={!state.order.length}><div class="empty conversation-empty"><span class="empty-mark">π</span><h2>What are we working on?</h2><p>Explore your code, work through an idea, or build something new.</p></div></Show>
-              <MessageList state={state} reviewCards={model.reviewCards.cards()} loadReviewPreview={model.loadReviewPreview} mobileReplyTarget={replyTarget()} loadImage={model.loadImage} onReply={quote => {
+              <MessageList state={state} openCode={location => { model.openCode(location); props.changes?.(); }} reviewCards={model.reviewCards.cards()} loadReviewPreview={model.loadReviewPreview} mobileReplyTarget={replyTarget()} loadImage={model.loadImage} onReply={quote => {
                 if (!model.quoteReply(quote)) return;
                 window.getSelection()?.removeAllRanges(); flush();
                 composer.querySelector("textarea")?.focus();
@@ -127,14 +128,22 @@ export function SessionView(props: { model: SessionModel }) {
               <Button class="reply-quote-remove" type="button" aria-label="Remove quote" title="Remove quote" onClick={() => { model.clearQuote(); composer.querySelector("textarea")?.focus({ preventScroll: true }); }}><Icon name="close" /></Button>
             </section>}</Show>
             <PromptInput id={`prompt-${model.id}`} value={draft()} onInput={setDraft} commands={state.commands}
+              placeholder={model.canSteer() ? "Guide Pi while it works…" : undefined}
               completionEnabled={online() && state.synced && state.status.process === "ready" && state.status.activity === "idle" && !pending()}
               searchFiles={model.searchFiles} onImages={model.addImages} onSubmit={submit} />
             <div class="composer-actions">
+              <input ref={imagePicker} type="file" accept="image/png,image/jpeg" multiple hidden aria-label="Choose images" disabled={!canAttach()} onChange={event => {
+                const files = Array.from(event.currentTarget.files ?? []);
+                event.currentTarget.value = "";
+                if (files.length) void model.addImages(files);
+              }} />
+              <Button class="icon-button attach-images" type="button" aria-label="Attach images" title={!state.settings.model?.images ? "The selected model does not support images" : "Attach PNG or JPEG images (up to four)"} disabled={!canAttach()} onClick={() => imagePicker.click()}><Icon name="plus" /></Button>
               <AgentControls model={model} />
               <Show when={state.status.activity !== "idle" && state.status.activity !== "failed"} fallback={
                 <Button class="primary send-button" aria-label={pending() ? "Sending…" : "Send"} title="Send message" type="submit" disabled={!canSend()}><Icon name="arrow" /></Button>
               }>
-                <Button class="primary send-button" aria-label="Stop" title="Stop response" type="button" disabled={!online() || state.status.activity === "cancelling"} onClick={() => send({ type: "cancel" })}><Icon name="stop" /></Button>
+                <Show when={model.canSteer() || pending()}><Button class="primary send-button steer-button" aria-label={pending() ? "Sending…" : "Steer Pi"} title="Send a correction at Pi’s next tool boundary" type="submit" disabled={!canSend()}><Icon name="arrow" /><span>{pending() ? "Sending…" : "Steer Pi"}</span></Button></Show>
+                <Button class="send-button" aria-label="Stop" title="Stop response" type="button" disabled={!online() || state.status.activity === "cancelling"} onClick={() => send({ type: "cancel" })}><Icon name="stop" /></Button>
               </Show>
             </div>
           </form>

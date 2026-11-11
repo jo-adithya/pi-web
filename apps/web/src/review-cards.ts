@@ -12,12 +12,12 @@ export function scopeReviewCard(snapshot: ReviewSnapshot, target: ReviewRequest)
   return { reference: reviewScopeReference(snapshot, target), target: { ...target }, selection: false, files: snapshot.files.map(preview) };
 }
 
-/** Guards persisted presentation data; invalid caches fall back to ordinary prompt text. */
-function validCard(value: unknown): value is ReviewCard {
+/** Validates persisted diff cards before their captured source previews are rendered. */
+export function validCard(value: unknown): value is ReviewCard {
   if (!value || typeof value !== "object") return false;
   const c = value as ReviewCard;
   return typeof c.reference === "string" && !!c.reference && typeof c.selection === "boolean" && (c.ambiguous === undefined || typeof c.ambiguous === "boolean") && !!c.target &&
-    ["unstaged", "staged", "branch", "commit"].includes(c.target.scope) &&
+    ["unstaged", "staged", "branch", "commit", "turn"].includes(c.target.scope) &&
     (c.target.base === undefined || typeof c.target.base === "string") && (c.target.commit === undefined || typeof c.target.commit === "string") &&
     Array.isArray(c.files) && c.files.length <= 10000 && c.files.every(f => f && typeof f.path === "string" && typeof f.status === "string" &&
       (f.previousPath === null || typeof f.previousPath === "string") && (f.lines === null || Array.isArray(f.lines) && f.lines.every(l => l && typeof l.text === "string" &&

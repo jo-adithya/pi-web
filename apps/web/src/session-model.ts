@@ -1,9 +1,9 @@
-import { createSignal, createStore } from "solid-js";
+import { createEffect, createRoot, createSignal, createStore, flush } from "solid-js";
 import type { BrowserAction, BrowserMessage, ServerMessage, ThinkingLevel, RunOutcome } from "./generated/protocol";
 import { imageRequest, prepareImage, IMAGE_BYTES, type Attachment } from "./images";
-import { searchWorkspaceFiles } from "./workspace-files";
+import { loadSource, searchWorkspaceFiles } from "./workspace-files";
 import { createLocalReview, fetchReview, type ReviewLoadRequest, type ReviewFile } from "./local-review";
-import { createReviewCards } from "./review-cards";
+import { createReviewCards, type ReviewCard } from "./review-cards";
 import { fetchStructuralReview } from "./structural-review";
 import { fetchContextReview } from "./context-review";
 import { fetchCommits } from "./commit-review";
@@ -12,9 +12,13 @@ import { fetchReviewGroups } from "./review-groups";
 import { loadCapability } from "./browser-auth";
 import { applyServer, initialState } from "./client-state";
 import { formatReply, type ReplyQuote } from "./reply-quote";
+import type { CodeLocation } from "./code-reference";
+import { feedbackText, feedbackFits, restoreSessionDraft, savePromptDraft, saveFeedbackDraft, type FeedbackNote } from "./session-draft";
 
-/** Session-local presentation and unsent draft. Connection loss never replays a command. */
+/** Conversation presentation with same-tab recovery of unsent text and feedback. Connection loss never replays a command. */
 export function createSessionModel(id: string, transport: (message: BrowserMessage) => boolean, connected: () => boolean, completed?: (sessionId: string, outcome: RunOutcome) => void, capability: () => string | null = loadCapability) {
+  const restored = restoreSessionDraft(id);
+  let promptUncertain = restored.prompt.uncertain, feedbackUncertain = restored.feedback.uncertain;
   const review = createLocalReview(
     (request, signal) => fetchReview(id, request, signal, capability()),
     (request, signal) => fetchStructuralReview(id, request, signal, capability()),
@@ -24,14 +28,45 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     (signal, query) => fetchBranches(id, signal, capability(), query),
     { model: () => state.settings.model ? { provider: state.settings.model.provider, id: state.settings.model.id } : null, cacheNamespace: id },
   );
+  const [codeLocation, openCode] = createSignal<CodeLocation>();
   const reviewCards = createReviewCards(id);
+  const [feedback, setFeedback] = createSignal<FeedbackNote[]>(restored.feedback.notes);
+  function persistFeedback(notes: FeedbackNote[]) {
+    if (!saveFeedbackDraft(id, { notes, uncertain: feedbackUncertain })) setNotice("Unsent feedback is only in memory. This browser could not save it; keep this tab open.");
+  }
+  function replaceFeedback(notes: FeedbackNote[]): boolean {
+    if (!feedbackFits(notes)) { setNotice("Feedback is full. Send or remove some notes before adding more."); return false; }
+    setFeedback(notes); return true;
+  }
+  /** Captures a bounded feedback note and its browser-only diff snapshot. */
+  function addFeedback(comment: string, card: ReviewCard): boolean {
+    return !!comment.trim() && replaceFeedback([...feedback(), { id: crypto.randomUUID(), comment: comment.trim(), card }]);
+  }
+  /** Edits only the comment, preserving its captured scope and source; in-flight batches are immutable. */
+  function editFeedback(noteId: string, comment: string): boolean {
+    if (pending() || !comment.trim() || !feedback().some(note => note.id === noteId)) return false;
+    return replaceFeedback(feedback().map(note => note.id === noteId ? { ...note, comment: comment.trim() } : note));
+  }
+  function removeFeedback(noteId: string) { if (!pending()) replaceFeedback(feedback().filter(note => note.id !== noteId)); }
+  /** Clears only the acknowledged batch, leaving later notes and the composer intact. */
+  function submitFeedback(): boolean {
+    const notes = feedback();
+    if (!notes.length || !submitReview(feedbackText(notes), notes.map(note => note.id))) return false;
+    for (const note of notes) reviewCards.remember(note.card);
+    return true;
+  }
   const loadReviewPreview = async (request: ReviewLoadRequest & { path: string }, signal: AbortSignal): Promise<ReviewFile> => {
     const snapshot = await fetchReview(id, request, signal, capability());
     return snapshot.files[0] as ReviewFile; // Selected-path responses are validated by fetchReview.
   };
   const [state, setState] = createStore(initialState());
-  const [draft, setDraft] = createSignal(""); const [notice, setNotice] = createSignal("");
-  const [quote, setQuote] = createSignal<ReplyQuote | undefined>(undefined);
+  const [draft, setDraft] = createSignal(restored.prompt.text);
+  const [notice, setNotice] = createSignal(restored.warning || (promptUncertain || feedbackUncertain ? "Previous delivery is uncertain. Inspect the transcript before resending restored work." : ""));
+  const [quote, setQuote] = createSignal<ReplyQuote | undefined>(restored.prompt.quote);
+  function persistPrompt(text: string, savedQuote: ReplyQuote | undefined) {
+    const savedText = prompt?.standalone && !prompt.feedbackIds ? (text ? `${text}\n\n${prompt.text}` : prompt.text) : text;
+    if (!savePromptDraft(id, { text: savedText, quote: savedQuote, uncertain: promptUncertain })) setNotice("Unsent text is only in memory. This browser could not save it; keep this tab open.");
+  }
   /** Retains a trimmed snapshot; empty or over-budget selections leave the draft and quote intact. */
   function quoteReply(selected: ReplyQuote): boolean {
     const next = { author: selected.author, text: selected.text.trim() };
@@ -57,7 +92,12 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
   let disposed = false;
   const [uploading, setUploading] = createSignal(false);
-  let prompt: { id: string; text: string; quote: ReplyQuote | undefined; images: string[]; standalone?: boolean } | undefined; let epoch = ""; let attachmentNotice = false;
+  let prompt: { id: string; text: string; quote: ReplyQuote | undefined; images: string[]; standalone?: boolean; feedbackIds?: string[] } | undefined; let epoch = ""; let attachmentNotice = false;
+  const stopSaving = createRoot(dispose => {
+    createEffect(() => [draft(), quote(), pending()] as const, ([text, quote]) => persistPrompt(text, quote));
+    createEffect(() => [feedback(), pending()] as const, ([notes]) => persistFeedback(notes));
+    return dispose;
+  });
   function send(action: BrowserAction): string | undefined {
     if (!connected() || !epoch || (!state.synced && action.type !== "attach")) return;
     const requestId = crypto.randomUUID();
@@ -100,34 +140,43 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   function removeImage(imageId: string) {
     setAttachments(previous => previous.filter(image => { if (image.id !== imageId) return true; URL.revokeObjectURL(image.preview); return false; }));
   }
-  /** Releases previews when the workspace permanently discards this draft. */
-  function dispose() { disposed = true; clearQuote(); review.cancel(); for (const image of attachments()) removeImage(image.id); }
+  /** Releases previews; confirmed deletion also discards this conversation’s saved unsent work. */
+  function dispose(discardDraft = false) {
+    disposed = true; review.cancel(); for (const image of attachments()) removeImage(image.id);
+    if (discardDraft) { prompt = undefined; promptUncertain = feedbackUncertain = false; setDraft(""); setQuote(undefined); setFeedback([]); }
+    flush(); stopSaving(); setQuote(undefined);
+    if (discardDraft) { savePromptDraft(id, { text: "", uncertain: false }); saveFeedbackDraft(id, { notes: [], uncertain: false }); }
+  }
   async function loadImage(imageId: string): Promise<Blob> { return (await imageRequest(id, imageId, undefined, capability())).blob(); }
-  const canSend = () => canConfigure() && !settingsRequest && (!!draft().trim() || attachments().length > 0) && !uploading() && (!attachments().length || !!state.settings.model?.images) && new TextEncoder().encode(formatReply(draft(), quote())).length <= 32_768;
+  const canSteer = () => online() && state.status.process === "ready" && ["running", "retrying"].includes(state.status.activity) && !pending() && !settingsPending();
+  const canSend = () => (canConfigure() || canSteer()) && !settingsRequest && (!!draft().trim() || attachments().length > 0) && !uploading() && (!attachments().length || !!state.settings.model?.images) && new TextEncoder().encode(formatReply(draft(), quote())).length <= 32_768;
   function submit() {
     if (prompt || !canSend()) return;
-    const text = draft(); const submittedQuote = quote(); const images = attachments().map(image => image.id); const requestId = send({ type: "prompt", text: formatReply(text, submittedQuote), images });
-    if (requestId) { prompt = { id: requestId, text, quote: submittedQuote, images }; setPending(true); setNotice(""); setStick(true); }
+    const text = draft(); const submittedQuote = quote(); const images = attachments().map(image => image.id); const requestId = send({ type: canSteer() ? "steer" : "prompt", text: formatReply(text, submittedQuote), images });
+    if (requestId) { prompt = { id: requestId, text, quote: submittedQuote, images }; promptUncertain = true; setPending(true); setNotice(""); setStick(true); }
   }
   /** Sends an explicit review question independently of the composer. Returns transport acceptance.
-   * Failed or uncertain delivery restores the question to the draft for manual recovery; never replays it.
+   * Failed or uncertain delivery restores standalone questions to the draft; feedback batches stay collected. Never replays a request.
    */
-  function submitReview(text: string): boolean {
-    if (disposed || prompt || settingsRequest || !canConfigure() || !text.trim() || new TextEncoder().encode(text).length > 32_768) return false;
-    const requestId = send({ type: "prompt", text, images: [] });
+  function submitReview(text: string, feedbackIds?: string[]): boolean {
+    if (disposed || prompt || settingsRequest || (!canConfigure() && !(feedbackIds && canSteer())) || !text.trim() || new TextEncoder().encode(text).length > 32_768) return false;
+    const requestId = send({ type: canSteer() ? "steer" : "prompt", text, images: [] });
     if (!requestId) return false;
-    prompt = { id: requestId, text, quote: undefined, images: [], standalone: true };
+    prompt = { id: requestId, text, quote: undefined, images: [], standalone: true, feedbackIds };
     setPending(true); setNotice(""); setStick(true);
+    if (feedbackIds) feedbackUncertain = true;
+    else promptUncertain = true;
     return true;
   }
   function preserveReviewQuestion(text: string) { setDraft(previous => previous ? `${previous}\n\n${text}` : text); }
   function disconnected() {
     setState(value => { value.synced = false; value.dialogs = []; });
-    if (prompt) {
-      if (prompt.standalone) preserveReviewQuestion(prompt.text);
+    const interrupted = prompt; prompt = undefined;
+    if (interrupted) {
+      if (interrupted.standalone && !interrupted.feedbackIds) preserveReviewQuestion(interrupted.text);
       setNotice("Prompt delivery is uncertain. Inspect the transcript before sending your preserved draft again.");
     }
-    prompt = undefined; setPending(false);
+    setPending(false);
     settingsRequest = undefined; setSettingsPending(false);
   }
   function stopped() {
@@ -166,19 +215,23 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
       const result = message.body.result;
       if (settingsRequest === result.requestId && result.code !== "pending") { settingsRequest = undefined; setSettingsPending(false); }
       if (prompt?.id === result.requestId && result.code !== "pending") {
-        if (result.ok && !prompt.standalone) {
-          if (draft() === prompt.text) setDraft("");
-          if (quote() === prompt.quote) clearQuote();
-          for (const image of prompt.images) removeImage(image);
+        const acknowledged = prompt; prompt = undefined;
+        if (acknowledged.feedbackIds) feedbackUncertain = false; else promptUncertain = false;
+        if (result.ok && result.disposition === "queued") setNotice("Correction queued for Pi’s next tool boundary.");
+        if (result.ok && !acknowledged.standalone) {
+          if (draft() === acknowledged.text) setDraft("");
+          if (quote() === acknowledged.quote) clearQuote();
+          for (const image of acknowledged.images) removeImage(image);
         }
-        if (!result.ok && prompt.standalone && !result.recoveredDraft) preserveReviewQuestion(prompt.text);
-        setPending(false); prompt = undefined;
+        if (result.ok && acknowledged.feedbackIds) { const sent = new Set(acknowledged.feedbackIds); setFeedback(notes => notes.filter(note => !sent.has(note.id))); }
+        if (!result.ok && acknowledged.standalone && !acknowledged.feedbackIds && !result.recoveredDraft) preserveReviewQuestion(acknowledged.text);
+        setPending(false);
       }
       if (result.recoveredDraft) setDraft(previous => previous ? `${previous}\n\n${result.recoveredDraft}` : result.recoveredDraft!);
       if (!result.ok) setNotice(`Command not completed: ${result.code.replaceAll("_", " ")}. Your draft was kept.`);
     }
     return true;
   }
-  return { id, dispose, review, reviewCards, loadReviewPreview, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, send, submit, submitReview, receive, disconnected, stopped, scroll: 0 };
+  return { id, dispose, loadSource: (path: string, line: number, signal: AbortSignal) => loadSource(id, path, line, signal, capability()), feedback, addFeedback, editFeedback, removeFeedback, submitFeedback, codeLocation, openCode, review, reviewCards, loadReviewPreview, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, canSteer, send, submit, submitReview, receive, disconnected, stopped, scroll: 0, reviewPosition: { filter: "", needsReview: false, groupKey: "", view: "files" as "files" | "overview", scroll: 0, identity: "" } };
 }
 export type SessionModel = ReturnType<typeof createSessionModel>;

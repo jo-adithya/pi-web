@@ -23,6 +23,7 @@ export function ChatSelectionReply(props: { children: JSX.Element; onReply?: (qu
     let node: Node | null = range.commonAncestorContainer instanceof Text ? range.commonAncestorContainer : walker.nextNode();
     for (; node; node = walker.nextNode()) {
       const text = node as Text;
+      if (text.parentElement?.closest(".copy-action")) continue;
       if (range.comparePoint(text, 0) > 0 || range.comparePoint(text, text.length) < 0) continue;
       const selectedText = text.data.slice(text === range.startContainer ? range.startOffset : 0, text === range.endContainer ? range.endOffset : text.length);
       if (!selectedText.trim()) continue;
@@ -40,7 +41,18 @@ export function ChatSelectionReply(props: { children: JSX.Element; onReply?: (qu
     const range = selection.getRangeAt(0);
     const author = selectedAuthor(range);
     if (!author || (dismissed && sameRange(range, dismissed))) { setSelected(undefined); return; }
-    const text = selection.toString().trim();
+    // App-owned copy controls can lie inside an otherwise valid native text range.
+    const content = range.cloneRange();
+    let text = "";
+    for (const control of root.querySelectorAll(".copy-action")) {
+      if (!content.intersectsNode(control)) continue;
+      if (!control.contains(content.startContainer)) {
+        const before = content.cloneRange(); before.setEndBefore(control); text += before.toString();
+      }
+      if (control.contains(content.endContainer)) { content.collapse(false); break; }
+      content.setStartAfter(control);
+    }
+    text = (text + content.toString()).trim();
     if (!text) { setSelected(undefined); return; }
     const viewport = window.visualViewport;
     const left = viewport?.offsetLeft ?? 0, top = viewport?.offsetTop ?? 0;

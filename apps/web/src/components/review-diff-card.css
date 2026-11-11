@@ -18,6 +18,7 @@
 .chat-review-file > summary span { color: var(--muted-foreground); }
 .chat-review-code { max-height: 24rem; overflow: auto; border: 1px solid var(--border); border-radius: .35rem; font: .75rem/1.6 var(--font-mono, monospace); }
 .chat-review-line { display: grid; grid-template-columns: 4.5ch 4.5ch minmax(max-content, 1fr); min-width: max-content; }
+.chat-review-line[data-reference] { background: var(--info-muted); box-shadow: inset 3px 0 var(--info); }
 .chat-review-line code { padding: 0 .6rem; white-space: pre; font: inherit; }
 .chat-review-number { text-align: right; padding-right: .5ch; color: var(--muted-foreground); border-right: 1px solid var(--border); user-select: none; }
 .chat-review-line.add { background: color-mix(in srgb, #22c55e 12%, transparent); }

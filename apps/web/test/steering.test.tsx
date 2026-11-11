@@ -1,0 +1,32 @@
+import { afterEach, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render } from "@solidjs/testing-library";
+import { flush } from "solid-js";
+import { createSessionModel } from "../src/session-model";
+import { SessionView } from "../src/SessionView";
+import { initialState } from "../src/client-state";
+import type { BrowserMessage } from "../src/generated/protocol";
+
+afterEach(cleanup);
+it("sends corrections during a run without stopping, clearing only an acknowledged draft", () => {
+  const transport = vi.fn((_message: BrowserMessage) => true);
+  const model = createSessionModel("s", transport, () => true);
+  model.receive({ v: 1, sessionId: "s", epoch: "e", body: { type: "hello", project: "fixture", process: "ready" } });
+  model.receive({ v: 1, sessionId: "s", epoch: "e", body: { type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready", activity: "running" } } });
+  model.setDraft("Keep the existing API");
+  const page = render(() => <SessionView model={model} />); flush();
+  expect(page.getByRole("button", { name: "Steer Pi" }).textContent).toContain("Steer Pi");
+  expect(page.getByRole("combobox", { name: "Message Pi" }).getAttribute("placeholder")).toBe("Guide Pi while it works…");
+  fireEvent.click(page.getByRole("button", { name: "Steer Pi" })); flush();
+  expect(transport).toHaveBeenCalledOnce();
+  const message = transport.mock.calls[0][0];
+  expect(message.action).toEqual({ type: "steer", text: "Keep the existing API", images: [] });
+  expect(model.draft()).toBe("Keep the existing API");
+  expect(page.getByRole("button", { name: "Stop" })).toBeTruthy();
+  model.receive({ v: 1, sessionId: "s", epoch: "e", body: { type: "result", result: { requestId: message.requestId, ok: true, code: "accepted", disposition: "queued", recoveredDraft: null } } }); flush();
+  expect(model.draft()).toBe("");
+  expect(model.state.status.activity).toBe("running");
+  model.setDraft("Another correction"); flush(); model.submit();
+  model.disconnected(); flush();
+  expect(model.draft()).toBe("Another correction");
+  expect(model.visibleNotice()).toContain("uncertain");
+});

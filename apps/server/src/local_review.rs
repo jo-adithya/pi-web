@@ -1,4 +1,6 @@
 //! Bounded, read-only Git snapshots rooted at a registered workspace.
+mod turn;
+pub(crate) use turn::TurnChanges;
 use p256::ecdsa::{
     Signature,
     signature::{PrehashSignature, digest::Digest},
@@ -22,6 +24,7 @@ pub(crate) enum Scope {
     Staged,
     Branch,
     Commit,
+    Turn,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,7 +36,7 @@ pub(crate) struct Request {
     /// Continuation token from a metadata page; mutually exclusive with path.
     pub cursor: Option<String>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct File {
     path: String,
@@ -58,7 +61,7 @@ struct ParsedLineStats {
 /// Scope-wide Git line counts, independent of the bounded file list and lazy patches.
 /// Added and removed totals exclude conventional test/generated paths, lockfiles, and .md files.
 /// Binary and untracked files contribute to unavailable_files instead of line counts.
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LineStats {
     added: u64,
@@ -69,7 +72,7 @@ pub(crate) struct LineStats {
     total_removed: u64,
     unavailable_files: usize,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Review {
     files: Vec<File>,
     truncated: bool,
@@ -183,6 +186,7 @@ pub(crate) async fn review(
                     Scope::Staged => b"staged",
                     Scope::Branch => b"branch",
                     Scope::Commit => b"commit",
+                    Scope::Turn => b"turn",
                 });
                 field(&(patch_args.len() as u64).to_be_bytes());
                 for arg in &patch_args {
@@ -485,6 +489,7 @@ async fn prepare_snapshot(
     git: &mut Git<'_>,
     request: &Request,
 ) -> Result<(Vec<String>, Option<String>), &'static str> {
+    if matches!(request.scope, Scope::Turn) { return Err("Last-turn snapshots are read from their runtime"); }
     let mut identity = None;
     if !matches!(request.scope, Scope::Branch) && request.base.is_some() {
         return Err("Base is only valid for branch review");
@@ -511,6 +516,7 @@ async fn prepare_snapshot(
         "--full-index".into(),
     ];
     match request.scope {
+        Scope::Turn => unreachable!(),
         Scope::Unstaged => {}
         Scope::Staged => args.push("--cached".into()),
         Scope::Commit => {
@@ -769,7 +775,7 @@ impl Git<'_> {
                 return Err("Git output exceeds review limit");
             }
             let status = child.wait().await.map_err(|_| "Cannot wait for Git")?;
-            if !status.success() {
+            if !status.success() && !(args.get(1) == Some(&"--no-index") && status.code() == Some(1)) {
                 return Err("Git review failed; check repository and local refs");
             }
             Ok(bytes)

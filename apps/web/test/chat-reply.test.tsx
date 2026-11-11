@@ -61,6 +61,21 @@ it("accepts paragraph selection ending just before the next message's heading", 
   expect(reply).toHaveBeenCalledExactlyOnceWith({ author: "Pi", text: "Keep the public interface stable." });
 });
 
+it("quotes across code copy controls without including their labels", () => {
+  const reply = vi.fn();
+  const state = transcript();
+  state.messages.answer.blocks = [{ kind: "text", text: "Before\n\n```sh\nprintf x\n```\n\nAfter" }];
+  const view = render(() => <MessageList state={state} onReply={reply} />); flush();
+  selectText(view.container.querySelector(".message-text")!);
+  fireEvent.click(view.getByRole("button", { name: "Reply to selection" })); flush();
+  const quote = reply.mock.calls[0][0];
+  expect(quote.author).toBe("Pi");
+  expect(quote.text).toContain("printf x\n");
+  expect(quote.text).toContain("Before");
+  expect(quote.text).toContain("After");
+  expect(quote.text).not.toContain("Copy");
+});
+
 it("dismisses without clearing native selection and allows selecting the same text again", () => {
   const view = render(() => <MessageList state={transcript()} onReply={() => {}} />); flush();
   const text = view.getByText("Keep the public interface stable.");

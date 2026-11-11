@@ -130,6 +130,26 @@ async fn result(connection: &mut Connection, id: &str) -> pi_web::protocol::Comm
     result
 }
 
+#[tokio::test]
+async fn steering_is_acknowledged_during_a_run_and_never_starts_an_idle_run() {
+    let fixture = Fixture::new();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    send(&handle, &identity, "idle-steer", BrowserAction::Steer { text: "not yet".into(), images: vec![] });
+    assert!(!result(&mut connection, "idle-steer").await.ok);
+    send(&handle, &identity, "start", BrowserAction::Prompt { text: "retry".into(), images: vec![] });
+    assert!(result(&mut connection, "start").await.ok);
+    send(&handle, &identity, "correction", BrowserAction::Steer { text: "Keep the existing API".into(), images: vec![] });
+    let ack = result(&mut connection, "correction").await;
+    assert!(ack.ok, "{ack:?}");
+    assert_eq!(ack.disposition.as_deref(), Some("queued"));
+    let log = fixture.log();
+    assert_eq!(log.iter().filter(|c| c["type"] == "steer").count(), 1);
+    assert!(!log.iter().any(|c| c["type"] == "abort"));
+    assert!(handle.shutdown().await);
+}
+
 /// Adjacent browser commands must reach Pi as prompt, clear_queue, then abort,
 /// even when control-priority transport work is ready before the prompt task runs.
 #[tokio::test]

@@ -101,7 +101,7 @@ pub(super) fn validate(message: &BrowserMessage) -> Result<(), &'static str> {
         {
             Err("invalid_model")
         }
-        BrowserAction::Prompt { text, images } if (text.trim().is_empty() && images.is_empty()) || text.len() > 32 * 1024 || images.len() > 4 || images.iter().any(|id| !crate::images::valid_ref(id)) => {
+        BrowserAction::Prompt { text, images } | BrowserAction::Steer { text, images } if (text.trim().is_empty() && images.is_empty()) || text.len() > 32 * 1024 || images.len() > 4 || images.iter().any(|id| !crate::images::valid_ref(id)) => {
             Err("invalid_prompt")
         }
         BrowserAction::UiReply { dialog_id, answer } => {

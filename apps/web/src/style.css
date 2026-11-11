@@ -52,6 +52,10 @@ a:hover { color: var(--foreground); }
 .sidebar-section-label .icon, .sidebar-workspace-trigger .icon, .sidebar-session-trigger .icon { width: 1rem; height: 1rem; }
 .workspace-group { flex-shrink: 0; margin-bottom: .65rem; }
 .workspace-heading-row { display: flex; align-items: center; gap: .15rem; padding-right: .2rem; }
+.workspace-collapse { width: 1.65rem; height: 2rem; padding: .25rem; }
+.workspace-collapse[aria-expanded="false"] .icon { transform: rotate(-90deg); }
+.unread-dot { display: inline-block; flex-shrink: 0; width: .45rem; height: .45rem; margin-left: .4rem; border-radius: 50%; background: var(--primary); }
+.workspace-info .unread-dot { vertical-align: middle; }
 .workspace-heading { flex: 1; min-width: 0; justify-content: flex-start; text-align: left; padding: .25rem .45rem; border-color: transparent; background: transparent; }
 .workspace-heading:hover:not(:disabled) { background: transparent; }
 .workspace-menu-hint { display: block; max-width: 16rem; padding: .4rem .65rem; font-size: .75rem; color: var(--muted-foreground); }
@@ -150,6 +154,17 @@ a:hover { color: var(--foreground); }
 .message.user { width: fit-content; max-width: 90%; margin-left: auto; padding: .9rem 1.2rem; border-radius: 1.2rem 1.2rem .35rem 1.2rem; background: var(--muted); }
 .message.user > h2 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
 .message.assistant > h2 { color: var(--primary); }
+.copy-action { user-select: none; display: inline-flex; flex-wrap: wrap; align-items: center; gap: .4rem; font: .75rem/1.4 "Figtree Variable", sans-serif; }
+.copy-button { padding: .25rem .5rem; color: var(--muted-foreground); }
+.copy-status { color: var(--error); max-width: 22rem; white-space: normal; }
+.answer-actions { margin-top: .4rem; }
+.code-block { position: relative; margin: .6rem 0 1rem; }
+.markdown .code-block pre { margin: 0; padding-top: 2.5rem; }
+.code-block .copy-action { position: absolute; top: .4rem; right: .5rem; max-width: calc(100% - 1rem); justify-content: flex-end; }
+@media (hover: hover) and (pointer: fine) {
+  .copy-button { opacity: 0; }
+  .message:hover .answer-actions .copy-button, .code-block:hover .copy-button, .copy-action:focus-within .copy-button { opacity: 1; }
+}
 /* Compaction is a quiet milestone, not another assistant response. */
 .context-summary { margin: .25rem 0 2rem; border-block: 1px solid var(--border); overflow-wrap: anywhere; }
 .context-summary > summary { display: flex; align-items: center; gap: .75rem; min-height: 64px; padding: .75rem .35rem; list-style: none; cursor: pointer; color: var(--muted-foreground); border-radius: var(--radius); }
@@ -257,6 +272,7 @@ a:hover { color: var(--foreground); }
 .composer-actions { display: flex; align-items: flex-end; gap: .6rem; padding: .35rem 0 0; }
 .composer-actions > .icon-button { flex-shrink: 0; }
 .send-button { width: 1.8rem; height: 1.8rem; padding: .25rem; border-radius: .7rem; flex-shrink: 0; }
+.send-button.steer-button { width: auto; padding-inline: .6rem; font-size: .78rem; white-space: nowrap; }
 .composer-footnote { display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem; margin: .25rem 0 0; color: var(--muted-foreground); font-size: .68rem; }
 /* Anchor to the sticky composer, outside transcript flow, without shifting messages. */
 .latest { position: absolute; bottom: calc(100% + .5rem); left: 50%; transform: translateX(-50%); z-index: 2; width: 44px; height: 44px; padding: 0; border-radius: 50%; box-shadow: var(--shadow-popover); }
@@ -305,6 +321,15 @@ a:hover { color: var(--foreground); }
   .workspace-controls { padding: .25rem .65rem; }
   .workspace-controls .icon-button { width: 2.6rem; height: 2.6rem; }
   .session-controls { gap: .35rem; }
+  .workspace-controls { gap: .25rem; }
+  .workspace-context { display: flex; flex: 1; min-width: 0; flex-direction: column; align-items: flex-start; gap: 0; padding: .15rem .25rem; border-color: transparent; background: var(--card); text-align: left; line-height: 1.35; }
+  .workspace-context strong, .workspace-context > span { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .workspace-context strong { font-size: .75rem; }
+  .workspace-context > span { font-size: .67rem; color: var(--muted-foreground); }
+  .workspace-controls .connection { max-width: 6rem; padding: .25rem .4rem; }
+  .connection-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .workspace-controls .connection.connected { padding: .25rem; border: 0; background: transparent; }
+  .connection.connected .connection-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .reading { padding-inline: 1rem; }
   .message { margin-bottom: 1.25rem; }
   .message.user { max-width: 95%; padding: .65rem .85rem; }

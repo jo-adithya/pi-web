@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
 import { flush } from "solid-js";
+import { fileReviewCard } from "../src/review-cards";
 import { LocalReview } from "../src/LocalReview";
 import { SettingsPage } from "../src/SettingsPage";
 import { createSessionModel } from "../src/session-model";
@@ -12,6 +13,81 @@ const file: ReviewFile = { fingerprint: "snapshot-a", path: "src/a.ts", previous
 const snapshot = (files: ReviewEntry[] = [file]): ReviewSnapshot => ({ files, truncated: false, note: null });
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+it.each([false, true])("restores filters after visiting chat and restores position only for unchanged diffs (changed=%s)", async changed => {
+  let different = false;
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot([{ ...file, fingerprint: different ? "updated" : file.fingerprint }])))));
+  const model = createSessionModel("review-position", vi.fn(() => true), () => true, undefined, () => "cap");
+  const first = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await first.findByRole("heading", { name: file.path });
+  fireEvent.input(first.getByRole("searchbox", { name: "Filter files" }), { target: { value: "a.ts" } }); flush();
+  document.documentElement.scrollTop = 420;
+  first.unmount(); different = changed;
+  vi.mocked(window.scrollTo).mockClear();
+  const second = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await second.findByRole("heading", { name: file.path });
+  expect((second.getByRole("searchbox", { name: "Filter files" }) as HTMLInputElement).value).toBe("a.ts");
+  await waitFor(() => expect(window.scrollTo).toHaveBeenCalledWith({ top: changed ? 0 : 420, left: 0, behavior: "instant" }));
+  document.documentElement.scrollTop = 0;
+});
+
+it("edits a collected note against its captured code without sending or changing the composer", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
+  const transport = vi.fn(() => true), model = createSessionModel("edit-feedback", transport, () => true, undefined, () => "cap");
+  const card = fileReviewCard({ ...file, patch: "@@ -1 +1 @@\n-old captured code\n+new captured code\n" }, { scope: "unstaged" });
+  model.setDraft("My separate draft"); model.addFeedback("Keep the API stable", card); flush();
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("heading", { name: file.path });
+  fireEvent.click(page.getByText("1 feedback note")); flush();
+  fireEvent.click(page.getByRole("button", { name: "Edit note" })); flush();
+  const dialog = screen.getByRole("dialog", { name: "Edit feedback" });
+  expect(dialog.textContent).toContain("new captured code");
+  fireEvent.input(screen.getByRole("textbox", { name: "Feedback" }), { target: { value: "Also handle empty results" } }); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Save note" })); flush();
+  expect(model.feedback()[0].comment).toBe("Also handle empty results");
+  expect(model.feedback()[0].card).toEqual(card);
+  expect(model.draft()).toBe("My separate draft");
+  expect(transport).not.toHaveBeenCalled();
+});
+
+it("reviews the captured last turn through the existing diff view", async () => {
+  const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+    const request = JSON.parse(init.body as string);
+    return new Response(JSON.stringify(snapshot([{ ...file, patch: request.scope === "turn" ? "@@ -1 +1 @@\n-before this turn\n+after this turn\n" : file.patch }])));
+  });
+  vi.stubGlobal("fetch", fetch);
+  const model = createSessionModel("turn-review", vi.fn(() => true), () => true, undefined, () => "cap");
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await page.findByRole("heading", { name: file.path });
+  fireEvent.click(page.getByRole("button", { name: "Last turn" })); flush();
+  await waitFor(() => { flush(); expect(page.getByRole("region", { name: "Unified diff" }).textContent).toContain("after this turn"); });
+  expect(fetch.mock.calls.some(([, init]) => JSON.parse(init.body as string).scope === "turn")).toBe(true);
+});
+
+it("opens a code reference at its diff row and falls back to current source for unchanged files", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/source")
+    ? { path: "src/helper.ts", firstLine: 1, text: "export const helper = true;" } : snapshot()))));
+  const model = createSessionModel("reference-jump", vi.fn(() => true), () => true, undefined, () => "cap");
+  model.openCode({ path: file.path, line: 2, endLine: 2 }); flush();
+  const page = render(() => <LocalReview model={model} conversation={() => {}} />);
+  await waitFor(() => { flush(); expect(page.container.querySelector(".diff-add[data-review-evidence]")).not.toBeNull(); });
+  model.openCode({ path: "src/helper.ts", line: 1, endLine: 1 }); flush();
+  const dialog = await screen.findByRole("dialog", { name: "src/helper.ts:1" });
+  await waitFor(() => { flush(); expect(dialog.textContent).toContain("export const helper = true;"); });
+  expect(dialog.textContent).toContain("Current workspace source");
+});
+
+it("previews code references even when a Git comparison is unavailable", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("/source")
+    ? new Response(JSON.stringify({ path: "main.ts", firstLine: 1, text: "const value = 1;" }))
+    : new Response(JSON.stringify({ error: "Not a Git root" }), { status: 422 })));
+  const model = createSessionModel("non-git-reference", vi.fn(() => true), () => true, undefined, () => "cap");
+  model.openCode({ path: "main.ts", line: 1, endLine: 1 }); flush();
+  render(() => <LocalReview model={model} conversation={() => {}} />);
+  const dialog = await screen.findByRole("dialog", { name: "main.ts:1" });
+  await waitFor(() => { flush(); expect(dialog.querySelector("[data-reference]")?.textContent).toContain("const value = 1;"); });
+  expect(model.codeLocation()).toBeUndefined();
+});
 
 it("prepares focused selection questions without sending or replacing the draft", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot()))));
@@ -519,6 +595,7 @@ it("expands unchanged context above a hunk without changing the snapshot or send
   expect(page.getByText("1 / 1 files reviewed")).toBeTruthy();
   expect(model.review.snapshot()?.files[0].patch).toBe(selected.patch);
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Show Git metadata" })); flush();
   expect([...screen.getByLabelText("File changes").querySelectorAll("code")].map(code => code.textContent).join("\n")).toBe(selected.patch.trimEnd());
   expect(screen.getByLabelText("File changes").textContent).not.toContain("const value5");
   expect(model.draft()).toBe("");
@@ -1034,6 +1111,7 @@ it("renders escaped diff text, tracks review and opens the shared Ask Pi modal w
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
   expect(screen.getByRole("dialog", { name: "Ask Pi about file" })).toBeTruthy();
   expect(screen.getByRole("textbox", { name: "Your question" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Show Git metadata" })); flush();
   expect([...screen.getByLabelText("File changes").querySelectorAll("code")].map(code => code.textContent).join("\n")).toBe(file.patch.trimEnd());
   expect(model.draft()).toBe("Existing question");
   expect(transport).not.toHaveBeenCalled(); expect(conversation).not.toHaveBeenCalled();
@@ -1051,6 +1129,7 @@ it.each(["example.ts", "example.txt"])("hides only diff prefixes and retains sou
   expect(page.getByText("--- a/example")).toBeTruthy(); expect(page.getByText("+++ b/example")).toBeTruthy();
   expect(page.getByText("\\ No newline at end of file")).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Show Git metadata" })); flush();
   expect([...screen.getByLabelText("File changes").querySelectorAll("code")].map(code => code.textContent).join("\n")).toBe(patch.trimEnd());
   expect(model.draft()).toBe("");
 });

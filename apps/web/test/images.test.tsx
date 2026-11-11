@@ -16,7 +16,7 @@ function setup() {
   model.receive(frame({ type: "snapshot", throughSeq: 0, messages: [], dialogs: [], olderHistory: false, status: { ...initialState().status, process: "ready" } }));
   model.receive(frame({ type: "settings", settings: { ...initialState().settings, model: { id: "model", name: "Model", provider: "fixture", images: true } } }));
   vi.spyOn(images, "prepareImage").mockResolvedValue(new Blob(["image"], { type: "image/png" }));
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ id }))));
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response(JSON.stringify({ id }))));
   vi.stubGlobal("URL", class extends URL { static createObjectURL = vi.fn(() => "blob:preview"); static revokeObjectURL = vi.fn(); });
   flush(); return { model, sent };
 }
@@ -89,12 +89,12 @@ it("does not load conversation images until requested and releases the blob on h
   fireEvent.click(view.getByRole("button", { name: "Hide image" })); flush(); expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:display");
 
 });
-it("shows previews above the textbox with an icon-only remove control and no picker", async () => {
+it("shows previews above the textbox with an icon-only remove control and an image picker", async () => {
   const { model } = setup();
   await model.addImages([new File(["image"], "picture.png")]); flush();
   const view = render(() => <SessionView model={model} />); flush();
-  expect(view.container.querySelector('input[type="file"]')).toBeNull();
-  expect(view.queryByText("Attach image")).toBeNull();
+  expect(view.container.querySelector('input[type="file"]')).not.toBeNull();
+  expect(view.getByRole("button", { name: "Attach images" })).toBeTruthy();
   const preview = view.getByAltText("picture.png");
   expect(preview.closest("form")).toBeNull();
   const textbox = view.getByRole("combobox", { name: "Message Pi" });
@@ -106,7 +106,28 @@ it("shows previews above the textbox with an icon-only remove control and no pic
   expect(model.attachments()).toHaveLength(0);
   expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:preview");
 });
-it.each(["drop", "paste"])("attaches images by %s without a picker", async method => {
+it("picks images without submitting and allows the same file to be selected again", async () => {
+  const { model, sent } = setup();
+  const view = render(() => <SessionView model={model} />); flush();
+  const picker = view.container.querySelector<HTMLInputElement>('input[type="file"]')!;
+  expect(picker).not.toBeNull();
+  const open = vi.spyOn(picker, "click");
+  fireEvent.click(view.getByRole("button", { name: "Attach images" }));
+  expect(open).toHaveBeenCalledOnce();
+  expect(picker.accept).toBe("image/png,image/jpeg");
+  expect(picker.multiple).toBe(true);
+  const file = new File(["image"], "picture.png");
+  fireEvent.change(picker, { target: { files: [file] } });
+  await waitFor(() => { flush(); expect(model.attachments()).toHaveLength(1); });
+  expect(picker.value).toBe("");
+  expect(sent).toHaveLength(0);
+  model.removeImage(id); flush();
+  fireEvent.change(picker, { target: { files: [file] } });
+  await waitFor(() => { flush(); expect(model.attachments()).toHaveLength(1); });
+  model.receive(frame({ type: "settings", settings: initialState().settings })); flush();
+  expect((view.getByRole("button", { name: "Attach images" }) as HTMLButtonElement).disabled).toBe(true);
+});
+it.each(["drop", "paste"])("attaches images by %s", async method => {
   const { model } = setup();
   const view = render(() => <SessionView model={model} />); flush();
   const textbox = view.getByRole("combobox", { name: "Message Pi" });

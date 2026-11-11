@@ -141,6 +141,36 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn source_references_are_authenticated_bounded_and_never_follow_symlinks() {
+    let f = Fixture::new().await;
+    fs::write(f.root.join("source.ts"), (1..=100).map(|line| format!("line {line}\n")).collect::<String>()).unwrap();
+    fs::write(f.root.join("binary"), b"private\0binary").unwrap();
+    std::os::unix::fs::symlink("source.ts", f.root.join("link.ts")).unwrap();
+    for (path, line, proof, expected) in [
+        ("source.ts", 30, true, StatusCode::OK),
+        ("source.ts", 30, false, StatusCode::UNAUTHORIZED),
+        ("../source.ts", 1, true, StatusCode::BAD_REQUEST),
+        (".git/config", 1, true, StatusCode::BAD_REQUEST),
+        ("link.ts", 1, true, StatusCode::UNPROCESSABLE_ENTITY),
+        ("binary", 1, true, StatusCode::UNPROCESSABLE_ENTITY),
+        ("source.ts", 101, true, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let mut request = Request::builder().method("POST").uri(format!("/files/{}/source", f.session))
+            .header("host", "127.0.0.1:9876").header("origin", "http://127.0.0.1:9876").header("content-type", "application/json");
+        if proof { request = request.header("x-pi-capability", "a".repeat(64)); }
+        let response = f.router.clone().oneshot(request.body(Body::from(serde_json::json!({"path":path,"line":line}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+        if expected == StatusCode::OK {
+            let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 100_000).await.unwrap()).unwrap();
+            assert_eq!(body["firstLine"], 15);
+            assert!(body["text"].as_str().unwrap().contains("line 30"));
+            assert_eq!(body["text"].as_str().unwrap().lines().count(), 80);
+        }
+    }
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn line_totals_cover_the_scope_without_loading_patches() {
     let f = Fixture::new().await;
     f.init();

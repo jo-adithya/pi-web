@@ -2,7 +2,7 @@
 use std::{
     ffi::{CStr, CString},
     fs::File,
-    io,
+    io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::ffi::OsStrExt,
@@ -89,6 +89,44 @@ fn open_directory(parent: &File, name: &CStr) -> io::Result<File> {
     }
     // SAFETY: openat returned a new descriptor whose ownership is transferred.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Reads one bounded regular file through pinned directories. Symlinks and special
+/// files are rejected, including ancestors replaced during traversal.
+pub(crate) fn read(root: &Path, path: &str, limit: usize) -> io::Result<Vec<u8>> {
+    crate::local_review::validate_path(path).map_err(io::Error::other)?;
+    let mut directory = open_root(root)?;
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let name = CString::new(part)?;
+        if parts.peek().is_some() {
+            directory = open_directory(&directory, &name)?;
+            continue;
+        }
+        // SAFETY: directory and the NUL-terminated name remain valid throughout openat.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful openat transfers a fresh owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("Not a regular source file"));
+        }
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(io::Error::other("Source file exceeds preview limit"));
+        }
+        return Ok(bytes);
+    }
+    Err(io::Error::other("Missing source path"))
 }
 
 struct Directory(*mut libc::DIR);

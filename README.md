@@ -156,6 +156,7 @@ a Git working tree (including a Git-colocated jj repository).
   edits are excluded. Missing parent objects in shallow repositories produce an
   error rather than a misleading root diff. History is read-only and bounded to
   256 KiB per response with a ten-second request deadline.
+- **Last turn** shows captured content changes from just before the latest submitted prompt to agent settlement, excluding edits already present at its start. Steering stays in that same turn. This is a filesystem comparison, not proof of agent authorship: concurrent editor/agent changes during the run are included. Git index/history are never changed. Capture requires a Git root with an existing commit; it retains up to 1,000 dirty paths / 4 MiB before the turn, reads regular UTF-8 files up to 256 KiB, and publishes up to 1 MiB of previews with 64 KiB per diff. Binary, symlink, oversized, and non-content changes are omitted or explicitly unavailable. Capture uses cooperative three-/five-second deadlines and assumes responsive local storage; failure never prevents the prompt from running. Private temporary comparison files are removed on normal cleanup; a crash can leave them in system temp. Snapshots are runtime-only, clear on restart/session replacement, and are not accessible to Pi as Git revisions. Refresh after completion. Structural comparison, context expansion, and AI grouping are unavailable for this captured scope.
 - The review summary shows total lines changed (added + deleted) for the selected
   scope, independently of metadata pagination or patch-size limits. Binary and
   untracked files are counted separately as having no line counts. Totals use a
@@ -247,7 +248,7 @@ a Git working tree (including a Git-colocated jj repository).
   It never auto-attaches review skills; an explicitly chosen focused question still
   asks that question. Pending chat quotes and existing leading slash commands stay
   intact. Pi can make changes when requested, subject to its normal permissions.
-  Quotes, context and commands count toward the 32 KiB message limit.
+  The standalone question and its references count toward the 32 KiB message limit; the existing chat draft and quote are not sent with it.
 - **Group with AI** is optional; folder grouping remains the default. Clicking it
   sends the displayed file names and bounded diff snippets to the conversation’s
   current Pi provider/model by default. Open **Settings → AI review** from the
@@ -307,16 +308,14 @@ a Git working tree (including a Git-colocated jj repository).
   The server admits one inference at a time with a 60-second deadline plus supervised
   cleanup; the browser limits each inference unit, including its requested captures, to 90 seconds. Cancel
   stops further captures and inference calls; failed/cancelled runs leave folders available.
-- **Ask Pi** appends the selected file’s path, changed-line ranges and scope to your existing draft and
-  returns to Conversation. It never sends automatically. Oversized context is
-  rejected without changing the draft; reopen stopped conversations before sending.
+- **Ask Pi** opens the same question modal for a whole file or selected lines, using the shared syntax-highlighted diff UI. It never changes the existing chat draft or sends automatically. Oversized questions are rejected in place; reopen stopped conversations before sending.
   In Text mode, drag across line numbers to select a range, or select a line then
   Shift-click another. **Choose end line** lets touch and keyboard users choose
   the end of a range. A floating **Ask Pi** action appears beside the range endpoint
   when selection finishes; × or Escape dismisses it without clearing the range.
   It and **Ask Pi about selection** open a focused question dialog with a preview
   of those source rows and their old/new line numbers. Write a question or choose
-  a suggestion, then explicitly **Send to Pi** to open the answer in Conversation.
+  a suggestion, then explicitly **Send to Pi** to open the answer in Conversation. Git metadata is folded behind **Show Git metadata**, leaving changed code and its original line numbers visible.
   Only the question, filename, old/new line references and comparison metadata are sent; existing chat drafts, quotes,
   and attachments stay untouched. Failed or uncertain delivery preserves the
   question in the draft for manual recovery. Selection clears when the file, scope,
@@ -329,6 +328,8 @@ a Git working tree (including a Git-colocated jj repository).
   do not send messages to Pi. Up to 16 cards / 1 MiB per conversation survive reload
   in this tab’s session storage. Other tabs, expired previews and edited references
   fall back to the plain references; no code snapshots are stored in Pi’s history.
+- In the question modal, **Add feedback** collects a note without sending it. Select more locations or files and add further notes; the compact feedback disclosure lets you inspect, **Edit note**, or remove them and **Send feedback to Pi** submits them together. While Pi runs, the batch is steering; otherwise it starts a normal prompt. Only acknowledged notes are removed, and failed/uncertain delivery keeps the batch for manual inspection before resending. Existing drafts, quotes, and images stay separate. Notes retain captured file/line references and browser-only previews; they are not reattached to a different snapshot after refresh. Limits: 32 notes, 32 KiB combined prompt, 1 MiB of previews. Notes and their captured previews recover from this tab’s session storage after reload; they are never sent automatically. A count on **Changes** keeps unsent notes visible from chat. Storage failures warn that work is memory-only.
+- Returning from chat restores Changes filters and view. Diff scroll position is restored only when the selected file, comparison and fingerprint still match; fresh edits return to the top instead of reusing a stale position.
 - Snapshots are best-effort, not live or atomic: refresh after edits, and coordinate
   concurrent agents. Limits are 100 listed files per page, 64 KiB per selected patch, 1 MiB per JSON response,
   and a ten-second deadline per list or patch request. Omitted content is explicitly marked; binary diffs show
@@ -338,10 +339,32 @@ a Git working tree (including a Git-colocated jj repository).
 
 ## Use and limits
 
-- Send with Enter, the button or Ctrl/⌘ Enter; Shift+Enter inserts a newline. Stop clears queued prompts, then requests
+- Open the **Command palette** with **Ctrl/⌘ K** or the search button in the top bar.
+  Search conversation titles, workspace names/paths, or actions: **New conversation**,
+  **Open conversation**, **Open Changes**, and **Open Settings**. Use ↑/↓ and Enter,
+  or tap a result; Escape closes it and restores focus. Unavailable actions stay
+  disabled, stopped conversations stay stopped, and switching preserves drafts.
+  Search covers the remembered catalog, not message contents. Other open dialogs
+  keep control of the shortcut. On phones, tap the compact project/conversation label
+  to open the palette; a healthy connection uses a small dot. Connection problems
+  retain their status text, with **Update login link** in Session options.
+- Completed answers offer **Copy answer** (Markdown text); completed code blocks offer
+  **Copy code** without their surrounding controls. Buttons appear on hover/focus or
+  remain visible on touch devices. Clipboard permission failures show a manual-copy fallback.
+- Use the **+** in the composer to choose PNG/JPEG images, or continue to paste/drop them.
+  Picking never sends a prompt. Existing limits apply: four images, model support,
+  idle upload, and a combined 512 KiB after preparation.
+- Fold workspace conversations with the chevron beside their heading. The selected
+  conversation stays visible; folding is remembered in this browser and is page-local
+  if storage is blocked. Solid unread dots mark newly observed successful/error run
+  completions outside the visible conversation, including in collapsed workspace headings.
+  Opening the visible transcript clears its dot. These markers last only for this page;
+  reload/history snapshots do not replay completions, and aborted runs do not add markers.
+- Send with Enter, the button or Ctrl/⌘ Enter; Shift+Enter inserts a newline. During running/retrying, the send action becomes **Steer Pi**: the correction is delivered after the current assistant tool calls, before the next model call. It does not abort tools or promise immediate delivery. Only confirmed acceptance clears the submitted draft; rejection or uncertain delivery keeps it, with no automatic resend. Model/thinking configuration stays idle-only, and compaction, pending dialogs, reconciliation, and cancellation do not accept steering. **Stop** remains separate and clears queued prompts, then requests
   abort; only `agent_settled` means completion. An unconfirmed cancellation offers
   separately confirmed process termination. Failed/exited children require explicit
   restart; prompts are never replayed automatically.
+- Completed answers link workspace code references such as `src/main.ts:42`, `[handler](src/main.ts#L42-L50)`, and file-only references. Clicking opens Changes at the matching new-side coordinates (old-side for deleted files). References outside the selected diff open an explicitly labeled **current source** preview instead of implying historical accuracy. Reads require the session capability and registered root, never follow symlinks, and return up to 80 lines / 64 KiB from regular UTF-8 files up to 256 KiB. Missing/changed files and invalid locations fail visibly. References inside fenced code remain inert; absolute paths, traversal, executable URLs and Git metadata are rejected. No source is automatically sent to Pi.
 - Type `/` at the start of a message to complete loaded extension commands, prompt
   templates and skills. Use ↑/↓ to choose, Tab/Enter or a click to insert, and Esc
   to dismiss. Selection never sends the message; add arguments and send normally.
@@ -402,7 +425,7 @@ a Git working tree (including a Git-colocated jj repository).
   notice asks you to retry to finish removing the entry. If you restart before
   retrying and startup reports a missing remembered session, launch with `--new`
   and delete the old sidebar entry again.
-  Unsent drafts live in this page, not persistent storage; reloading loses them.
+  Draft text and reply quotes recover from this tab’s session storage after refresh, separately per conversation; they are never sent automatically. Delivery interrupted before acknowledgment remains uncertain and asks you to inspect the transcript. Recovery lasts for this tab’s browser session and is not synchronized to other tabs/devices; blocked/full storage leaves work in memory with a warning. Attached images must be reattached after reload. Confirmed conversation deletion clears saved drafts and feedback.
 - Up to eight authenticated tabs/devices can share a conversation. The backend accepts
   the first prompt while idle and rejects competing prompts as busy; rejected drafts
   stay on the sending device. Either device can stop a run, and the first valid

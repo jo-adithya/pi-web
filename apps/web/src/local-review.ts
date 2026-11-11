@@ -8,7 +8,7 @@ import type { GroupModel } from "./review-costs";
 import { createReviewHistory } from "./review-history";
 import { createReviewExplanations } from "./review-explanations";
 
-export type ReviewScope = "unstaged" | "staged" | "branch" | "commit";
+export type ReviewScope = "unstaged" | "staged" | "branch" | "commit" | "turn";
 export interface ReviewRequest { scope: ReviewScope; base?: string; commit?: string }
 export interface ReviewLoadRequest extends ReviewRequest { path?: string; cursor?: string }
 export interface ReviewEntry { path: string; previousPath: string | null; status: string; patch: string | null; fingerprint: string | null; lineStats?: ReviewFileLineStats }
@@ -263,7 +263,7 @@ export const reviewQuestionPresets: { question: ReviewQuestion; label: string; d
 
 /** Names the exact Git comparison without conflating branch and commit scopes. */
 export function reviewScopeLabel(target: ReviewRequest): string {
-  return target.scope === "commit" ? `commit ${target.commit} against its first parent (empty tree for a root commit)` : target.scope === "branch" ? `branch changes against merge-base with ${JSON.stringify(target.base)}` : target.scope;
+  return target.scope === "turn" ? "last completed turn (captured turn-start to settlement; concurrent edits included)" : target.scope === "commit" ? `commit ${target.commit} against its first parent (empty tree for a root commit)` : target.scope === "branch" ? `branch changes against merge-base with ${JSON.stringify(target.base)}` : target.scope;
 }
 
 /** Prepares a scope-wide question with a file manifest, not cached patches.
@@ -312,5 +312,5 @@ export function reviewLineRanges(values: (number | undefined)[]): string {
 /** Names both sides of the comparison without including source text or snapshot identifiers. */
 export function reviewFileReference(file: ReviewFile, target: ReviewRequest, lines?: readonly DiffLine[]): string {
   const rows = lines ?? diffLines(file.patch).filter(line => line.kind === "add" || line.kind === "remove");
-  return `Context for this request: local ${reviewScopeLabel(target)} changes for ${JSON.stringify(file.path)}.${file.previousPath ? ` Previous path: ${JSON.stringify(file.previousPath)}.` : ""}\n${lines ? "Selected lines only" : "All changed lines"}. Old/new numbers refer to the two sides of this comparison.\nOld lines: ${reviewLineRanges(rows.map(line => line.old))}\nNew lines: ${reviewLineRanges(rows.map(line => line.next))}\nNo code or patch is attached. Inspect the file and the exact scoped diff as needed to carry out the request. References may be stale; verify them before drawing conclusions. For deleted lines, read the old side, not current-file coordinates. State any unavailable evidence.`;
+  return `Context for this request: local ${reviewScopeLabel(target)} changes for ${JSON.stringify(file.path)}.${file.previousPath ? ` Previous path: ${JSON.stringify(file.previousPath)}.` : ""}\n${lines ? "Selected lines only" : "All changed lines"}. Old/new numbers refer to the two sides of this comparison.\nOld lines: ${reviewLineRanges(rows.map(line => line.old))}\nNew lines: ${reviewLineRanges(rows.map(line => line.next))}\nNo code or patch is attached.${target.scope === "turn" ? " The original turn snapshots are retained only by pi-web, not in Git. Inspect current files as needed, but disclose unavailable before/after evidence rather than substituting the entire working-tree diff." : " Inspect the file and the exact scoped diff as needed to carry out the request."} References may be stale; verify them before drawing conclusions. For deleted lines, read the old side, not current-file coordinates. State any unavailable evidence.`;
 }

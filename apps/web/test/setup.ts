@@ -2,6 +2,7 @@ import { beforeEach, vi } from "vitest";
 
 // jsdom has no layout/media-query engine; focused tests supply resize notifications.
 beforeEach(() => {
+  sessionStorage.clear();
   vi.stubGlobal("ResizeObserver", class {
     observe() {}
     unobserve() {}

@@ -136,6 +136,11 @@ pub enum RpcCommand {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         images: Vec<Value>,
     },
+    Steer {
+        message: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Value>,
+    },
     ClearQueue,
     Abort,
 }
@@ -150,6 +155,7 @@ impl RpcCommand {
             Self::SetModel { .. } => "set_model",
             Self::SetThinkingLevel { .. } => "set_thinking_level",
             Self::Prompt { .. } => "prompt",
+            Self::Steer { .. } => "steer",
             Self::ClearQueue => "clear_queue",
             Self::Abort => "abort",
         }

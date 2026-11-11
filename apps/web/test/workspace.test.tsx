@@ -43,6 +43,184 @@ it.each([
   expect(() => decodeWorkspace(JSON.stringify({ ...catalog(), groupingSettings }))).toThrow("Invalid global grouping settings");
 });
 
+it("shows the current project and conversation in the mobile switcher", async () => {
+  vi.stubGlobal("matchMedia", vi.fn((query: string) => ({ matches: query === "(max-width: 760px)", media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  for (const frame of frames(a)) socket.emit(frame);
+  const switcher = page.getByRole("button", { name: "Switch conversation: Alpha / Conversation 1" });
+  expect(switcher.textContent).toContain("Alpha");
+  expect(switcher.textContent).toContain("Conversation 1");
+  fireEvent.click(switcher); flush();
+  expect(screen.getByRole("dialog", { name: "Command palette" })).toBeTruthy();
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "Search commands and conversations" }), { key: "Escape" }); flush();
+  socket.onclose?.(); flush();
+  expect(page.queryByRole("button", { name: "Update login link" })).toBeNull();
+  fireEvent.keyDown(page.getByRole("button", { name: "Session options" }), { key: "Enter" }); flush();
+  fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Update login link" }), { key: "Enter" }); flush();
+  expect(page.getByLabelText("Terminal login link")).toBeTruthy();
+});
+
+it("marks unseen completions until their conversation is opened, without replaying snapshots or aborted runs", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  for (const frame of [...frames(a), ...frames(b)]) socket.emit(frame);
+  const done = (sessionId: string, runId: string, outcome = "success") => socket.emit({ v: 1, sessionId, epoch, body: { type: "run_completed", runId, outcome } });
+  done(b, "1", "aborted");
+  expect(page.queryByRole("button", { name: /Conversation 2,.*unread/ })).toBeNull();
+  done(b, "2");
+  expect(page.getByRole("button", { name: /Conversation 2,.*unread/ })).toBeTruthy();
+  fireEvent.click(page.getByRole("button", { name: /Conversation 2,.*unread/ })); flush();
+  expect(page.queryByRole("button", { name: /Conversation 2,.*unread/ })).toBeNull();
+  done(b, "2");
+  expect(page.queryByRole("button", { name: /Conversation 2,.*unread/ })).toBeNull();
+  fireEvent.click(page.getByRole("button", { name: "Settings" })); flush();
+  done(b, "3", "error");
+  expect(page.getByRole("button", { name: /Conversation 2,.*unread/ })).toBeTruthy();
+  fireEvent.click(page.getByRole("button", { name: "Conversation" })); flush();
+  expect(page.queryByRole("button", { name: /Conversation 2,.*unread/ })).toBeNull();
+  for (const frame of frames(a)) socket.emit(frame);
+  expect(page.queryByRole("button", { name: /Conversation 1,.*unread/ })).toBeNull();
+});
+
+it("keeps hidden-tab completions unread until visible and forgets deleted conversations", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const frame of [...frames(a), ...frames(b)]) socket.emit(frame);
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+  socket.emit({ v: 1, sessionId: a, epoch, body: { type: "run_completed", runId: "1", outcome: "success" } });
+  expect(page.getByRole("button", { name: /Conversation 1,.*unread/ })).toBeTruthy();
+  visibility.mockReturnValue("visible"); fireEvent(document, new Event("visibilitychange")); flush();
+  expect(page.queryByRole("button", { name: /Conversation 1,.*unread/ })).toBeNull();
+  socket.emit({ v: 1, sessionId: b, epoch, body: { type: "run_completed", runId: "1", outcome: "success" } });
+  expect(page.getByRole("button", { name: /Conversation 2,.*unread/ })).toBeTruthy();
+  socket.emit({ ...catalog(), sessions: [item(a, "Conversation 1")] });
+  socket.emit(catalog());
+  expect(page.queryByRole("button", { name: /Conversation 2,.*unread/ })).toBeNull();
+});
+
+it("keeps workspace folding usable when local storage is blocked", async () => {
+  vi.spyOn(localStorage, "getItem").mockImplementation(() => { throw new Error("blocked"); });
+  vi.spyOn(localStorage, "setItem").mockImplementation(() => { throw new Error("blocked"); });
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  Socket.instances[0].onopen?.(); Socket.instances[0].emit(grouped());
+  fireEvent.click(page.getByRole("button", { name: "Collapse workspace Beta" })); flush();
+  expect(page.queryByRole("button", { name: /^Conversation 2,/ })).toBeNull();
+  fireEvent.click(page.getByRole("button", { name: "Expand workspace Beta" })); flush();
+  expect(page.getByRole("button", { name: /^Conversation 2,/ })).toBeTruthy();
+});
+
+it("remembers collapsed workspaces locally while keeping the selected conversation visible", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  fireEvent.click(page.getByRole("button", { name: "Collapse workspace Beta" })); flush();
+  expect(page.queryByRole("button", { name: /^Conversation 2,/ })).toBeNull();
+  expect(page.getByRole("button", { name: "Expand workspace Beta" }).getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(page.getByRole("button", { name: "Collapse workspace Alpha" })); flush();
+  expect(page.getByRole("button", { name: /^Conversation 1,/ })).toBeTruthy();
+  expect(JSON.parse(localStorage.getItem("pi-web.collapsed-workspaces.v1")!)).toEqual([wb, wa]);
+  page.unmount();
+  const next = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(2));
+  Socket.instances[1].onopen?.(); Socket.instances[1].emit(grouped());
+  expect(next.getByRole("button", { name: "Expand workspace Beta" })).toBeTruthy();
+  expect(next.queryByRole("button", { name: /^Conversation 2,/ })).toBeNull();
+  fireEvent.click(next.getByRole("button", { name: "Expand workspace Beta" })); flush();
+  expect(next.getByRole("button", { name: /^Conversation 2,/ })).toBeTruthy();
+});
+
+it("opens the command palette, searches conversations, and preserves drafts", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  for (const frame of [...frames(a), ...frames(b)]) socket.emit(frame);
+  const composer = page.getByLabelText("Message Pi");
+  fireEvent.input(composer, { target: { value: "Keep this draft" } }); flush();
+  composer.focus();
+  fireEvent.keyDown(composer, { key: "k", ctrlKey: true }); flush();
+  const dialog = screen.getByRole("dialog", { name: "Command palette" });
+  const search = within(dialog).getByRole("combobox");
+  fireEvent.input(search, { target: { value: "beta conversation 2" } }); flush();
+  expect(within(dialog).getAllByRole("option")).toHaveLength(1);
+  fireEvent.keyDown(search, { key: "Enter" }); flush();
+  expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+  expect(page.getByRole("button", { name: /^Conversation 2,/ }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(page.getByRole("button", { name: /^Conversation 1,/ })); flush();
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep this draft");
+  const trigger = page.getByRole("button", { name: "Command palette" }); trigger.focus();
+  fireEvent.click(trigger); flush();
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "Search commands and conversations" }), { key: "Escape" }); flush();
+  expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+});
+
+it("routes palette actions through existing workspace commands and blocks nested modals", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  for (const frame of frames(a)) socket.emit(frame);
+  for (const [raw] of [...socket.send.mock.calls]) {
+    const request = JSON.parse(raw);
+    if (request.v === 2) socket.emit({ ...grouped(), requestId: request.requestId });
+  }
+  function search(query: string) {
+    fireEvent.keyDown(window, { key: "K", metaKey: true }); flush();
+    const input = screen.getByRole("combobox", { name: "Search commands and conversations" });
+    fireEvent.input(input, { target: { value: query } }); flush();
+    return input;
+  }
+  fireEvent.keyDown(search("settings"), { key: "Enter" }); flush();
+  expect(page.getByLabelText("Maximum AI calls")).toBeTruthy();
+  fireEvent.keyDown(search("new conversation"), { key: "Enter" }); flush();
+  expect(JSON.parse(socket.send.mock.calls.at(-1)![0]).action).toEqual({ type: "create_in", workspaceId: wa });
+  const request = JSON.parse(socket.send.mock.calls.at(-1)![0]);
+  socket.emit({ ...grouped(), requestId: request.requestId });
+  fireEvent.keyDown(search("workspace beta"), { key: "Enter" }); flush();
+  expect(JSON.parse(socket.send.mock.calls.at(-1)![0]).action).toEqual({ type: "select_workspace", workspaceId: wb });
+  socket.onclose?.(); flush();
+  const input = search("new conversation");
+  expect(screen.getByRole("option").getAttribute("aria-disabled")).toBe("true");
+  const count = socket.send.mock.calls.length;
+  fireEvent.keyDown(input, { key: "Enter" }); flush();
+  expect(socket.send.mock.calls).toHaveLength(count);
+  fireEvent.keyDown(input, { key: "Escape" }); flush();
+  const modal = document.createElement("div"); modal.setAttribute("role", "dialog"); document.body.append(modal);
+  fireEvent.keyDown(window, { key: "k", ctrlKey: true }); flush();
+  expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+  modal.remove();
+});
+
+it("shows pending feedback on the Changes tab while chatting", async () => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const file = { path: "a.ts", previousPath: null, status: "modified", fingerprint: "one", patch: "@@ -1 +1 @@\n-old\n+new\n" };
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url === "/auth" ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ files: [file], truncated: false, note: null }))));
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const frame of frames(a)) socket.emit(frame);
+  fireEvent.click(page.getByRole("button", { name: "Changes" })); flush();
+  await page.findByRole("button", { name: "Ask Pi about file" });
+  fireEvent.click(page.getByRole("button", { name: "Ask Pi about file" })); flush();
+  fireEvent.input(screen.getByRole("textbox", { name: "Your question" }), { target: { value: "Keep the API" } }); flush();
+  fireEvent.click(screen.getByRole("button", { name: "Add feedback" })); flush();
+  fireEvent.click(page.getByRole("button", { name: "Conversation" })); flush();
+  const changes = page.getByRole("button", { name: "Changes" });
+  expect(changes.textContent).toContain("1");
+  expect(document.getElementById(changes.getAttribute("aria-describedby")!)?.textContent).toBe("1 unsent feedback note");
+  expect(page.getByRole("combobox", { name: "Message Pi" })).toBeTruthy();
+});
+
 it("applies live global grouping settings across conversations and future AI runs", async () => {
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
   const file = { path: "a.ts", previousPath: null, status: "modified", fingerprint: "one", patch: "@@ -1 +1 @@\n-old\n+new\n" };
@@ -107,7 +285,7 @@ it.each(["none", "current", "other"])("reloads the app with draft protection for
   fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Reload app" }), { key: "Enter" }); flush();
   if (draft !== "none") {
     expect(reload).not.toHaveBeenCalled();
-    expect(screen.getByText(/Unsent drafts, attached images, and reply quotes/)).toBeTruthy();
+    expect(screen.getByText(/Attached images and any work this browser could not save/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" })); flush();
     expect(reload).not.toHaveBeenCalled();
     if (draft === "current") expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep my draft");
@@ -753,7 +931,9 @@ it("shares live activity across devices while preserving a rejected device's dra
   flush();
   expect(devices[0].draft()).toBe(""); expect(devices[1].draft()).toBe("phone prompt");
   expect(devices[1].notice()).toContain("busy");
-  for (const model of devices) { expect(model.pending()).toBe(false); expect(model.canSend()).toBe(false); }
+  for (const model of devices) expect(model.pending()).toBe(false);
+  expect(devices[0].canSend()).toBe(false);
+  expect(devices[1].canSend()).toBe(true); // The preserved correction can now be explicitly sent as steering.
   if (update.body.type !== "event") throw new Error("Expected event");
   for (const model of devices) model.receive({ ...update, body: { ...update.body, seq: 2, status: { ...update.body.status, activity: "idle" } } });
   flush(); expect(devices[1].canSend()).toBe(true);

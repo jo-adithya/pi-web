@@ -1,7 +1,7 @@
 import { SelectField } from "./SelectField";
 import { TextField } from "@kobalte/core/text-field";
 import { Checkbox } from "@kobalte/core/checkbox";
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createSignal, createUniqueId } from "solid-js";
 import { Button } from "@kobalte/core/button";
 import { DropdownMenu } from "@kobalte/core/dropdown-menu";
 import type { Activity, CatalogItem, WorkspaceItem } from "../generated/protocol";
@@ -11,6 +11,9 @@ import { Icon } from "./Icon";
 
 interface SessionSidebarProps {
   catalog: CatalogItem[];
+  collapsed: string[];
+  toggleWorkspace: (id: string) => void;
+  unread: (id: string) => boolean;
   workspaces: WorkspaceItem[];
   selected: string;
   selectedWorkspace: string;
@@ -36,16 +39,17 @@ interface SessionSidebarProps {
 
 /** Project navigation shared by the desktop rail and the mobile modal drawer. */
 export function SessionSidebar(props: SessionSidebarProps) {
+  const id = createUniqueId();
   return <>
     <Button class="new-conversation" disabled={!props.canCreate} onClick={props.create}><Icon name="plus" />New conversation</Button>
     <div class="sidebar-section-label">Workspaces <Button class="icon-button" aria-label="Add workspace" title="Add workspace" disabled={!props.canManage || props.workspaces.length >= 16} onClick={() => props.setAdding(!props.adding)}><Icon name="plus" /></Button></div>
     <nav class="session-list" aria-label="Workspaces and conversations">
       <Show when={props.adding}><WorkspaceForm pending={!props.canManage} notice={props.notice} submit={props.addWorkspace} cancel={() => props.setAdding(false)} /></Show>
       <For each={props.workspaces}>{workspace => <section class="workspace-group" role="group" aria-label={workspace.name}>
-        <div class="workspace-heading-row"><Button class={["workspace-heading", { selected: props.selectedWorkspace === workspace.workspaceId }]} title={workspace.path}
+        <div class="workspace-heading-row"><Button class="icon-button workspace-collapse" aria-label={`${props.collapsed.includes(workspace.workspaceId) ? "Expand" : "Collapse"} workspace ${workspace.name}`} aria-expanded={props.collapsed.includes(workspace.workspaceId) ? "false" : "true"} aria-controls={`${id}-${workspace.workspaceId}`} onClick={() => props.toggleWorkspace(workspace.workspaceId)}><Icon name="chevronDown" /></Button><Button class={["workspace-heading", { selected: props.selectedWorkspace === workspace.workspaceId }]} title={workspace.path}
           aria-label={`Select workspace ${workspace.name}`} aria-pressed={props.selectedWorkspace === workspace.workspaceId ? "true" : "false"} disabled={!props.canManage}
           onClick={() => props.selectWorkspace(workspace.workspaceId)}>
-          <Icon name="folder" /><span class="workspace-info"><strong>{workspace.name}</strong><small>{workspace.path}</small></span>
+          <Icon name="folder" /><span class="workspace-info"><strong>{workspace.name}<Show when={props.catalog.some(item => item.workspaceId === workspace.workspaceId && props.unread(item.sessionId))}><span class="unread-dot" role="img" aria-label="Unread response" /></Show></strong><small>{workspace.path}</small></span>
         </Button><DropdownMenu placement="bottom-end" gutter={6} modal={false}>
           <DropdownMenu.Trigger class="icon-button sidebar-workspace-trigger" aria-label={`Workspace options for ${workspace.name}`} title={`Workspace options for ${workspace.name}`}><Icon name="more" /></DropdownMenu.Trigger>
           <DropdownMenu.Portal><DropdownMenu.Content class="session-menu sidebar-workspace-actions">
@@ -53,10 +57,10 @@ export function SessionSidebar(props: SessionSidebarProps) {
             <Show when={props.workspaces.length <= 1}><span class="workspace-menu-hint">Keep at least one workspace. Add another before deleting this one.</span></Show>
           </DropdownMenu.Content></DropdownMenu.Portal>
         </DropdownMenu></div>
-        <For each={props.catalog.filter(item => item.workspaceId === workspace.workspaceId)}>{item => <div class="session-row"><Button class={["session-item", { selected: props.selected === item.sessionId, stopped: item.lifecycle === "stopped" }]}
-          aria-label={`${item.title}, ${props.needsInput(item.sessionId) ? "needs input" : (props.activity(item.sessionId) ?? item.lifecycle).replaceAll("_", " ")}`}
+        <div id={`${id}-${workspace.workspaceId}`}><For each={props.catalog.filter(item => item.workspaceId === workspace.workspaceId && (!props.collapsed.includes(workspace.workspaceId) || item.sessionId === props.selected))}>{item => <div class="session-row"><Button class={["session-item", { selected: props.selected === item.sessionId, stopped: item.lifecycle === "stopped" }]}
+          aria-label={`${item.title}, ${props.needsInput(item.sessionId) ? "needs input" : (props.activity(item.sessionId) ?? item.lifecycle).replaceAll("_", " ")}${props.unread(item.sessionId) ? ", unread response" : ""}`}
           aria-pressed={props.selected === item.sessionId ? "true" : "false"} onClick={() => props.choose(item)}>
-          <span class="session-info"><span class="session-title-row"><span class="session-title">{item.title}</span>
+          <span class="session-info"><span class="session-title-row"><span class="session-title">{item.title}</span><Show when={props.unread(item.sessionId)}><span class="unread-dot" aria-hidden="true" /></Show>
             <Show when={item.lifecycle === "open" && !props.needsInput(item.sessionId) && ["submitting", "running", "retrying", "compacting", "reconciling", "cancelling"].includes(props.activity(item.sessionId) ?? "")}><span class="working-dot" aria-hidden="true" /></Show>
           </span><Show when={props.needsInput(item.sessionId)}><small>Needs input</small></Show></span>
         </Button><DropdownMenu placement="bottom-end" gutter={6} modal={false}>
@@ -65,7 +69,7 @@ export function SessionSidebar(props: SessionSidebarProps) {
             <DropdownMenu.Item disabled={!props.canManage} onSelect={() => props.rename(item)}>Rename…</DropdownMenu.Item>
             <DropdownMenu.Item class="danger" disabled={!props.canManage || !["open", "stopped"].includes(item.lifecycle)} onSelect={() => props.remove(item)}>Delete…</DropdownMenu.Item>
           </DropdownMenu.Content></DropdownMenu.Portal>
-        </DropdownMenu></div>}</For>
+        </DropdownMenu></div>}</For></div>
       </section>}</For>
     </nav>
     <footer class="sidebar-footer">

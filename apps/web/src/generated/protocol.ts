@@ -166,7 +166,7 @@ export type RunOutcome = "success" | "error" | "aborted";
  * Only the controlling browser may issue these bounded, session-scoped actions.
  */
 
-export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, images: Array<string>, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
+export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, images: Array<string>, } | { "type": "steer", text: string, images: Array<string>, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
 
 /**
  * Browser envelope. Shape decoding precedes bounds, version, subscription and epoch checks.

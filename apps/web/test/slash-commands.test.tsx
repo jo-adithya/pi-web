@@ -99,7 +99,7 @@ it("does not send empty, busy or disconnected drafts on Enter", () => {
   const { type, key, transport, receive, model } = setup();
   key("Enter");
   type("Hello");
-  receive({ type: "event", seq: 1, patches: [], status: { ...initialState().status, process: "ready", activity: "running" }, dialogs: [], olderHistory: false });
+  receive({ type: "event", seq: 1, patches: [], status: { ...initialState().status, process: "ready", activity: "submitting" }, dialogs: [], olderHistory: false });
   key("Enter");
   model.disconnected(); flush(); key("Enter");
   expect(transport).not.toHaveBeenCalled();

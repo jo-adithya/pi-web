@@ -51,14 +51,14 @@ function ReviewCardFileView(props: { file: ReviewCardFile; card: ReviewCard; sin
 }
 
 /** Reuses safe syntax tokens while retaining the excerpt's original old/new coordinates. */
-export function ReviewCode(props: { path: string; lines: readonly DiffLine[] }) {
+export function ReviewCode(props: { path: string; lines: readonly DiffLine[]; highlight?: { line: number; endLine: number } }) {
   const rows = createMemo(() => {
     // A synthetic hunk enables highlighting selections without adding it to the visible excerpt.
     const highlighted = highlightDiff(props.path, `@@ -1 +1 @@\n${props.lines.map(line => line.text).join("\n")}`).lines.slice(1);
     return props.lines.map((line, index) => ({ ...line, tokens: highlighted[index]?.tokens }));
   });
   return <div class="chat-review-code" role="region" aria-label={`Diff for ${props.path}`} tabindex={0}>
-    <For each={rows()}>{line => <div class={`chat-review-line ${line.kind}`}>
+    <For each={rows()}>{line => <div class={`chat-review-line ${line.kind}`} data-reference={props.highlight && line.next !== undefined && line.next >= props.highlight.line && line.next <= props.highlight.endLine ? "true" : undefined}>
       <span class="chat-review-number" title="Old line">{line.old ?? ""}</span><span class="chat-review-number" title="New line">{line.next ?? ""}</span>
       <code><Show when={line.tokens} fallback={line.text}>{tokens => <>{line.text[0]}<For each={tokens()}>{token => <span class={token.className}>{token.text}</span>}</For></>}</Show></code>
     </div>}</For>

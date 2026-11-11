@@ -145,6 +145,7 @@ pub fn router(state: WebState) -> Router {
         .route("/sw.js", get(service_worker))
         .route("/push", post(push_request))
         .route("/files/{session}", post(workspace_files))
+        .route("/files/{session}/source", post(workspace_source))
         .route("/review/{session}", post(local_review))
         .route("/review/{session}/structural", post(structural_review))
         .route("/review/{session}/context", post(context_review))
@@ -558,6 +559,41 @@ async fn workspace_files(
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SourceRequest { path: String, line: usize }
+
+/// Returns current source around an explicit reference, never following symlinks.
+async fn workspace_source(State(state): State<WebState>, Path(session): Path<String>, request: Request<Body>) -> Response {
+    if !image_proof(&state, request.headers()) { return StatusCode::UNAUTHORIZED.into_response(); }
+    if request.headers().get(header::CONTENT_TYPE).is_none_or(|value| value != "application/json") { return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response(); }
+    let Ok(permit) = state.file_slots.clone().try_acquire_owned() else { return StatusCode::TOO_MANY_REQUESTS.into_response(); };
+    let body = match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 2048)).await {
+        Ok(Ok(body)) => body,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let Ok(input) = serde_json::from_slice::<SourceRequest>(&body) else { return StatusCode::BAD_REQUEST.into_response(); };
+    if crate::local_review::validate_path(&input.path).is_err() || !(1..=10_000_000).contains(&input.line) { return StatusCode::BAD_REQUEST.into_response(); }
+    let Some(root) = state.runtime.workspace_directory(&session).await else { return StatusCode::NOT_FOUND.into_response(); };
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let bytes = crate::workspace_files::read(&root, &input.path, 256 * 1024).map_err(|_| "Source unavailable: missing, symlink, special file, or over 256 KiB")?;
+        if bytes.contains(&0) { return Err("Binary source cannot be previewed"); }
+        let text = String::from_utf8(bytes).map_err(|_| "Source is not UTF-8")?;
+        let lines: Vec<_> = text.lines().collect();
+        if input.line > lines.len() { return Err("The referenced line is outside the current file"); }
+        let first = input.line.saturating_sub(16);
+        let excerpt = lines[first..lines.len().min(first + 80)].join("\n");
+        if excerpt.len() > 65536 { return Err("Source excerpt exceeds 64 KiB"); }
+        Ok(serde_json::json!({"path":input.path,"firstLine":first + 1,"text":excerpt}))
+    });
+    match tokio::time::timeout(Duration::from_secs(5), worker).await {
+        Ok(Ok(Ok(source))) => axum::Json(source).into_response(),
+        Ok(Ok(Err(error))) => (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(serde_json::json!({"error":error}))).into_response(),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 #[cfg(test)]
 mod file_tests {
     use super::*;
@@ -670,6 +706,13 @@ async fn local_review(
     let Ok(input) = serde_json::from_slice::<crate::local_review::Request>(&body) else {
         return error(StatusCode::BAD_REQUEST, "Invalid review request");
     };
+    if matches!(input.scope, crate::local_review::Scope::Turn) {
+        let Some(runtime) = state.runtime.lookup(&session).await else { return error(StatusCode::UNPROCESSABLE_ENTITY, "Start the conversation and finish a turn to capture changes"); };
+        return match runtime.turns.review(&input) {
+            Ok(review) => axum::Json(review).into_response(),
+            Err(message) => error(StatusCode::UNPROCESSABLE_ENTITY, message),
+        };
+    }
     let Some(root) = state.runtime.workspace_directory(&session).await else {
         return error(StatusCode::NOT_FOUND, "Session workspace not found");
     };

@@ -1,4 +1,5 @@
 import { Button } from "@kobalte/core/button";
+import { CopyButton } from "./components/CopyButton";
 import { ImageLightbox } from "./components/ImageLightbox";
 import { For, Show, createMemo, createSignal, onSettled } from "solid-js";
 import type { DisplayMessage } from "./generated/protocol";
@@ -9,14 +10,15 @@ import { ChatSelectionReply } from "./components/ChatSelectionReply";
 import type { ReplyQuote } from "./reply-quote";
 import { reviewMessageContent, type ReviewCard } from "./review-cards";
 import { ReviewDiffCard, type ReviewPreviewLoader } from "./components/ReviewDiffCard";
+import type { CodeLocation } from "./code-reference";
 
-interface ReviewPresentation { reviewCards?: readonly ReviewCard[]; loadReviewPreview?: ReviewPreviewLoader }
+interface ReviewPresentation { openCode?: (location: CodeLocation) => void; reviewCards?: readonly ReviewCard[]; loadReviewPreview?: ReviewPreviewLoader }
 
 /** Starts with the latest 100 messages; explicitly revealed history stays expanded while mounted. */
 export function MessageList(props: ReviewPresentation & { state: Pick<ClientState, "order" | "messages">; loadImage?: (id: string) => Promise<Blob>; onReply?: (quote: ReplyQuote) => void; mobileReplyTarget?: HTMLDivElement }) {
   const [count, setCount] = createSignal(100);
   return <ChatSelectionReply onReply={props.onReply} mobileReplyTarget={props.mobileReplyTarget}><Show when={props.state.order.length > count()}><Button class="history-marker" onClick={() => setCount(value => value + 100)}>Show earlier retained messages</Button></Show>
-    <For each={props.state.order.slice(-count())}>{id => <Message message={props.state.messages[id]} loadImage={props.loadImage} reviewCards={props.reviewCards} loadReviewPreview={props.loadReviewPreview} />}</For></ChatSelectionReply>;
+    <For each={props.state.order.slice(-count())}>{id => <Message message={props.state.messages[id]} openCode={props.openCode} loadImage={props.loadImage} reviewCards={props.reviewCards} loadReviewPreview={props.loadReviewPreview} />}</For></ChatSelectionReply>;
 }
 
 /** Renders responses and warnings, with compaction summaries tucked into a disclosure. */
@@ -36,13 +38,14 @@ function Message(props: ReviewPresentation & { message: DisplayMessage; loadImag
   return <Show when={visible()}><Show when={props.message.role === "compactionSummary"} fallback={<>
     <Show when={review().cards.length}><div class="chat-review-attachments" role="group" aria-label="Referenced changes"><For each={review().cards}>{card => <ReviewDiffCard card={card} load={props.loadReviewPreview} />}</For></div></Show>
     <Show when={review().message.blocks.length || props.message.error || props.message.truncated || !review().cards.length}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`} data-reply-author={props.message.role === "assistant" ? "Pi" : "You"}><h2>{props.message.role === "assistant" ? "Pi" : props.message.role}</h2>
-      <MessageBody message={review().message} loadImage={props.loadImage} />
+      <MessageBody message={review().message} openCode={props.openCode} loadImage={props.loadImage} />
+      <Show when={props.message.role === "assistant" && props.message.complete && props.message.blocks.some(block => block.kind === "text" && block.text)}><div class="answer-actions"><CopyButton label="Copy answer" text={() => props.message.blocks.filter(block => block.kind === "text").map(block => block.text).join("\n\n")} /></div></Show>
     </article></Show>
-  </>}><CompactionSummary message={props.message} loadImage={props.loadImage} /></Show></Show>;
+  </>}><CompactionSummary message={props.message} openCode={props.openCode} loadImage={props.loadImage} /></Show></Show>;
 }
 
 /** A quiet history milestone; summary content mounts only when explicitly opened. */
-function CompactionSummary(props: { message: DisplayMessage; loadImage?: (id: string) => Promise<Blob> }) {
+function CompactionSummary(props: ReviewPresentation & { message: DisplayMessage; loadImage?: (id: string) => Promise<Blob> }) {
   const [open, setOpen] = createSignal(false);
   return <details class="context-summary" onToggle={event => setOpen(event.currentTarget.open)}>
     <summary>
@@ -51,14 +54,14 @@ function CompactionSummary(props: { message: DisplayMessage; loadImage?: (id: st
       <span class="context-summary-action">{open() ? "Hide summary" : "View summary"}</span>
       <span class="context-summary-chevron"><Icon name="chevronDown" /></span>
     </summary>
-    <Show when={open()}><div class="context-summary-body"><MessageBody message={props.message} loadImage={props.loadImage} /></div></Show>
+    <Show when={open()}><div class="context-summary-body"><MessageBody message={props.message} openCode={props.openCode} loadImage={props.loadImage} /></div></Show>
   </details>;
 }
 
 /** Shared safe message content, including image loading and preview warnings. */
-function MessageBody(props: { message: DisplayMessage; loadImage?: (id: string) => Promise<Blob> }) {
+function MessageBody(props: ReviewPresentation & { message: DisplayMessage; loadImage?: (id: string) => Promise<Blob> }) {
   return <><For each={props.message.blocks}>{block => <Show when={block.kind !== "thinking"}>
-      <Show when={block.kind === "text"} fallback={<Show when={block.kind === "image"} fallback={<pre class="block-notice">{block.text}</pre>}><ImagePreview id={block.text} load={props.loadImage} /></Show>}><div class="message-text"><Markdown text={block.text} complete={props.message.complete} allowArtifacts={props.message.role === "assistant" && !props.message.truncated} /></div></Show>
+      <Show when={block.kind === "text"} fallback={<Show when={block.kind === "image"} fallback={<pre class="block-notice">{block.text}</pre>}><ImagePreview id={block.text} load={props.loadImage} /></Show>}><div class="message-text"><Markdown text={block.text} openCode={props.openCode} complete={props.message.complete} allowArtifacts={props.message.role === "assistant" && !props.message.truncated} /></div></Show>
     </Show>}</For>
     <Show when={props.message.error}><p class="warning">{props.message.error}</p></Show><Show when={props.message.truncated}><p class="truncated">Preview truncated. The full content remains with Pi.</p></Show>
   </>;

@@ -7,6 +7,7 @@ import type { WorkspaceFiles } from "../workspace-files";
 interface PromptInputProps {
   id: string;
   value: string;
+  placeholder?: string;
   commands: SlashCommand[];
   completionEnabled: boolean;
   onInput: (value: string) => void;
@@ -130,7 +131,7 @@ export function PromptInput(props: PromptInputProps) {
         A trailing space preserves the height of an empty final line. */}
     <div class="prompt-size" aria-hidden="true">{props.value + " "}</div>
     <TextField.TextArea ref={input} id={props.id} rows={1} maxlength={32_768}
-      placeholder="What would you like to work on?"
+      placeholder={props.placeholder ?? "What would you like to work on?"}
       role="combobox" aria-autocomplete="list" aria-expanded={matches().length > 0 ? "true" : "false"}
       aria-controls={matches().length ? listId : undefined}
       aria-activedescendant={matches().length ? optionId(active()) : undefined}

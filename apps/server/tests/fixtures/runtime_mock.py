@@ -115,6 +115,9 @@ for line in sys.stdin:
             with open("slash-commands.json") as file:
                 commands += json.load(file)
         response(command, {"commands": commands})
+    elif kind == "steer":
+        response(command, {"disposition": "queued"})
+        emit({"type": "message_end", "message": {"role": "user", "content": command["message"]}})
     elif kind == "prompt":
         text = command["message"]
         if command.get("images"):

@@ -208,6 +208,12 @@ pub enum BrowserAction {
         #[serde(default)]
         images: Vec<String>,
     },
+    /// Queues a correction at the next tool boundary in an active run.
+    Steer {
+        text: String,
+        #[serde(default)]
+        images: Vec<String>,
+    },
     Cancel,
     UiReply {
         dialog_id: String,
