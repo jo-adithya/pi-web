@@ -8,10 +8,10 @@ import type { GroupModel } from "./review-costs";
 import { createReviewHistory } from "./review-history";
 import { createReviewExplanations } from "./review-explanations";
 
-export type ReviewScope = "unstaged" | "staged" | "branch" | "commit" | "turn";
+export type ReviewScope = "unstaged" | "staged" | "branch" | "commit" | "turn" | "saved";
 export interface ReviewRequest { scope: ReviewScope; base?: string; commit?: string }
 export interface ReviewLoadRequest extends ReviewRequest { path?: string; cursor?: string }
-export interface ReviewEntry { path: string; previousPath: string | null; status: string; patch: string | null; fingerprint: string | null; lineStats?: ReviewFileLineStats }
+export interface ReviewEntry { checkoutKey?: string; path: string; previousPath: string | null; status: string; patch: string | null; fingerprint: string | null; lineStats?: ReviewFileLineStats }
 export interface ReviewFile extends ReviewEntry { patch: string; fingerprint: string }
 /** Text counts from the metadata listing; omitted when counts are unknown. */
 export interface ReviewFileLineStats { added: number; removed: number }
@@ -50,6 +50,8 @@ export async function fetchReview(id: string, request: ReviewLoadRequest, signal
   if ("nextCursor" in value && (typeof value.nextCursor !== "string" || !value.nextCursor || value.nextCursor.length > 256 || request.path !== undefined || !value.files.length)) throw new Error("Invalid review continuation.");
   if ("snapshotKey" in value && (typeof value.snapshotKey !== "string" || !/^[a-f0-9]{64}$/.test(value.snapshotKey))) throw new Error("Invalid review snapshot identity.");
   if ("currentBranch" in value && value.currentBranch !== null && (typeof value.currentBranch !== "string" || !value.currentBranch || value.currentBranch.length > 4096 || /[\x00-\x1f\x7f]/.test(value.currentBranch))) throw new Error("Invalid review branch.");
+  const checkoutKey = "checkoutKey" in value ? value.checkoutKey : undefined;
+  if (checkoutKey !== undefined && (typeof checkoutKey !== "string" || !/^[a-f0-9]{64}$/.test(checkoutKey))) throw new Error("Invalid checkout identity.");
   let jjContext: ReviewJjContext | undefined;
   if ("jjContext" in value) {
     const context = value.jjContext;
@@ -87,7 +89,7 @@ export async function fetchReview(id: string, request: ReviewLoadRequest, signal
     }
     const size = new TextEncoder().encode(file.patch ?? "").length; bytes += size;
     if (size > 65536 || bytes > 1_100_000) throw new Error("Local review response exceeds its limit.");
-    return { path: file.path, previousPath: file.previousPath, status: file.status, patch: file.patch, fingerprint: file.fingerprint, ...(lineStats ? { lineStats } : {}) };
+    return { ...(checkoutKey ? { checkoutKey } : {}), path: file.path, previousPath: file.previousPath, status: file.status, patch: file.patch, fingerprint: file.fingerprint, ...(lineStats ? { lineStats } : {}) };
   });
   if (request.path !== undefined && (files.length !== 1 || files[0].path !== request.path || !hasPatch(files[0]))) throw new Error("Invalid selected-file response.");
   if (new Set(files.map(file => file.path)).size !== files.length) throw new Error("Duplicate review files.");
@@ -97,7 +99,14 @@ export async function fetchReview(id: string, request: ReviewLoadRequest, signal
 /** Session-local lazy patches with a 1 MiB LRU budget. Refresh discards loaded content;
  * reviewed fingerprints are revalidated as files load. Cancellation ignores late replies.
  */
-export function createLocalReview(load: (request: ReviewLoadRequest, signal: AbortSignal) => Promise<ReviewSnapshot>, loadStructural: StructuralLoader = async () => ({ mode: "text", reason: "Structural comparison is unavailable." }), loadContext: ContextLoader = async () => { throw new Error("Diff context is unavailable."); }, loadCommits: CommitLoader = async () => { throw new Error("Commit history is unavailable."); }, loadGroups: GroupLoader = async () => { throw new Error("AI grouping is unavailable."); }, loadBranches: BranchLoader = async () => { throw new Error("Branch list is unavailable."); }, groupingConfig: { model?: () => GroupModel | null; cacheNamespace?: string } = {}) {
+export function createLocalReview(readSource: (request: ReviewLoadRequest, signal: AbortSignal) => Promise<ReviewSnapshot>, loadStructural: StructuralLoader = async () => ({ mode: "text", reason: "Structural comparison is unavailable." }), loadContext: ContextLoader = async () => { throw new Error("Diff context is unavailable."); }, loadCommits: CommitLoader = async () => { throw new Error("Commit history is unavailable."); }, loadGroups: GroupLoader = async () => { throw new Error("AI grouping is unavailable."); }, loadBranches: BranchLoader = async () => { throw new Error("Branch list is unavailable."); }, groupingConfig: { model?: () => GroupModel | null; cacheNamespace?: string } = {}) {
+  const [saved, setSaved] = createSignal(false);
+  const load = async (request: ReviewLoadRequest, signal: AbortSignal): Promise<ReviewSnapshot> => {
+    if (request.scope !== "saved") return readSource(request, signal);
+    const source = snapshot();
+    if (!saved() || !source) throw new Error("Open a saved round first.");
+    return request.path ? { ...source, files: source.files.filter(file => file.path === request.path) } : source;
+  };
   const grouping = createReviewGroups(loadGroups, groupingConfig.cacheNamespace);
   const groupingModel = () => grouping.options().model ?? groupingConfig.model?.();
   // Budget changes affect work allowed, not the identity of already completed suggestions.
@@ -163,6 +172,8 @@ export function createLocalReview(load: (request: ReviewLoadRequest, signal: Abo
   }
   /** Pins commit reviews to a full object ID, independent of subsequent HEAD/history changes. */
   async function refresh(nextScope: ReviewScope = scope(), nextCommit = commit()) {
+    if (nextScope === "saved") return;
+    setSaved(false);
     const previousTarget = target();
     cancel(); explanations.invalidate();
     if (snapshot()) grouping.reconcile(undefined, snapshot()!.files, true); else grouping.reset();
@@ -240,7 +251,41 @@ export function createLocalReview(load: (request: ReviewLoadRequest, signal: Abo
       verify: source.snapshotKey ? async signal => (await load(request, signal)).snapshotKey === source.snapshotKey : undefined });
   }
 
-  return { scope, setScope, base, setBase, commit, setCommit, history, branches, snapshot, target, selected, setSelected, busy, error, patchBusy, patchError, loadPatch, refresh, cancel, isReviewed, mark, historyReview, explanations, structural, context, grouping, groupWithAI };
+  /** Opens retained patches without requesting current repository content. */
+  function openSaved(files: (ReviewFile & { reviewed: boolean })[], label: string, identity: string) {
+    cancel(); explanations.invalidate(); grouping.reset(); historyReview.reset(); recent.clear();
+    setSaved(true); setScope("saved"); setTarget({ scope: "saved", base: label });
+    setSnapshot({ files, truncated: false, note: null, snapshotKey: `saved:${identity}` });
+    for (const file of files) if (file.reviewed) mark(file, true);
+    if (!files.some(file => file.path === selected())) updateSelected(files[0]?.path ?? "");
+    setError(""); setPatchError("");
+  }
+  /** Releases a deleted saved round without fetching another scope or retaining its source in the reader. */
+  function closeSaved() {
+    cancel(); explanations.invalidate(); grouping.reset(); historyReview.reset(); recent.clear();
+    setSaved(false); setScope("unstaged"); setTarget(undefined); setSnapshot(undefined); updateSelected("");
+  }
+  /** Captures all admitted patches within 4 MiB, checking mutable scope identity around the read.
+   * Sources without content identities remain explicitly best-effort captures.
+   */
+  async function capture(): Promise<ReviewFile[]> {
+    const source = snapshot(), request = target();
+    if (!source || !request || busy() || source.truncated || source.nextCursor) throw new Error("Load a complete review scope before saving a round.");
+    if (source.files.length > 1000) throw new Error("Save a scope with at most 1,000 files.");
+    const signal = AbortSignal.timeout(60000), files: ReviewFile[] = [];
+    let bytes = 0;
+    for (const entry of source.files) {
+      const result = saved() ? entry : (await load({ ...request, path: entry.path }, signal)).files[0];
+      if (entry.checkoutKey && result?.checkoutKey !== entry.checkoutKey) throw new Error("Checkout changed during capture. Refresh and retry.");
+      if (!result || result.path !== entry.path || !hasPatch(result)) throw new Error("A patch could not be captured. Refresh and retry.");
+      bytes += new TextEncoder().encode(result.patch).length;
+      if (bytes > 4 * 1024 * 1024) throw new Error("Round exceeds 4 MiB of patches. Choose a smaller scope.");
+      files.push({ ...result });
+    }
+    if (JSON.stringify(target()) !== JSON.stringify(request) || (source.snapshotKey && (await load(request, signal)).snapshotKey !== source.snapshotKey)) throw new Error("Changes moved during capture. Refresh and retry.");
+    return files;
+  }
+  return { scope, setScope, base, setBase, commit, setCommit, history, branches, snapshot, target, selected, setSelected, busy, error, patchBusy, patchError, loadPatch, refresh, cancel, isReviewed, mark, historyReview, explanations, structural, context, grouping, groupWithAI, saved, openSaved, closeSaved, capture };
 }
 export type LocalReviewModel = ReturnType<typeof createLocalReview>;
 
@@ -281,7 +326,7 @@ export const reviewQuestionPresets: { question: ReviewQuestion; label: string; d
 
 /** Names the exact Git comparison without conflating branch and commit scopes. */
 export function reviewScopeLabel(target: ReviewRequest): string {
-  return target.scope === "turn" ? "last completed turn (captured turn-start to settlement; concurrent edits included)" : target.scope === "commit" ? `commit ${target.commit} against its first parent (empty tree for a root commit)` : target.scope === "branch" ? `branch changes against merge-base with ${JSON.stringify(target.base)}` : target.scope;
+  return target.scope === "saved" ? `saved review: ${target.base ?? "captured patches"}` : target.scope === "turn" ? "last completed turn (captured turn-start to settlement; concurrent edits included)" : target.scope === "commit" ? `commit ${target.commit} against its first parent (empty tree for a root commit)` : target.scope === "branch" ? `branch changes against merge-base with ${JSON.stringify(target.base)}` : target.scope;
 }
 
 /** Prepares a scope-wide question with a file manifest, not cached patches.

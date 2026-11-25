@@ -1,11 +1,11 @@
 ---
 name: pi-web-visuals
-description: Create theme-aware interactive HTML/CSS/SVG visuals in Pi Web chat. Use when a diagram, chart, architecture overview, timeline, or styled before/after comparison would help explain the answer, or when the user requests a visual artifact.
+description: Create custom theme-aware HTML/CSS/SVG visuals in Pi Web chat. Use only when the user explicitly requests a visual artifact, or when built-in summary blocks cannot express the explanation well. Normal replies use Pi Web's composable summaries.
 ---
 
 # Pi Web visuals
 
-Use a visual only when it clarifies the answer; otherwise use Markdown. Use supported facts and label illustrative data.
+Composable summaries are the default: answer normally and let Pi Web arrange the summary with built-in text, tables, charts, diagrams and annotated paths. For a walkthrough or a side-by-side review, describe each path in order and keep costs, risks and proposal status with the steps or paths they qualify; the formatter can lay them out natively. Use this custom HTML-preview skill only when the user explicitly requests a visual artifact, or when the built-in summary blocks cannot express the explanation well. A complex topic alone is not a reason to create a custom preview. Keep custom visuals focused, use supported facts and label illustrative data.
 
 ## Output
 
@@ -44,6 +44,12 @@ Each colored palette also provides `-muted` (tinted fill), `-border` (outline), 
 Only these color tokens are forwarded to previews: app tokens such as `--popover`, `--input`, `--ring` and `--chart-1` through `--chart-5` are not supplied. Never redefine supplied tokens. Keep body copy on normal foreground; SVG uses `currentColor` or theme variables.
 
 Use semantic accents sparingly: `error`, `success`, `warning`, `info`, `primary`. Pair tinted fills with their matching `-muted` and `-border` tokens; `-foreground` belongs on the solid accent, not muted fills. Labels/shapes must carry meaning without color. See the optional [palette](references/colors.md).
+
+## Zoomable diagrams
+
+Prefer inline SVG for flowcharts and architecture diagrams: vector labels stay sharp when zoomed. Give the outer SVG a complete `viewBox` containing every node, arrow and label. Large SVGs (viewBox at least 160 × 80) automatically receive a fitted, bounded viewer with pinch zoom, drag-to-pan, zoom buttons and Fit. Keyboard users can focus the diagram and use +/−, arrow keys and 0/Home to fit. Ctrl/⌘ + scroll zooms; ordinary scrolling moves the page.
+
+Do not crop diagrams with fixed-height, `overflow: hidden` containers or `preserveAspectRatio="slice"`. Keep headings and supporting text outside the SVG, and give the SVG an accessible name. Zoom is a reading aid, not a substitute for short, legible labels. Decorative SVGs marked `aria-hidden="true"` are left alone. If a diagram implements its own interaction, set `data-pan-zoom="off"` on it or an ancestor to opt out. Canvas remains available for custom drawing, but requires its own zoom handling, high-DPI rendering and accessible text alternative.
 
 ## Optional corner radius
 

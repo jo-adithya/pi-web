@@ -1,3 +1,11 @@
+export const swipeDebugEnabled = () => new URLSearchParams(location.search).get("swipeDebug") === "1";
+export function setSwipeDebug(enabled: boolean) {
+  const url = new URL(location.href);
+  if (enabled) url.searchParams.set("swipeDebug", "1"); else url.searchParams.delete("swipeDebug");
+  history.replaceState(history.state, "", url);
+  window.dispatchEvent(new Event("pi-swipe-debug"));
+}
+
 /** Drawer visibility during a gesture or its release animation; progress is clamped to 0–1. */
 export interface SidebarDrag { progress: number; dragging: boolean }
 
@@ -16,7 +24,20 @@ export function listenForSidebarSwipes(
   let start: { id: number; x: number; y: number; open: boolean; width: number; claimed: boolean; progress: number } | undefined;
   let settling: ReturnType<typeof setTimeout> | undefined;
   let suppressClickUntil = 0;
-  const blocked = () => !enabled() || Boolean(document.querySelector("dialog[open], [role='dialog']:not(.sidebar-drawer), [role='alertdialog']"));
+  // Local, opt-in diagnostics for phones without remote devtools. No touch
+  // coordinates, page content, or events are stored or sent anywhere.
+  let badge: HTMLDivElement | null = null;
+  const report = (reason: string) => { if (badge) badge.textContent = `Swipe: ${reason} · scale ${window.visualViewport?.scale ?? 1}`; };
+  const syncBadge = () => {
+    if (!swipeDebugEnabled()) { badge?.remove(); badge = null; return; }
+    if (badge) return;
+    badge = document.createElement("div");
+    badge.style.cssText = "position:fixed;top:12%;left:4px;z-index:2147483647;pointer-events:none;background:#222;color:white;padding:4px;font:14px sans-serif";
+    document.body.append(badge); report("ready");
+  };
+  syncBadge();
+  window.addEventListener("pi-swipe-debug", syncBadge);
+  const blocked = () => !enabled() ? "disabled" : document.querySelector("dialog[open], [role='dialog']:not(.sidebar-drawer), [role='alertdialog']") ? "other dialog" : "";
   const finish = (open: boolean) => {
     const gesture = start; start = undefined;
     if (!gesture?.claimed) return;
@@ -25,18 +46,21 @@ export function listenForSidebarSwipes(
     if (open !== isOpen()) setOpen(open);
     settling = setTimeout(() => { settling = undefined; onDrag(null); }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 180);
   };
-  const cancel = () => finish(isOpen());
+  const cancel = (event?: Event) => { if (start) report(event?.type ?? "gesture rejected"); finish(isOpen()); };
   const begin = (event: TouchEvent) => {
     suppressClickUntil = 0;
     if (start) cancel();
-    if (settling || blocked() || event.touches.length !== 1 || !(event.target instanceof Element)) return;
+    const reason = blocked();
+    if (settling || reason || event.touches.length !== 1 || !(event.target instanceof Element)) { report(reason || "start ignored"); return; }
+    report("outside swipe surface");
     const target = event.target, open = isOpen(), touch = event.touches[0];
     if (!(open ? target.closest(".sidebar-drawer, .sidebar-overlay") : target.closest(".chat-panel"))
       || target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='slider'], [role='menu'], [role='listbox']")) return;
     for (let element: Element | null = target; element; element = element.parentElement) {
       if (element.scrollWidth > element.clientWidth
-        && /^(auto|scroll)$/.test(getComputedStyle(element).overflowX)) return;
+        && /^(auto|scroll)$/.test(getComputedStyle(element).overflowX)) { report("horizontal scroller"); return; }
     }
+    report("tracking");
     const drawer = document.querySelector(".sidebar-drawer");
     const width = drawer?.getBoundingClientRect().width || Math.min(310, window.innerWidth - 3 * parseFloat(getComputedStyle(document.documentElement).fontSize || "16"));
     start = { id: touch.identifier, x: touch.clientX, y: touch.clientY, open, width, claimed: false, progress: open ? 1 : 0 };
@@ -51,6 +75,7 @@ export function listenForSidebarSwipes(
       if (Math.abs(dx) < 10) return;
       if (Math.abs(dx) < Math.abs(dy) * 1.5 || (start.open ? dx >= 0 : dx <= 0)) { cancel(); return; }
       start.claimed = true;
+      report("dragging");
     }
     event.preventDefault();
     start.progress = Math.max(0, Math.min(1, (start.open ? 1 : 0) + dx / start.width));
@@ -60,6 +85,7 @@ export function listenForSidebarSwipes(
     if (!start) return;
     if (blocked() || event.touches.length || isOpen() !== start.open
       || !Array.from(event.changedTouches).some(touch => touch.identifier === start!.id)) { cancel(); return; }
+    report(start.claimed ? "released" : "no horizontal move");
     const enough = start.open ? start.progress <= 0.7 : start.progress >= 0.3;
     finish(enough ? !start.open : start.open);
   };
@@ -76,7 +102,8 @@ export function listenForSidebarSwipes(
   window.addEventListener("resize", cancel);
   window.visualViewport?.addEventListener("resize", cancel);
   return () => {
-    start = undefined; clearTimeout(settling); onDrag(null);
+    window.removeEventListener("pi-swipe-debug", syncBadge);
+    badge?.remove(); start = undefined; clearTimeout(settling); onDrag(null);
     document.removeEventListener("touchstart", begin);
     document.removeEventListener("touchmove", move);
     document.removeEventListener("touchend", end);

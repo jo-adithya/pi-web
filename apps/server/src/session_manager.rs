@@ -27,7 +27,6 @@ const CACHE_BYTES: usize = 512 * 1024;
 pub struct SessionManager(Arc<Inner>);
 struct Inner {
     config: Config,
-    push: Option<crate::push::PushService>,
     registry_store: MetadataStore,
     grouping_changed: watch::Sender<()>,
     response_model: watch::Sender<config::ResponseModel>,
@@ -61,13 +60,6 @@ struct State {
 impl SessionManager {
     /// Adopts legacy metadata in place and opens only the selected record. No Pi file is rewritten.
     pub fn start(config: Config) -> io::Result<Self> {
-        Self::start_with_push(config, None)
-    }
-    /// Starts catalog runtimes with one optional workspace-wide completion mailbox.
-    pub fn start_with_push(
-        config: Config,
-        push: Option<crate::push::PushService>,
-    ) -> io::Result<Self> {
         let registry_store = MetadataStore::open(&config.registry_dir)?;
         let grouping_settings = GroupingSettings::load(&registry_store)?;
         let response_model = config::ResponseModel::load(&registry_store, &config.response_model)?;
@@ -102,6 +94,7 @@ impl SessionManager {
                 options.startup = config.startup.clone();
             }
             let store = Arc::new(MetadataStore::open(&options.state_dir)?);
+            options.author_notes.store(store.load_bounded_document::<bool>("author-notes.json", 32)?.unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
             let catalog = Self::load_catalog(&options, &store)?;
             projects.insert(
                 record.id.clone(),
@@ -122,7 +115,7 @@ impl SessionManager {
             .find(|entry| entry.id == project.catalog.selected)
             .unwrap();
         let owners = Ownership::default();
-        let handle = Self::launch(&project.config, &project.store, entry, owners.clone(), push.clone(), response_model_tx.subscribe())?;
+        let handle = Self::launch(&project.config, &project.store, entry, owners.clone(), response_model_tx.subscribe())?;
         let active = BTreeMap::from([(
             entry.id.clone(),
             Active {
@@ -132,7 +125,6 @@ impl SessionManager {
         )]);
         Ok(Self(Arc::new(Inner {
             config,
-            push,
             registry_store,
             grouping_changed: watch::channel(()).0,
             response_model: response_model_tx,
@@ -224,7 +216,6 @@ impl SessionManager {
         root: &Arc<MetadataStore>,
         entry: &CatalogEntry,
         owners: Ownership,
-        push: Option<crate::push::PushService>,
         response_model: watch::Receiver<config::ResponseModel>,
     ) -> io::Result<SessionHandle> {
         require_available_folder(&config.cwd)?;
@@ -243,7 +234,7 @@ impl SessionManager {
         options
             .session_roots
             .push(config.state_dir.join("sessions"));
-        session::start_owned(options, store, metadata, owners, push, response_model)
+        session::start_owned(options, store, metadata, owners, response_model)
     }
     fn add_record(
         config: &Config,
@@ -319,6 +310,35 @@ impl SessionManager {
             .find(|project| project.catalog.entries.iter().any(|entry| entry.id == id))
             .map(|project| project.config.cwd.clone())
     }
+    /// Serializes review persistence with catalog deletion. The catalog guard stays owned until disk I/O settles.
+    pub(crate) async fn review_notebook(&self, id: String, input: crate::review_notebook::Request) -> Result<crate::review_notebook::Document, (&'static str, u16)> {
+        let state = self.0.state.lock().await;
+        if !valid_id(&id) || state.stopping || state.removing_workspace || state.active.get(&id).is_some_and(|slot| slot.lifecycle != SlotStatus::Open) {
+            return Err(("Session workspace unavailable", 404));
+        }
+        let store = state.projects.values().find(|project| project.catalog.entries.iter().any(|entry| entry.id == id))
+            .map(|project| project.store.clone()).ok_or(("Session workspace not found", 404))?;
+        let result = tokio::task::spawn_blocking(move || crate::review_notebook::transact(&store, &id, input)).await
+            .map_err(|_| ("Review storage worker failed", 500))?;
+        drop(state);
+        result
+    }
+
+    /// Reads or persists the project-wide author-note opt-in, then publishes it to existing runtimes.
+    pub(crate) async fn author_notes(&self, id: &str, enabled: Option<bool>) -> Result<bool, &'static str> {
+        let state = self.0.state.lock().await;
+        if state.stopping || state.removing_workspace { return Err("Workspace unavailable"); }
+        let project = state.projects.values().find(|project| project.catalog.entries.iter().any(|entry| entry.id == id)).ok_or("Session workspace not found")?;
+        if let Some(enabled) = enabled {
+            if enabled && project.config.isolated { return Err("Author notes require an agent with write tools; isolated mode is read-only"); }
+            let store = project.store.clone();
+            tokio::task::spawn_blocking(move || store.save_document("author-notes.json", &enabled)).await
+                .map_err(|_| "Preference worker failed")?.map_err(|_| "Could not save author-note preference")?;
+            project.config.author_notes.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(project.config.author_notes.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Subscribes to successfully persisted global settings changes.
     /// Subscribe before taking a snapshot to avoid missing an intervening update.
     pub fn grouping_changes(&self) -> watch::Receiver<()> {
@@ -622,6 +642,7 @@ impl SessionManager {
                         .config
                         .for_project(cwd.clone(), self.0.config.additional_state_dir(&cwd));
                     let store = Arc::new(MetadataStore::open(&options.state_dir)?);
+                    options.author_notes.store(store.load_bounded_document::<bool>("author-notes.json", 32)?.unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
                     let catalog = Self::load_catalog(&options, &store)?;
                     let mut next = state.registry.clone();
                     next.entries.push(WorkspaceRecord {
@@ -660,7 +681,6 @@ impl SessionManager {
                         &project.store,
                         entry,
                         self.0.owners.clone(),
-                        self.0.push.clone(),
                         self.0.response_model.subscribe(),
                     ) {
                         Ok(handle) => {
@@ -735,7 +755,6 @@ impl SessionManager {
                     &project.store,
                     entry,
                     self.0.owners.clone(),
-                    self.0.push.clone(),
                     self.0.response_model.subscribe(),
                 ) {
                     Ok(handle) => {
@@ -795,7 +814,6 @@ impl SessionManager {
                         &project.store,
                         entry,
                         self.0.owners.clone(),
-                        self.0.push.clone(),
                         self.0.response_model.subscribe(),
                     ) {
                         Ok(handle) => {
@@ -902,6 +920,11 @@ impl SessionManager {
                 };
                 if !cleaned {
                     return Self::reply(&state, id, false, "presentation_delete_failed");
+                }
+                let store = project.store.clone();
+                let review_name = format!("{session_id}.json");
+                if !matches!(tokio::task::spawn_blocking(move || store.child("reviews")?.remove_record(&review_name)).await, Ok(Ok(()))) {
+                    return Self::reply(&state, id, false, "review_delete_failed");
                 }
                 if Self::forget_record(project, session_id).is_err() {
                     let code = if removed {

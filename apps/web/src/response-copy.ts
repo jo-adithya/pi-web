@@ -1,18 +1,28 @@
-import type { ResponseCard, SimpleResponse } from "./generated/protocol";
-import { canvasBlocks, rankedFindings } from "./response-plan";
+import type { CanvasNode, ResponseCard, SimpleResponse } from "./generated/protocol";
+import { fitsMarkdownTableCell } from "./markdown";
+import { annotationLabels, canvasBlocks, checkLabels, rankedChecks, rankedFindings } from "./response-plan";
 
 /** Escapes table delimiters while preserving existing inline Markdown escapes. */
 function tableCell(value: string): string {
-  return value.replace(/(\\*)\|/g, (_pipe, slashes: string) => `${slashes}${slashes.length % 2 ? "" : "\\"}|`).replace(/\r\n?|\n/g, " ");
+  return value.replace(/(\\*)\|/g, (_pipe, slashes: string) => `${slashes}${slashes.length % 2 ? "" : "\\"}|`);
 }
 
 /** Copies the displayed reading order, including graph relationships, uncertainty,
  * recorded provenance and collapsed details. Original replies use their own copy path. */
 export function responseText(response: SimpleResponse): string {
-  const prefix = response.canvas && response.canvas.headline.trim() !== response.summary.trim() ? [response.canvas.headline, response.summary] : [response.summary];
+  const headline = response.canvas?.headline?.trim();
+  const prefix = [headline !== response.summary.trim() ? headline : undefined, response.summary].filter((s): s is string => !!s?.trim());
   const errors = response.recorded?.tools.filter(tool => tool.outcome === "error").length ?? 0;
   if (errors) prefix.push(`${errors} tool ${errors === 1 ? "error" : "errors"} during work. May include recovered errors; this is not a final test verdict.`);
-  return [...prefix, ...canvasBlocks(response).map(({ card }) => blockText(card, response))].join("\n\n");
+  const composition = response.canvas?.composition;
+  const body = composition ? compositionText(composition, response) : canvasBlocks(response).map(({ card }) => blockText(card, response));
+  return [...prefix, ...body].join("\n\n");
+}
+/** Keeps visible group headings and collapsed content in copied reading order. */
+function compositionText(node: CanvasNode, response: SimpleResponse): string[] {
+  if (node.type === "block") return [blockText(response.blocks[node.index], response)];
+  if (node.type === "comparison_panels") return [node.left, node.right].flatMap(side => [side.title, ...side.blocks.map(i => blockText(response.blocks[i], response))]);
+  return [...(node.type === "section" ? [node.title] : []), ...node.children.flatMap(child => compositionText(child, response))];
 }
 function blockText(card: ResponseCard, response: SimpleResponse): string {
   const reported = ["checks", "facts", "diagram", "chart", "timeline", "findings"].includes(card.type);
@@ -28,6 +38,13 @@ function blockText(card: ResponseCard, response: SimpleResponse): string {
       break;
     }
     case "table": {
+      if (card.columns.some(column => /[\r\n]/.test(column)) || card.rows.some(row => row.some(cell => !fitsMarkdownTableCell(cell)))) {
+        // Scope each cell so even an unclosed fence cannot absorb another cell when pasted.
+        const rows = card.rows.flatMap((row, index) => [`Row ${index + 1}`, ...row.flatMap((cell, column) => [
+          `${card.columns[column]}:`, cell.split(/\r\n?|\n/).map(line => `> ${line}`).join("\n"),
+        ])]);
+        return [title, ...rows].join("\n\n");
+      }
       const row = (cells: string[]) => `| ${cells.map(tableCell).join(" | ")} |`;
       text = [row(card.columns), row(card.columns.map(() => "---")), ...card.rows.map(row)].join("\n"); break;
     }
@@ -52,9 +69,15 @@ function blockText(card: ResponseCard, response: SimpleResponse): string {
       break;
     }
     case "facts": text = card.items.map(item => `${item.label}: ${item.value}`).join("\n"); break;
-    case "comparison": text = `Before: ${card.before}\nAfter: ${card.after}`; break;
+    case "comparison": {
+      const { left, right } = card;
+      return [title, `${left.title}:`, left.text, `${right.title}:`, right.text].join("\n\n");
+    }
+    case "path": return [card.status ? `${title} (${card.status})` : title, ...card.groups.map(group => [group.label,
+      ...group.steps.map((step, i) => `${i + 1}. ${step.text}${step.annotation ? ` — ${annotationLabels[step.annotation.kind]}: ${step.annotation.text}` : ""}`),
+    ].join("\n"))].join("\n\n");
     case "flow": text = card.items.join(" → "); break;
-    case "checks": text = card.items.map(item => `${item.status[0].toUpperCase()}${item.status.slice(1)}: ${item.text}`).join("\n"); break;
+    case "checks": text = rankedChecks(card.items).map(item => `${checkLabels[item.status]}: ${item.text}`).join("\n"); break;
     case "checklist": case "steps": text = card.items.map((item, index) => card.type === "steps" ? `${index + 1}. ${item}` : `• ${item}`).join("\n"); break;
     default: text = card.text;
   }

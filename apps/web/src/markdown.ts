@@ -54,17 +54,19 @@ parser.renderer.rules.code_inline = (tokens, index) => {
 // Never automatically fetch an agent-supplied remote image or render inline SVG.
 parser.renderer.rules.image = () => '<span class="image-omitted">[Image omitted]</span>';
 
+const MARKDOWN_PARSE_LIMIT = 65_536;
+
 export type MarkdownPart = { kind: "markdown"; html: string } | { kind: "artifact"; source: string };
 
-/** Splits completed top-level `html preview` fences from bounded safe Markdown.
- * Unclosed fences remain code; callers decide whether the message may contain artifacts.
+/** Splits completed top-level `html preview` fences. Unclosed fences remain code;
+ * text over the parsing budget stays complete and plain, with no preview.
  */
 export function renderMarkdownParts(text: string): MarkdownPart[] {
-  const bounded = text.slice(0, 65_536);
+  if (text.length > MARKDOWN_PARSE_LIMIT) return [{ kind: "markdown", html: renderMarkdown(text) }];
   const environment = {};
-  const tokens = parser.parse(bounded, environment);
+  const tokens = parser.parse(text, environment);
   // Match the parser's line maps for LF, CRLF, and lone CR input.
-  const lines = bounded.split(/\r\n?|\n/);
+  const lines = text.split(/\r\n?|\n/);
   const parts: MarkdownPart[] = [];
   let start = 0;
   for (let index = 0; index < tokens.length; index++) {
@@ -81,9 +83,20 @@ export function renderMarkdownParts(text: string): MarkdownPart[] {
   return parts;
 }
 
-/** Renders a completed, bounded message using this module's fixed safe Markdown policy.
- * Streaming callers must render plain text instead. No plugins or raw HTML are enabled.
+/** Renders safe Markdown up to the parsing budget, or the complete text literally.
+ * List items can opt into emphasis on an existing short, plain-text lead-in.
  */
-export function renderMarkdown(text: string): string {
-  return parser.render(text.slice(0, 65_536));
+export function renderMarkdown(text: string, emphasizeLeadIn = false): string {
+  if (text.length > MARKDOWN_PARSE_LIMIT) return `<div class="markdown-plain-text">${parser.utils.escapeHtml(text)}</div>`;
+  return parser.render(emphasizeLeadIn
+    ? text.replace(/^(\p{L}[\p{L}\p{M}\p{N} '’-]{0,39}:)(?=[ \t]+\S)/u, "**$1**")
+    : text);
+}
+
+/** Pipe tables can carry one inline paragraph per cell, but not Markdown blocks. */
+export function fitsMarkdownTableCell(text: string): boolean {
+  if (text.length > MARKDOWN_PARSE_LIMIT || /[\r\n]/.test(text)) return false;
+  // The block parser distinguishes even one-line lists, quotes and code from prose.
+  const tokens = parser.parse(text, {});
+  return tokens.length === 3 && tokens[0].type === "paragraph_open";
 }

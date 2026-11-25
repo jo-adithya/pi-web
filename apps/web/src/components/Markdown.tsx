@@ -3,13 +3,13 @@ import { Portal } from "@solidjs/web";
 import { CopyButton } from "./CopyButton";
 import { renderMarkdown, renderMarkdownParts } from "../markdown";
 import { HtmlArtifact } from "./HtmlArtifact";
-import { codeReference, type CodeLocation } from "../code-reference";
+import { codeReference, type OpenCodeReference } from "../code-reference";
 
 /** Streams plain text; parses/highlights only the authoritative completed block. */
-export function Markdown(props: { text: string; complete: boolean; allowArtifacts?: boolean; openCode?: (location: CodeLocation) => void }) {
+export function Markdown(props: { text: string; complete: boolean; allowArtifacts?: boolean; emphasizeLeadIn?: boolean; openCode?: OpenCodeReference }) {
   const parts = createMemo(() => !props.complete ? [] : props.allowArtifacts
     ? renderMarkdownParts(props.text)
-    : [{ kind: "markdown" as const, html: renderMarkdown(props.text) }]);
+    : [{ kind: "markdown" as const, html: renderMarkdown(props.text, props.emphasizeLeadIn) }]);
   return (
     <Show when={props.complete} fallback={<pre class="streaming-text">{props.text}</pre>}>
       <For each={parts()}>{part => part.kind === "artifact"
@@ -20,7 +20,7 @@ export function Markdown(props: { text: string; complete: boolean; allowArtifact
 }
 
 /** Adds app-owned copy controls to completed Markdown, including nested code fences. */
-function MarkdownContent(props: { html: string; openCode?: (location: CodeLocation) => void }) {
+function MarkdownContent(props: { html: string; openCode?: OpenCodeReference }) {
   let root!: HTMLDivElement;
   const [blocks, setBlocks] = createSignal<{ mount: HTMLDivElement; text: string }[]>([]);
   onSettled(() => {
@@ -36,6 +36,6 @@ function MarkdownContent(props: { html: string; openCode?: (location: CodeLocati
     if (!target) return;
     event.preventDefault();
     const location = codeReference(target.dataset.codeReference ?? "");
-    if (location) props.openCode?.(location);
+    if (location) props.openCode?.(location, target);
   }} /><For each={blocks()}>{block => <Portal mount={block.mount}><CopyButton label="Copy code" text={() => block.text} /></Portal>}</For></>;
 }

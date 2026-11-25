@@ -29,14 +29,21 @@ async fn next_frame(slots: &mut [Attached], cursor: &mut usize) -> (String, Opti
     })
     .await
 }
+const WRITE_DEADLINE: Duration = Duration::from_secs(2);
+
 async fn send(
     writer: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: Message,
 ) -> bool {
-    matches!(
-        tokio::time::timeout(Duration::from_secs(2), writer.send(message)).await,
-        Ok(Ok(()))
-    )
+    send_before(writer, message, tokio::time::Instant::now() + WRITE_DEADLINE).await
+}
+
+async fn send_before(
+    writer: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+    deadline: tokio::time::Instant,
+) -> bool {
+    matches!(tokio::time::timeout_at(deadline, writer.send(message)).await, Ok(Ok(())))
 }
 async fn send_catalog(
     writer: &mut futures_util::stream::SplitSink<WebSocket, Message>,
@@ -114,7 +121,7 @@ async fn prune_deleted(slots: &mut Vec<Attached>, catalog: &WorkspaceReply, clie
     }
 }
 
-pub(super) async fn socket_loop(socket: WebSocket, mut state: WebState) {
+pub(super) async fn socket_loop(socket: WebSocket, mut state: WebState, reply_timing: bool) {
     let Ok(id) = config::identity() else {
         return;
     };
@@ -156,8 +163,21 @@ pub(super) async fn socket_loop(socket: WebSocket, mut state: WebState) {
             output = next_frame(&mut slots, &mut cursor), if !slots.is_empty() => {
                 let (session_id, frame) = output;
                 if let Some(frame) = frame {
-                    if !send(&mut writer, Message::Text(frame.text.clone().into())).await { break; }
-                    // `frame` holds the session permit through completion of the network write.
+                    let message = Message::Text(frame.text.into());
+                    let started = tokio::time::Instant::now();
+                    let deadline = started + WRITE_DEADLINE;
+                    if !send_before(&mut writer, message, deadline).await { break; }
+                    // The remaining frame fields hold the permit through the data write.
+                    // A timing report never extends the budget for a slow socket.
+                    if reply_timing && tokio::time::Instant::now() < deadline && let Some(delivery) = frame.delivery {
+                        let ms = |duration: Duration| duration.as_millis().min(u32::MAX.into()) as u32;
+                        let report = crate::protocol::ServerMessage { v: 1, session_id, epoch: delivery.epoch,
+                            body: crate::protocol::ServerBody::ResponseDelivery {
+                                seq: delivery.seq, queue_ms: ms(started.duration_since(delivery.queued)), send_ms: ms(started.elapsed()),
+                            },
+                        };
+                        if !send_before(&mut writer, Message::Text(serde_json::to_string(&report).unwrap().into()), deadline).await { break; }
+                    }
                 } else if let Some(index) = slots.iter().position(|slot| slot.id == session_id) {
                     let slot = slots.remove(index); slot.handle.disconnect(id.clone()).await;
                     // An active receiver disappearing means overload/detachment, not a transcript stop.

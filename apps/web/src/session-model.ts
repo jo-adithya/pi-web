@@ -4,6 +4,7 @@ import { imageRequest, prepareImage, IMAGE_BYTES, type Attachment } from "./imag
 import { loadSource, searchWorkspaceFiles } from "./workspace-files";
 import { createLocalReview, fetchReview, type ReviewLoadRequest, type ReviewFile } from "./local-review";
 import { createReviewCards, type ReviewCard } from "./review-cards";
+import { createReviewNotebook } from "./review-notebook";
 import { fetchStructuralReview } from "./structural-review";
 import { fetchContextReview } from "./context-review";
 import { fetchCommits } from "./commit-review";
@@ -61,6 +62,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     return snapshot.files[0] as ReviewFile; // Selected-path responses are validated by fetchReview.
   };
   const [state, setState] = createStore(initialState());
+  const notebook = createReviewNotebook(id, capability, review, () => state.settings.model ? { provider: state.settings.model.provider, id: state.settings.model.id } : undefined);
   const [historyPage, setHistoryPage] = createSignal<{ cursor: string; older: string | null; trail: string[]; index: number }>();
   const [historyBusy, setHistoryBusy] = createSignal(false);
   const [newReplies, setNewReplies] = createSignal(false);
@@ -86,6 +88,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   function clearQuote(): void { setQuote(undefined); }
   const [settingsPending, setSettingsPending] = createSignal(false);
   let settingsRequest: string | undefined; let completedRun = 0n;
+  const awaitingReply = new Map<string, RunOutcome>();
   const [pending, setPending] = createSignal(false); const [stick, setStick] = createSignal(true);
   const [noticeDismissed, setNoticeDismissed] = createSignal(false);
   const visibleNotice = () => notice() || (noticeDismissed() ? null : state.status.notice);
@@ -128,7 +131,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     if (!historyPage()) { setNewReplies(false); return true; }
     if (!send({ type: "attach" })) { setNotice("Reconnect before returning to the latest replies."); return false; }
     setHistoryPage(undefined); setNewReplies(false); setStick(true);
-    setState(value => { value.messages = {}; value.order = []; value.older = false; value.canvasReadyId = null; });
+    setState(value => { value.messages = {}; value.order = []; value.older = false; value.canvasReadyId = null; value.replyArrivals = {}; });
     return true;
   }
   /** Loads one replacement page; breadcrumbs retain only SDK cursor strings, not messages. */
@@ -155,7 +158,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
       const trail = previous ? previous.trail.slice() : [page.latestCursor];
       trail[index] = page.cursor;
       setHistoryPage({ cursor: page.cursor, older: page.olderCursor, trail, index }); setStick(false);
-      setState(value => { value.messages = Object.fromEntries(page.messages.map(message => [message.id, message])); value.order = page.messages.map(message => message.id); value.older = page.olderCursor !== null; value.canvasReadyId = null; });
+      setState(value => { value.messages = Object.fromEntries(page.messages.map(message => [message.id, message])); value.order = page.messages.map(message => message.id); value.older = page.olderCursor !== null; value.canvasReadyId = null; value.replyArrivals = {}; });
     } catch (error) {
       if (!controller.signal.aborted && !disposed && version === historyVersion) {
         if (!previous) setNewReplies(false);
@@ -196,7 +199,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   }
   /** Releases previews; confirmed deletion also discards this conversation’s saved unsent work. */
   function dispose(discardDraft = false) {
-    disposed = true; historyRead?.abort(); historyVersion++; review.cancel(); for (const image of attachments()) removeImage(image.id);
+    disposed = true; historyRead?.abort(); historyVersion++; review.cancel(); notebook.dispose(); for (const image of attachments()) removeImage(image.id);
     if (discardDraft) { prompt = undefined; promptUncertain = feedbackUncertain = false; setDraft(""); setQuote(undefined); setFeedback([]); }
     flush(); stopSaving(); setQuote(undefined);
     if (discardDraft) { savePromptDraft(id, { text: "", uncertain: false }); saveFeedbackDraft(id, { notes: [], uncertain: false }); }
@@ -226,6 +229,7 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
   }
   function preserveReviewQuestion(text: string) { setDraft(previous => previous ? `${previous}\n\n${text}` : text); }
   function disconnected() {
+    awaitingReply.clear();
     historyRead?.abort(); historyVersion++; setHistoryBusy(false);
     setState(value => { value.synced = false; value.dialogs = []; });
     const interrupted = prompt; prompt = undefined;
@@ -242,31 +246,48 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
     setState(value => { Object.assign(value, initialState()); value.status.process = "exited"; });
   }
   /** Returns whether this runtime incarnation accepted the frame for workspace bookkeeping. */
-  function receive(message: ServerMessage): boolean {
+  function receive(message: ServerMessage, receivedAt?: number): boolean {
     if (message.sessionId !== id) return false;
     if (message.body.type === "hello") {
       if (attachmentNotice) { setNotice(""); attachmentNotice = false; }
       if (message.epoch !== epoch) {
         historyRead?.abort(); historyVersion++; setHistoryBusy(false); setHistoryPage(undefined); setNewReplies(false);
         setState(value => { value.messages = {}; value.order = []; });
-        if (prompt || settingsRequest) disconnected(); completedRun = 0n; setStick(true);
+        if (prompt || settingsRequest) disconnected(); completedRun = 0n; awaitingReply.clear(); setStick(true);
       }
       epoch = message.epoch;
     }
     const applied: { action: ReturnType<typeof applyServer>; noticeChanged: boolean; live: boolean } = { action: "ignore", noticeChanged: false, live: false };
     setState(value => {
       const previousNotice = value.status.notice; const previousEpoch = value.epoch;
-      applied.action = applyServer(value, message, !!historyPage());
+      applied.action = applyServer(value, message, !!historyPage(), receivedAt);
       applied.noticeChanged = value.status.notice !== previousNotice || value.epoch !== previousEpoch;
       applied.live = applied.action === "applied" && value.synced;
     });
     if ((historyPage() || historyBusy()) && applied.action === "applied" && message.body.type === "event" && message.body.patches.some(patch => patch.kind === "message" || patch.kind === "delta")) setNewReplies(true);
     if (applied.noticeChanged) setNoticeDismissed(false);
-    if (applied.action === "resync") send({ type: "attach" });
+    if (applied.action === "resync") { awaitingReply.clear(); send({ type: "attach" }); }
     if (message.epoch !== epoch) return false;
     if (message.body.type === "run_completed" && applied.live && connected()) {
       const run = BigInt(message.body.runId);
-      if (run > completedRun) { completedRun = run; completed?.(id, message.body.outcome); }
+      if (run > completedRun) {
+        completedRun = run;
+        const { waitForMessageId, outcome } = message.body;
+        if (waitForMessageId && outcome !== "aborted") awaitingReply.set(waitForMessageId, outcome);
+        else completed?.(id, outcome);
+        void notebook.collectAuthorNotes(`${message.epoch}:${message.body.runId}`);
+      }
+    }
+    if (message.body.type === "event" && applied.live && connected() && awaitingReply.size) {
+      for (const patch of message.body.patches) {
+        if (patch.kind !== "message") continue;
+        const status = patch.message.presentation?.state;
+        const outcome = awaitingReply.get(patch.message.id);
+        if (outcome && (status === "ready" || status === "unsaved" || status === "error")) {
+          awaitingReply.delete(patch.message.id);
+          completed?.(id, status === "error" ? "error" : outcome);
+        }
+      }
     }
     if (message.body.type === "error") {
       attachmentNotice = !prompt;
@@ -290,10 +311,10 @@ export function createSessionModel(id: string, transport: (message: BrowserMessa
         setPending(false);
       }
       if (result.recoveredDraft) setDraft(previous => previous ? `${previous}\n\n${result.recoveredDraft}` : result.recoveredDraft!);
-      if (!result.ok) setNotice(`Command not completed: ${result.code.replaceAll("_", " ")}. Your draft was kept.`);
+      if (!result.ok) setNotice(result.code === "response_save_failed" ? "The summary still could not be saved. Copy it or retry saving after checking disk space and permissions." : `Command not completed: ${result.code.replaceAll("_", " ")}. Your draft was kept.`);
     }
     return true;
   }
-  return { id, dispose, historyPage, historyBusy, newReplies, navigateHistory, latestHistory, loadOriginal, loadSource: (path: string, line: number, signal: AbortSignal) => loadSource(id, path, line, signal, capability()), feedback, addFeedback, editFeedback, removeFeedback, submitFeedback, codeLocation, openCode, review, reviewCards, loadReviewPreview, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, canSteer, send, submit, submitReview, receive, disconnected, stopped, scroll: 0, reviewPosition: { filter: "", needsReview: false, groupKey: "", view: "files" as "files" | "overview", scroll: 0, identity: "" } };
+  return { id, dispose, historyPage, historyBusy, newReplies, navigateHistory, latestHistory, loadOriginal, loadSource: (path: string, line: number, signal: AbortSignal) => loadSource(id, path, line, signal, capability()), feedback, addFeedback, editFeedback, removeFeedback, submitFeedback, codeLocation, openCode, review, notebook, reviewCards, loadReviewPreview, attachments, uploading, addImages, removeImage, loadImage, searchFiles: (query: string, signal: AbortSignal) => searchWorkspaceFiles(id, query, signal, capability()), state, draft, setDraft, quote, quoteReply, clearQuote, notice, setNotice, visibleNotice, dismissNotice, pending, settingsPending, canConfigure, setModel, setThinkingLevel, stick, setStick, online, canSend, canSteer, send, submit, submitReview, receive, disconnected, stopped, scroll: 0, reviewPosition: { filter: "", needsReview: false, groupKey: "", view: "files" as "files" | "overview", scroll: 0, identity: "" } };
 }
 export type SessionModel = ReturnType<typeof createSessionModel>;

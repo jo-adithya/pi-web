@@ -21,6 +21,17 @@ it("reveals all assistant replies for this query in Original without mixing prom
   expect(original.getByText("Final result: ready.")).toBeTruthy();
   for (const text of ["Previous query answer", "The user prompt", "Tool output", "PRIVATE_THINKING"]) expect(original.queryByText(text)).toBeNull();
 });
+it("keeps an unsaved summary readable and retries only storage", () => {
+  const state = initialState(); state.order = ["reply"];
+  state.messages.reply = { id: "reply", role: "assistant", complete: true, truncated: false, error: null, blocks: [{ kind: "text", text: "Original." }], presentation: { state: "unsaved", response: { summary: "Not deployed.", blocks: [] } } };
+  const retry = vi.fn(), save = vi.fn();
+  const view = render(() => <MessageList state={state} retryResponse={retry} saveResponse={save} />); flush();
+  expect(view.getByText("Not deployed.")).toBeTruthy();
+  fireEvent.click(view.getByRole("button", { name: "Retry saving" }));
+  expect(save).toHaveBeenCalledWith("reply"); expect(retry).not.toHaveBeenCalled();
+  fireEvent.click(view.getByRole("button", { name: "View original" })); flush();
+  expect(view.getByText("Original.")).toBeTruthy();
+});
 it("hides the original response and copy action while a simple response is being prepared", () => {
   const state = initialState(); state.order = ["reply"];
   state.messages.reply = Object.assign({ id: "reply", role: "assistant", complete: false, truncated: false, error: null,
@@ -95,12 +106,19 @@ it("uses quiet original/back links instead of a repeated view switch", async () 
   expect(view.container.querySelector("script")).toBeNull();
   expect(view.queryByText("Original technical answer")).toBeNull();
   expect(view.queryByRole("button", { name: "Copy answer" })).toBeNull();
-  expect(view.getByRole("button", { name: "Copy simple answer" })).toBeTruthy();
+  const toggle = view.getByRole("button", { name: "View original" });
+  const footer = toggle.closest("footer");
+  expect(footer?.previousElementSibling).toBe(view.getByRole("region", { name: "Simple answer" }));
+  expect(footer?.contains(view.getByRole("button", { name: "Copy simple answer" }))).toBe(true);
+  expect(footer?.contains(view.getByRole("button", { name: "About response timing" }))).toBe(true);
+  toggle.focus();
   expect(view.queryByRole("group", { name: "Answer view" })).toBeNull();
   expect(view.queryByRole("button", { name: /^Simple$/ })).toBeNull();
   expect(view.queryByText("The short version, in plain words.")).toBeNull();
-  await fireEvent.click(view.getByRole("button", { name: "View original" })); flush();
+  await fireEvent.click(toggle); flush();
   expect(view.getByText("Original technical answer")).toBeTruthy();
+  expect(view.getByRole("button", { name: "Back to simple" })).toBe(toggle);
+  expect(document.activeElement).toBe(toggle);
   expect(view.queryByText("I fixed login.")).toBeNull();
   expect(view.queryByRole("heading", { name: "Changes" })).toBeNull();
   expect(view.getByRole("button", { name: "Back to simple" })).toBeTruthy();
@@ -128,10 +146,10 @@ it("supports safe Markdown in simple summaries, notes and list items without HTM
   const location = view.getByRole("link", { name: "src/auth.ts:4" });
   expect(location.querySelector("code")).not.toBeNull();
   await fireEvent.click(location);
-  expect(openCode).toHaveBeenCalledWith({ path: "src/auth.ts", line: 4, endLine: 4 });
+  expect(openCode).toHaveBeenCalledWith({ path: "src/auth.ts", line: 4, endLine: 4 }, location);
 });
 
-it("shows formatting failures and source warnings without exposing the original", async () => {
+it("automatically shows the original with the formatter failure and retry action", async () => {
   const retry = vi.fn();
   const state = initialState(); state.order = ["reply"];
   state.messages.reply = { id: "reply", role: "assistant", complete: true, truncated: false, error: "Agent warning",
@@ -139,20 +157,17 @@ it("shows formatting failures and source warnings without exposing the original"
   const view = render(() => <MessageList state={state} retryResponse={retry} />); flush();
   expect(view.getByRole("alert").textContent).toContain("Could not simplify.");
   expect(view.getByText("Agent warning")).toBeTruthy();
-  expect(view.queryByText("Original answer")).toBeNull();
+  expect(view.getByText("Original answer")).toBeTruthy();
+  expect(view.queryByRole("button", { name: "View original" })).toBeNull();
   await fireEvent.click(view.getByRole("button", { name: "Retry simple response" }));
   expect(retry).toHaveBeenCalledWith("reply");
-  await fireEvent.click(view.getByRole("button", { name: "View original" })); flush();
-  expect(view.getByText("Original answer")).toBeTruthy();
-  expect(view.queryByRole("button", { name: "Retry simple response" })).toBeNull();
 });
 it("keeps the interrupted original accessible when no simple answer can be made", async () => {
   const state = initialState(); state.order = ["reply"];
   state.messages.reply = { id: "reply", role: "assistant", complete: false, truncated: false, error: null,
     blocks: [{ kind: "text", text: "Partial original" }], presentation: { state: "error", message: "This run was cancelled.", retryable: false } };
   const view = render(() => <MessageList state={state} retryResponse={vi.fn()} />); flush();
-  expect((view.getByRole("button", { name: "View original" }) as HTMLButtonElement).disabled).toBe(false);
-  await fireEvent.click(view.getByRole("button", { name: "View original" })); flush();
+  expect(view.getByRole("region", { name: "Original answer" })).toBeTruthy();
   expect(view.getByText("Partial original")).toBeTruthy();
   expect(view.getByText(/stopped before it finished/)).toBeTruthy();
   expect(view.queryByRole("button", { name: "Retry simple response" })).toBeNull();
@@ -168,7 +183,7 @@ it("waits through intermediate messages and shows one final answer per query", (
   expect(view.queryByText("Technical progress")).toBeNull();
   setState(draft => { draft.messages.final.presentation = { state: "pending" }; }); flush();
   expect(view.container.querySelectorAll("article.assistant")).toHaveLength(1);
-  expect(view.getByText(/Preparing your answer/)).toBeTruthy();
+  expect(view.getByRole("status").textContent).toBe("Pi finished. Simplifying…");
   setState(draft => { draft.messages.final.presentation = { state: "ready", response: { summary: "Login is fixed.", blocks: [] } }; }); flush();
   expect(view.container.querySelectorAll("article.assistant")).toHaveLength(1);
   expect(view.getByText("Login is fixed.")).toBeTruthy();

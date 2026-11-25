@@ -11,11 +11,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", config::HELP);
         return Ok(());
     };
-    if config.revoke_push {
-        pi_web::push::revoke_all(&config.registry_dir.join("push"))?;
-        println!("All phone push subscriptions revoked.");
-        return Ok(());
-    }
     if !config.web_dir.join("index.html").is_file() {
         return Err("frontend build missing; run bun run build first".into());
     }
@@ -28,11 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || format!("http://127.0.0.1:{port}"),
         |origin| origin.as_str().to_owned(),
     );
-    let push = pi_web::push::PushService::start(
-        &config.registry_dir.join("push"),
-        browser_origin.clone(),
-    )?;
-    let runtime = SessionManager::start_with_push(config.clone(), Some(push.clone()))?;
+    let runtime = SessionManager::start(config.clone())?;
     let state = WebState::new(
         runtime.clone(),
         port,
@@ -40,8 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         capability.clone(),
         config.web_dir,
         stopping.clone(),
-    )
-    .with_push(push);
+    );
     // The secret is only in the fragment: browsers never transmit it in request URLs.
     println!("Open {browser_origin}/#cap={capability}");
     let signal = tokio::spawn(async move {

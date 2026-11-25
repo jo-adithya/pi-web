@@ -131,6 +131,15 @@ impl MetadataStore {
         serde_json::from_reader(BufReader::new(file)).map(Some).map_err(invalid)
     }
 
+    /// Reads a private document within the caller's byte budget before decoding JSON.
+    pub(crate) fn load_bounded_document<T: serde::de::DeserializeOwned>(&self, name: &str, limit: usize) -> io::Result<Option<T>> {
+        let Some(file) = self.record_file(name)? else { return Ok(None); };
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit { return Err(invalid("document exceeds size limit")); }
+        serde_json::from_slice(&bytes).map(Some).map_err(invalid)
+    }
+
     fn record_file(&self, name: &str) -> io::Result<Option<File>> {
         let file = match read_regular(&self.root.join(name)) {
             Ok(file) => file,

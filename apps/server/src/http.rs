@@ -8,7 +8,7 @@ use axum::{
         Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -25,6 +25,7 @@ use tokio::sync::{Semaphore, watch};
 mod listener;
 mod history;
 mod multiplex;
+mod notebook;
 pub use listener::BoundedListener;
 
 const SOCKET_PROTOCOL: &str = "pi-web.v1";
@@ -41,8 +42,6 @@ pub struct WebState {
     pub stopping: watch::Receiver<bool>,
     slots: Arc<Semaphore>,
     assets: Arc<Semaphore>,
-    push: Option<crate::push::PushService>,
-    push_slots: Arc<Semaphore>,
     image_slots: Arc<Semaphore>,
     file_slots: Arc<Semaphore>,
     review_slots: Arc<Semaphore>,
@@ -85,8 +84,6 @@ impl WebState {
             stopping,
             slots: Arc::new(Semaphore::new(8)),
             assets: Arc::new(Semaphore::new(8)),
-            push: None,
-            push_slots: Arc::new(Semaphore::new(4)),
             image_slots: Arc::new(Semaphore::new(2)),
             file_slots: Arc::new(Semaphore::new(2)),
             review_slots: Arc::new(Semaphore::new(2)),
@@ -99,11 +96,6 @@ impl WebState {
                 crate::structural_review::Cache::default(),
             )),
         }
-    }
-    /// Enables explicitly opted-in phone delivery through the server-owned worker.
-    pub fn with_push(mut self, push: crate::push::PushService) -> Self {
-        self.push = Some(push);
-        self
     }
     /// Validates an explicit origin-scoped proof before upgrading or admitting a client.
     /// Inspect raw headers: Axum's parsed protocol set removes duplicate values.
@@ -143,8 +135,6 @@ pub fn router(state: WebState) -> Router {
         .route("/assets/{*path}", get(asset))
         .route("/artifact-preview", get(artifact_preview))
         .route("/auth", post(auth))
-        .route("/sw.js", get(service_worker))
-        .route("/push", post(push_request))
         .route("/history/{session}", post(history::read))
         .route("/files/{session}", post(workspace_files))
         .route("/files/{session}/source", post(workspace_source))
@@ -154,6 +144,8 @@ pub fn router(state: WebState) -> Router {
         .route("/review/{session}/commits", post(commit_review))
         .route("/review/{session}/branches", post(branch_review))
         .route("/review/{session}/groups", post(group_review))
+        .route("/review/{session}/notebook", post(notebook::review_notebook))
+        .route("/review/{session}/source", post(notebook::review_source))
         .route("/images/{session}", post(upload_image))
         .route("/images/{session}/{id}", post(load_image))
         .route("/ws", get(upgrade))
@@ -171,7 +163,7 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
     let origins = request.headers().get_all(header::ORIGIN);
     let valid_origin =
         origins.iter().count() <= 1 && origins.iter().all(|origin| origin == state.origin.as_str());
-    let stateful = matches!(request.uri().path(), "/auth" | "/ws" | "/push")
+    let stateful = matches!(request.uri().path(), "/auth" | "/ws")
         || request.uri().path().starts_with("/history/")
         || request.uri().path().starts_with("/images/")
         || request.uri().path().starts_with("/files/")
@@ -216,7 +208,7 @@ async fn boundary(State(state): State<WebState>, request: Request<Body>, next: N
     if artifact {
         headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'; script-src-attr 'none'; connect-src 'none'; frame-src 'none'; style-src 'unsafe-inline'; img-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts;"));
     } else {
-        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; worker-src 'self'; manifest-src 'self'; style-src 'self'; connect-src 'self' {}; img-src 'self' blob:; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", state.socket_origin)).unwrap());
+        headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&format!("default-src 'none'; script-src 'self'; worker-src 'none'; manifest-src 'self'; style-src 'self'; connect-src 'self' {}; img-src 'self' blob:; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", state.socket_origin)).unwrap());
     }
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -269,54 +261,6 @@ async fn auth(State(state): State<WebState>, request: Request<Body>) -> Response
     }
     // Cookies cross loopback ports. Verification grants no ambient browser authority.
     StatusCode::NO_CONTENT.into_response()
-}
-/// Fixed worker path shares static-file bounds, no-store headers and same-origin policy.
-async fn service_worker(State(state): State<WebState>) -> Response {
-    static_file(&state, "sw.js".into()).await
-}
-async fn push_request(State(state): State<WebState>, request: Request<Body>) -> Response {
-    let proofs = request.headers().get_all("x-pi-capability");
-    if proofs.iter().count() != 1
-        || !proofs
-            .iter()
-            .next()
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|proof| secret_equal(proof, &state.capability))
-    {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .is_none_or(|v| v != "application/json")
-    {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
-    }
-    let Ok(_permit) = state.push_slots.try_acquire() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    };
-    let body =
-        match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 4096))
-            .await
-        {
-            Ok(Ok(body)) => body,
-            Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
-        };
-    let Ok(input) = serde_json::from_slice::<crate::push::Request>(&body) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let Some(push) = &state.push else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match push.request(input).await {
-        Ok(value) => axum::Json(value).into_response(),
-        Err("invalid") => StatusCode::BAD_REQUEST.into_response(),
-        Err("conflict") => StatusCode::CONFLICT.into_response(),
-        Err("missing") => StatusCode::NOT_FOUND.into_response(),
-        Err("full" | "rate_limited") => StatusCode::TOO_MANY_REQUESTS.into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
 }
 async fn index(State(state): State<WebState>) -> Response {
     static_file(&state, "index.html".into()).await
@@ -373,7 +317,9 @@ async fn static_file(state: &WebState, relative: String) -> Response {
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
-async fn upgrade(State(state): State<WebState>, ws: WebSocketUpgrade) -> Response {
+async fn upgrade(State(state): State<WebState>, uri: Uri, ws: WebSocketUpgrade) -> Response {
+    // Older tabs do not decode delivery reports. The capability proof remains a header.
+    let reply_timing = uri.query() == Some("replyTiming=1");
     let Ok(permit) = state.slots.clone().try_acquire_owned() else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
@@ -385,7 +331,7 @@ async fn upgrade(State(state): State<WebState>, ws: WebSocketUpgrade) -> Respons
         .max_write_buffer_size(12 * 1024 * 1024)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            multiplex::socket_loop(socket, state).await
+            multiplex::socket_loop(socket, state, reply_timing).await
         })
 }
 fn secret_equal(left: &str, right: &str) -> bool {

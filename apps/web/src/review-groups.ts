@@ -10,7 +10,7 @@ export interface IntentGroup { title: string; reason: string; paths: string[] }
 interface FileOverview { path: string; status: string; patch: string | null; added: number; removed: number; patchLines: number | null; sampled: boolean }
 interface DiffRead { path: string; startLine: number }
 interface DiffDetail extends DiffRead { patch: string }
-export interface GroupRequest { files: FileOverview[]; details: DiffDetail[]; readsRemaining: number; model?: GroupModel; explain?: { title: string } }
+export interface GroupRequest { files: FileOverview[]; details: DiffDetail[]; readsRemaining: number; model?: GroupModel; explain?: { title: string; question?: string; task?: "explain" | "review" } }
 export interface GroupRun { cacheKey?: string; force?: boolean; model?: GroupModel; verify?: (signal: AbortSignal) => Promise<boolean> }
 export interface GroupCoverage { files: number; sampled: number; unavailable: number; metadata: number; reads: number; bytes: number }
 const overviewLimit = 24 * 1024, contextLimit = 48 * 1024;

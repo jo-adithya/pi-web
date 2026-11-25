@@ -29,12 +29,21 @@ export function AskSelectionDialog(props: { selection: ReviewSelection; model: S
     } catch (error) { return { text: "", error: error instanceof Error ? error.message : "Could not prepare this question." }; }
   });
   const lines = selection.lines ?? diffLines(selection.file.patch);
-  const scope = { unstaged: "Unstaged", staged: "Staged", branch: "Branch", commit: "Commit", turn: "Last turn" }[selection.target.scope];
+  async function saveDiscussion() {
+    const source = diffLines(selection.file.patch);
+    const same = (a: DiffLine, b: DiffLine) => a.text === b.text && a.old === b.old && a.next === b.next;
+    const start = selection.lines ? source.findIndex(row => same(row, lines[0])) + 1 : 1;
+    const end = selection.lines ? source.findIndex(row => same(row, lines[lines.length - 1])) + 1 : source.length;
+    if (start < 1 || end < start) { setError("These lines are not in the saved patch. Reopen your selection."); return; }
+    if (await props.model.notebook.addThread(selection.file, start, end, question().trim())) props.close();
+    else setError(props.model.notebook.error() || "Could not save discussion.");
+  }
+  const scope = { unstaged: "Unstaged", staged: "Staged", branch: "Branch", commit: "Commit", turn: "Last turn", saved: "Saved round" }[selection.target.scope];
   return <ActionDialog title={selection.lines ? "Ask Pi about selected lines" : "Ask Pi about file"} description="Ask a question or collect feedback to send together."
     class="review-selection-dialog" returnFocus={selection.returnFocus} close={props.close}>
     <form class="review-selection-form" onSubmit={event => {
       event.preventDefault();
-      if (!prepared().text || !props.model.canConfigure()) return;
+      if (!prepared().text || !props.model.canConfigure() || selection.target.scope === "saved") return;
       if (!props.model.submitReview(prepared().text)) { setError("Could not send. Check the connection and try again."); return; }
       props.model.reviewCards.remember(fileReviewCard(selection.file, selection.target, selection.lines));
       props.close(); props.conversation();
@@ -53,15 +62,16 @@ export function AskSelectionDialog(props: { selection: ReviewSelection; model: S
         </div>
         <Show when={prepared().error || error()}><p class="review-warning" role="alert">{prepared().error || error()}</p></Show>
         <Show when={!props.model.canConfigure()}><p class="review-help" role="status">{props.model.online() ? "Send now is available when Pi is ready. You can still collect feedback." : "Reconnect to send. You can still collect feedback."}</p></Show>
-        <p class="review-selection-privacy"><Icon name="info" />Only your note and file/line references are sent.</p>
+        <p class="review-selection-privacy"><Icon name="info" />{selection.target.scope === "saved" ? "Save a discussion on this snapshot. Ask AI from the inline thread after reviewing its token estimate." : "Only your note and file/line references are sent."}</p>
       </div>
       <footer class="review-selection-footer">
         <div class="review-selection-actions">
-          <div><Button type="button" class="review-selection-collect" aria-describedby={`review-collect-${props.model.id}`} disabled={!prepared().text} onClick={() => {
+          <Show when={selection.target.scope === "saved"}><Button type="button" disabled={!question().trim() || props.model.notebook.busy()} onClick={() => void saveDiscussion()}>Save discussion beside code</Button></Show>
+          <div><Button type="button" class="review-selection-collect" aria-describedby={`review-collect-${props.model.id}`} disabled={!prepared().text || selection.target.scope === "saved"} onClick={() => {
             if (props.model.addFeedback(question().trim(), fileReviewCard(selection.file, selection.target, selection.lines))) props.close();
             else setError("Feedback is full. Send or remove some notes before adding more.");
           }}><Icon name="plus" />Add feedback</Button><span id={`review-collect-${props.model.id}`}>Send together from Changes.</span></div>
-          <div><Button type="submit" class="primary" aria-describedby={`review-send-${props.model.id}`} disabled={!props.model.canConfigure() || !prepared().text}><Icon name="arrow" />Send to Pi</Button><span id={`review-send-${props.model.id}`}>Send this note now.</span></div>
+          <div><Button type="submit" class="primary" aria-describedby={`review-send-${props.model.id}`} disabled={!props.model.canConfigure() || !prepared().text || selection.target.scope === "saved"}><Icon name="arrow" />Send to Pi</Button><span id={`review-send-${props.model.id}`}>Send this note now.</span></div>
         </div>
         <div class="review-selection-footer-meta"><Button type="button" onClick={props.close}>Cancel</Button><span aria-live="polite"><Show when={props.model.feedback().length} fallback="Your chat draft stays separate.">{props.model.feedback().length} {props.model.feedback().length === 1 ? "note" : "notes"} collected</Show></span></div>
       </footer>

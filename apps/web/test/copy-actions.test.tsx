@@ -4,6 +4,7 @@ import { flush } from "solid-js";
 import { Markdown } from "../src/components/Markdown";
 import { MessageList } from "../src/Conversation";
 import { initialState } from "../src/client-state";
+import { renderMarkdown } from "../src/markdown";
 
 const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 afterEach(() => {
@@ -46,10 +47,11 @@ it("copies only the selected version of a simple response", async () => {
     presentation: { state: "ready", response: { summary: "Fixed.", blocks: [{ type: "checklist", title: "Changes", items: ["Updated login"] }] } } };
   render(() => <MessageList state={state} />); flush();
   fireEvent.click(screen.getByRole("button", { name: "Copy simple answer" }));
-  await vi.waitFor(() => { flush(); expect(screen.getByRole("button", { name: "Copy simple answer" }).textContent).toBe("Copied"); });
+  await vi.waitFor(() => { flush(); expect(screen.getByRole("status").textContent).toBe("Copied"); });
   expect(write).toHaveBeenLastCalledWith("Fixed.\n\nChanges\n• Updated login");
   fireEvent.click(screen.getByRole("button", { name: "View original" })); flush();
-  expect(screen.getByRole("button", { name: "Copy original answer" }).textContent).toBe("Copy original answer");
+  expect(screen.getByRole("button", { name: "Copy original answer" }).getAttribute("title")).toBe("Copy original answer");
+  expect(screen.getByRole("status").textContent).toBe("");
   fireEvent.click(screen.getByRole("button", { name: "Copy original answer" }));
   await vi.waitFor(() => expect(write).toHaveBeenLastCalledWith("**Original answer**"));
 });
@@ -83,7 +85,7 @@ it("copies ordered steps, reported check statuses, warnings and collapsed detail
   render(() => <MessageList state={state} />); flush();
   expect(document.querySelector("details")?.open).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Copy simple answer" }));
-  await vi.waitFor(() => expect(write).toHaveBeenCalledWith("Update ready.\n\nWarning: Before deployment\nBack up first.\n\nNext steps\n1. Save settings.\n2. Restart pi-web.\n\nVerification (reported by Pi)\nPassed: Build completed.\nUnverified: Live model not checked.\n\nHow it works\nOptional explanation."));
+  await vi.waitFor(() => expect(write).toHaveBeenCalledWith("Update ready.\n\nWarning: Before deployment\nBack up first.\n\nNext steps\n1. Save settings.\n2. Restart pi-web.\n\nVerification (reported by Pi)\nNot verified: Live model not checked.\nPassed: Build completed.\n\nHow it works\nOptional explanation."));
 });
 
 it("copies visual facts, tables, comparisons and flow relationships as readable text", async () => {
@@ -94,13 +96,13 @@ it("copies visual facts, tables, comparisons and flow relationships as readable 
     summary: "Visual example.", blocks: [
       { type: "facts", title: "Key facts", items: [{ label: "Duration", value: "3.6 s" }] },
       { type: "table", title: "Comparison", columns: ["Option", "Time"], rows: [["A|B", "3.6 s"]] },
-      { type: "comparison", title: "Change", before: "Text-heavy.", after: "Visual." },
+      { type: "comparison", title: "Change", left: { title: "Before", text: "Text-heavy." }, right: { title: "After", text: "Visual." } },
       { type: "flow", title: "Answer path", items: ["Pi", "Formatter", "Answer"] },
     ],
   } } };
   render(() => <MessageList state={state} />); flush();
   fireEvent.click(screen.getByRole("button", { name: "Copy simple answer" }));
-  await vi.waitFor(() => expect(write).toHaveBeenCalledWith("Visual example.\n\nKey facts (reported by Pi)\nDuration: 3.6 s\n\nComparison\n| Option | Time |\n| --- | --- |\n| A\\|B | 3.6 s |\n\nChange\nBefore: Text-heavy.\nAfter: Visual.\n\nAnswer path\nPi → Formatter → Answer"));
+  await vi.waitFor(() => expect(write).toHaveBeenCalledWith("Visual example.\n\nKey facts (reported by Pi)\nDuration: 3.6 s\n\nComparison\n| Option | Time |\n| --- | --- |\n| A\\|B | 3.6 s |\n\nChange\n\nBefore:\n\nText-heavy.\n\nAfter:\n\nVisual.\n\nAnswer path\nPi → Formatter → Answer"));
 });
 
 it("keeps existing pipe escapes intact when copying inline Markdown table cells", async () => {
@@ -114,6 +116,30 @@ it("keeps existing pipe escapes intact when copying inline Markdown table cells"
   fireEvent.click(screen.getByRole("button", { name: "Copy simple answer" }));
   const expected = ["Table.", "", "Cells", "| Value |", "| --- |", String.raw`| A\|B |`, String.raw`| C\\\|D |`].join("\n");
   await vi.waitFor(() => expect(write).toHaveBeenCalledWith(expected));
+});
+
+it("copies block Markdown in table cells as labeled rows without flattening lists or code", async () => {
+  const write = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: write } });
+  const state = initialState(); state.order = ["answer"];
+  const checklist = "- Confirm the schema\n- Check permissions";
+  const snippet = "```text\n  schema | table";
+  state.messages.answer = { id: "answer", role: "assistant", complete: true, truncated: false, error: null, blocks: [], presentation: { state: "ready", response: {
+    summary: "Two sources.", blocks: [{ type: "table", purpose: "data", title: "Discovery checks", columns: ["Source", "Actions"], rows: [
+      ["Postgres", snippet], ["Maximo", checklist],
+    ] }],
+  } } };
+  render(() => <MessageList state={state} />); flush();
+  expect(screen.getByRole("table", { name: "Discovery checks" }).querySelectorAll("li")).toHaveLength(2);
+  fireEvent.click(screen.getByRole("button", { name: "Copy simple answer" }));
+  await vi.waitFor(() => expect(write).toHaveBeenCalledWith([
+    "Two sources.", "Discovery checks", "Row 1", "Source:", "> Postgres", "Actions:", "> ```text\n>   schema | table",
+    "Row 2", "Source:", "> Maximo", "Actions:", "> - Confirm the schema\n> - Check permissions",
+  ].join("\n\n")));
+  const pasted = document.createElement("div");
+  pasted.innerHTML = renderMarkdown(write.mock.calls[0][0]);
+  expect([...pasted.querySelectorAll("li")].map(item => item.textContent)).toEqual(["Confirm the schema", "Check permissions"]);
+  expect(pasted.querySelector("pre code")?.textContent).toBe("  schema | table\n");
 });
 
 it("copies snippets exactly and contains embedded fences when copying the whole answer", async () => {

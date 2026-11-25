@@ -12,8 +12,8 @@ export interface PaletteCommand {
   run: () => void;
 }
 
-/** Search existing actions; returnFocus can anchor dismissal when the launching drawer unmounts. */
-export function CommandPalette(props: { commands: PaletteCommand[]; close: () => void; returnFocus?: Element }) {
+/** Search supplied actions or open sessions; returnFocus anchors dismissal when the launching drawer unmounts. */
+export function CommandPalette(props: { commands: PaletteCommand[]; close: () => void; returnFocus?: Element; sessionsOnly?: boolean }) {
   const [query, setQuery] = createSignal("");
   const [selected, setSelected] = createSignal(0);
   const id = createUniqueId();
@@ -27,9 +27,9 @@ export function CommandPalette(props: { commands: PaletteCommand[]; close: () =>
     props.close();
     command.run();
   }
-  return <ActionDialog returnFocus={props.returnFocus} title="Command palette" description="Find conversations, workspaces, and actions. Use arrow keys and Enter to choose." close={props.close} class="command-palette" hideHeading>
-    <input class="palette-search" role="combobox" aria-label="Search commands and conversations" aria-expanded="true" aria-autocomplete="list" aria-controls={`${id}-results`} aria-activedescendant={active() >= 0 ? `${id}-${active()}` : undefined}
-      placeholder="Search commands and conversations…" autocomplete="off" spellcheck={false} value={query()}
+  return <ActionDialog returnFocus={props.returnFocus} title={props.sessionsOnly ? "Open sessions" : "Command palette"} description={props.sessionsOnly ? "Find open sessions, most recently used first. Use arrow keys and Enter to choose." : "Find conversations, workspaces, and actions. Use arrow keys and Enter to choose."} close={props.close} class="command-palette" hideHeading>
+    <input class="palette-search" role="combobox" aria-label={props.sessionsOnly ? "Search open sessions" : "Search commands and conversations"} aria-expanded="true" aria-autocomplete="list" aria-controls={`${id}-results`} aria-activedescendant={active() >= 0 ? `${id}-${active()}` : undefined}
+      placeholder={props.sessionsOnly ? "Search open sessions…" : "Search commands and conversations…"} autocomplete="off" spellcheck={false} value={query()}
       onInput={event => { setQuery(event.currentTarget.value); setSelected(0); }}
       onKeyDown={event => {
         if (event.isComposing) return;
@@ -43,13 +43,13 @@ export function CommandPalette(props: { commands: PaletteCommand[]; close: () =>
           document.getElementById(`${id}-${next}`)?.scrollIntoView({ block: "nearest" });
         }
       }} />
-    <div id={`${id}-results`} class="palette-results" role="listbox" aria-label="Commands and conversations">
+    <div id={`${id}-results`} class="palette-results" role="listbox" aria-label={props.sessionsOnly ? "Open sessions" : "Commands and conversations"}>
       <For each={matches()}>{(command, index) => <div id={`${id}-${index()}`} role="option" aria-label={`${command.label} ${command.detail}`} aria-selected={active() === index() ? "true" : "false"} aria-disabled={command.disabled ? "true" : undefined}
         class="palette-option" onClick={() => activate(command)} onPointerMove={() => setSelected(index())}>
         <span>{command.label}</span><small>{command.detail}</small>
       </div>}</For>
     </div>
-    <Show when={!matches().length}><p class="palette-empty" role="status">No matching commands or conversations.</p></Show>
+    <Show when={!matches().length}><p class="palette-empty" role="status">{props.sessionsOnly ? "No matching open sessions." : "No matching commands or conversations."}</p></Show>
     <footer class="palette-footer"><span>↑↓ navigate · Enter select</span><Button type="button" onClick={props.close}>Close <kbd>Esc</kbd></Button></footer>
   </ActionDialog>;
 }

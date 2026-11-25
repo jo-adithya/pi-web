@@ -1,0 +1,22 @@
+.reply-code-preview {
+  flex: 0 0 min(42%, 30rem);
+  min-width: 0;
+  overflow: auto;
+  padding: 1rem;
+  border-inline-start: 1px solid var(--border);
+  background: var(--background);
+}
+.reply-code-preview > header { display: flex; align-items: start; justify-content: space-between; gap: .75rem; }
+.reply-code-preview h2, .reply-code-sheet h2 { margin: 0; font-size: .95rem; overflow-wrap: anywhere; }
+.reply-code-preview button, .reply-code-sheet button { font-size: .8rem; }
+.reply-code-preview > header > button { flex-shrink: 0; }
+.reply-code-caption { margin: .65rem 0; color: var(--muted-foreground); font-size: .8rem; }
+.reply-code-preview > button + button, .reply-code-sheet > button + button { margin-inline-start: .45rem; }
+.reply-code-preview .chat-review-code { max-height: none; }
+.action-dialog.reply-code-sheet {
+  inset: auto 0 0; transform: none; width: 100%; max-height: min(78dvh, 36rem);
+  padding: .9rem 1rem max(1rem, env(safe-area-inset-bottom)); border-radius: var(--radius) var(--radius) 0 0;
+}
+.reply-code-sheet .preserve { margin: .3rem 0 .75rem; color: var(--muted-foreground); }
+.reply-code-sheet button { min-height: var(--mobile-control-size); }
+.reply-code-sheet .chat-review-code { max-height: 48dvh; }

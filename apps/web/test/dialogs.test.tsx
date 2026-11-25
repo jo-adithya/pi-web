@@ -29,6 +29,24 @@ it.each(["escape", "outside", "cancel", "no", "confirm"])("distinguishes extensi
   expect(answer).toHaveBeenCalledExactlyOnceWith(method === "no" || method === "confirm" ? { type: "confirmed", confirmed: method === "confirm" } : { type: "cancelled" });
 });
 
+it("does not treat a drag from the dialog or a cancelled backdrop press as dismissal", () => {
+  const close = vi.fn();
+  const confirm = vi.fn();
+  render(() => <ConfirmationDialog title="Delete conversation" description="Delete this conversation?" action="Delete" close={close} confirm={confirm} />);
+  flush();
+  const overlay = document.querySelector(".action-overlay")!;
+  const dialog = screen.getByRole("dialog", { name: "Delete conversation" });
+  fireEvent.pointerDown(overlay);
+  fireEvent.pointerCancel(overlay);
+  fireEvent.click(overlay, { detail: 1 });
+  expect(close).not.toHaveBeenCalled();
+  fireEvent.pointerDown(dialog);
+  fireEvent.pointerUp(overlay);
+  fireEvent.click(overlay, { detail: 1 });
+  expect(close).not.toHaveBeenCalled();
+  expect(confirm).not.toHaveBeenCalled();
+});
+
 it("requires an advertised nonempty extension choice", async () => {
   const answer = extension("select", "unknown");
   const send = screen.getByRole("button", { name: "Send response" }) as HTMLButtonElement;

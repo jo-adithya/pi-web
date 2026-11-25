@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-li
 import { flush } from "solid-js";
 import { LocalReview } from "../src/LocalReview";
 import { createSessionModel } from "../src/session-model";
+import { emptyNotebook } from "../src/review-notebook";
 import { createCommitHistory, fetchCommits } from "../src/commit-review";
 import { createLocalReview } from "../src/local-review";
 import { initialState } from "../src/client-state";
@@ -104,7 +105,7 @@ it("shows empty history and can reload commits without changing the workspace", 
 
 it("shows actionable history errors and retries while retaining the previous snapshot", async () => {
   let failed = true;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("/commits") && failed ? new Response(JSON.stringify({ error: "Local history unavailable" }), { status: 422 }) : new Response(JSON.stringify(url.endsWith("/commits") ? history : snapshot))));
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("/commits") && failed ? new Response(JSON.stringify({ error: "Local history unavailable" }), { status: 422 }) : new Response(JSON.stringify(url.endsWith("/notebook") ? emptyNotebook() : url.endsWith("/source") ? { enabled: false } : url.endsWith("/commits") ? history : snapshot))));
   const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await page.findByRole("article"); fireEvent.click(page.getByRole("button", { name: "Commit" }));

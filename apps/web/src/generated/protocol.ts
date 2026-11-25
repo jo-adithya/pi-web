@@ -85,10 +85,10 @@ export type ResponseCheckStatus = "passed" | "failed" | "skipped" | "unverified"
  * A verification outcome reported by Pi, independent of checks run by this UI.
  */
 
-export type ResponseCheck = { status: ResponseCheckStatus, text: string, };
+export type ResponseCheck = { status: ResponseCheckStatus, text: string, source?: string, };
 
 /**
- * A short, plain-text label and value reported by Pi for a compact facts row.
+ * A plain-text label and a compact Markdown value reported by Pi.
  */
 
 export type ResponseFact = { label: string, value: string, };
@@ -117,12 +117,29 @@ export type RecordedEvidence = { tools: Array<RecordedTool>, files: Array<Record
 
 export type CanvasLayout = "result" | "explanation" | "investigation" | "review" | "plan" | "comparison" | "answer";
 
+export type ColumnRatio = "equal" | "leading";
+
 /**
- * Selects a reading composition and one primary block by its zero-based index.
- * The headline is plain text. Warnings and recorded failures remain visible independently.
+ * One named side of a composed comparison. The nonempty block indices refer to the
+ * reply's existing blocks in reading order; each index is used once in the entire canvas.
  */
 
-export type CanvasPlan = { layout: CanvasLayout, headline: string, focus: number | null, };
+export type ComparisonPanel = { title: string, blocks: Array<number>, };
+
+/**
+ * Ordered grouping only: the app owns breakpoints, spacing and safe block rendering.
+ * Every block must appear exactly once. Existing details cards own disclosure;
+ * groups cannot hide warnings, required actions or recorded failures.
+ */
+
+export type CanvasNode = { "type": "block", index: number, } | { "type": "stack", children: Array<CanvasNode>, } | { "type": "section", title: string, children: Array<CanvasNode>, } | { "type": "columns", ratio: ColumnRatio, children: Array<CanvasNode>, } | { "type": "comparison_panels", mode: ComparisonMode, left: ComparisonPanel, right: ComparisonPanel, };
+
+/**
+ * Semantic response category plus an optional app-owned composition tree.
+ * Without composition, saved replies retain their legacy focus/support layout.
+ */
+
+export type CanvasPlan = { layout: CanvasLayout, headline?: string, focus: number | null, composition?: CanvasNode, };
 
 export type DiagramNodeKind = "input" | "process" | "store" | "decision" | "output";
 
@@ -150,6 +167,18 @@ export type TimelineKind = "reported" | "hypothesis" | "next";
 
 export type TimelineItem = { label: string, text: string, kind: TimelineKind, };
 
+export type AnnotationKind = "context" | "cost" | "risk";
+
+export type PathAnnotation = { kind: AnnotationKind, text: string, };
+
+export type PathStep = { text: string, annotation?: PathAnnotation, };
+
+/**
+ * One named entry point or phase; its steps retain reading/execution order.
+ */
+
+export type PathGroup = { label: string, steps: Array<PathStep>, };
+
 export type FindingSeverity = "critical" | "high" | "medium" | "low";
 
 /**
@@ -158,28 +187,47 @@ export type FindingSeverity = "critical" | "high" | "medium" | "low";
 
 export type ResponseFinding = { severity: FindingSeverity, title: string, text: string, location?: string, };
 
-export type ResponseCard = { "type": "checklist", title: string, items: Array<string>, } | { "type": "steps", title: string, items: Array<string>, } | { "type": "note", title: string, text: string, } | { "type": "code", title: string, language?: string, code: string, } | { "type": "warning", title: string, text: string, } | { "type": "details", title: string, text: string, } | { "type": "checks", title: string, items: Array<ResponseCheck>, } | { "type": "table", title: string, columns: Array<string>, rows: Array<Array<string>>, } | { "type": "facts", title: string, items: Array<ResponseFact>, } | { "type": "comparison", title: string, before: string, after: string, } | { "type": "flow", title: string, items: Array<string>, } | { "type": "diagram", title: string, nodes: Array<DiagramNode>, edges: Array<DiagramEdge>, } | { "type": "chart", title: string, unit: string, items: Array<ChartValue>, } | { "type": "timeline", title: string, items: Array<TimelineItem>, } | { "type": "findings", title: string, items: Array<ResponseFinding>, } | { "type": "evidence", title: string, items: Array<string>, };
+/**
+ * Whether the panels are alternatives or an earlier and later state of one subject.
+ */
+
+export type ComparisonMode = "alternatives" | "change";
+
+/**
+ * One comparison panel: a plain-text title and a safe Markdown body.
+ */
+
+export type ComparisonSide = { title: string, text: string, };
+
+/**
+ * A table's reading intent, independent of its visible headers. A decision has an
+ * option column followed by criteria. A conditional has exactly condition and action columns.
+ */
+
+export type TablePurpose = "data" | "decision" | "conditional";
+
+export type ResponseCard = { "type": "checklist", title: string, items: Array<string>, } | { "type": "steps", title: string, items: Array<string>, } | { "type": "note", title: string, text: string, } | { "type": "code", title: string, language?: string, code: string, snippetDiff?: boolean, } | { "type": "warning", title: string, text: string, } | { "type": "details", title: string, text: string, } | { "type": "checks", title: string, items: Array<ResponseCheck>, } | { "type": "table", title: string, purpose?: TablePurpose, columns: Array<string>, rows: Array<Array<string>>, } | { "type": "facts", title: string, items: Array<ResponseFact>, } | { "type": "comparison", title: string, mode?: ComparisonMode, left: ComparisonSide, right: ComparisonSide, } | { "type": "flow", title: string, items: Array<string>, } | { "type": "path", title: string, status?: string, groups: Array<PathGroup>, } | { "type": "diagram", title: string, nodes: Array<DiagramNode>, edges: Array<DiagramEdge>, } | { "type": "chart", title: string, unit: string, items: Array<ChartValue>, } | { "type": "timeline", title: string, items: Array<TimelineItem>, } | { "type": "findings", title: string, items: Array<ResponseFinding>, } | { "type": "evidence", title: string, items: Array<string>, };
 
 /**
  * Markdown in app-owned sections, rendered with the browser's safe Markdown policy.
  */
 
-export type SimpleResponse = { summary: string, blocks: Array<ResponseCard>, canvas?: CanvasPlan, recorded?: RecordedEvidence, };
+export type SimpleResponse = { summary: string, summarySource?: string, blocks: Array<ResponseCard>, canvas?: CanvasPlan, recorded?: RecordedEvidence, };
 
 /**
- * Server elapsed milliseconds for Pi work and formatting, before cache save and delivery.
- * `work_ms` spans prompt admission (or observed agent start) through presentation preparation;
- * absent values were not recorded. `total_ms` covers formatting only, including its queue.
- * Model time includes first-text waiting. Cached results retain the original run's timings.
+ * Elapsed server milliseconds for Pi work, formatting, and the live save attempt.
+ * `work_ms` spans prompt admission (or observed agent start) through presentation preparation.
+ * `total_ms` covers formatting, including its queue, but not saving. Cached results retain
+ * the original formatting measurements. `save_ms` is available only on the live attempt.
  */
 
-export type ResponseTimings = { model: string, cached: boolean, workMs?: number, totalMs: number, captureMs?: number, queueMs: number, startupMs: number | null, modelMs: number | null, firstTextMs: number | null, cleanupMs: number, };
+export type ResponseTimings = { model: string, cached: boolean, workMs?: number, totalMs: number, captureMs?: number, queueMs: number, startupMs: number | null, modelMs: number | null, firstTextMs: number | null, cleanupMs: number, saveMs?: number, };
 
 /**
  * A presentation selected by the server, independent of the original assistant text.
  */
 
-export type ResponsePresentation = { "state": "pending" } | { "state": "hidden" } | { "state": "ready", response: SimpleResponse, timings?: ResponseTimings, } | { "state": "error", message: string, retryable: boolean, timings?: ResponseTimings, };
+export type ResponsePresentation = { "state": "pending" } | { "state": "hidden" } | { "state": "unsaved", response: SimpleResponse, timings?: ResponseTimings, } | { "state": "ready", response: SimpleResponse, timings?: ResponseTimings, } | { "state": "error", message: string, retryable: boolean, timings?: ResponseTimings, };
 
 /**
  * A bounded message preview. `id` belongs to this view, not necessarily Pi storage.
@@ -288,7 +336,7 @@ export type RunOutcome = "success" | "error" | "aborted";
  * Only the controlling browser may issue these bounded, session-scoped actions.
  */
 
-export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "retry_response", messageId: string, } | { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, images: Array<string>, } | { "type": "steer", text: string, images: Array<string>, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
+export type BrowserAction = { "type": "refresh_codex_usage" } | { "type": "retry_response", messageId: string, } | { "type": "retry_response_save", messageId: string, } | { "type": "set_model", provider: string, modelId: string, } | { "type": "set_thinking_level", level: ThinkingLevel, } | { "type": "attach" } | { "type": "prompt", text: string, images: Array<string>, } | { "type": "steer", text: string, images: Array<string>, } | { "type": "cancel" } | { "type": "ui_reply", dialogId: string, answer: DialogAnswer, } | { "type": "terminate", confirmed: boolean, } | { "type": "restart", confirmed: boolean, };
 
 /**
  * Browser envelope. Shape decoding precedes bounds, version, subscription and epoch checks.
@@ -335,7 +383,11 @@ export type SlashCommand = { name: string, description: string | null, source: S
  * Ordered application messages. Snapshots supersede earlier events through their sequence.
  */
 
-export type ServerBody = { "type": "background_tasks", tasks: Array<BackgroundTask>, } | { "type": "codex_usage", usage: CodexUsage, } | { "type": "context_usage", usage: ContextUsage | null, } | { "type": "settings", settings: AgentSettings, } | { "type": "run_completed", runId: string, outcome: RunOutcome, } | { "type": "commands", commands: Array<SlashCommand>, } | { "type": "hello", project: string, process: ProcessStatus, } | { "type": "snapshot", throughSeq: number, status: RuntimeStatus, messages: Array<DisplayMessage>, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "event", seq: number, patches: Array<ViewPatch>, status: RuntimeStatus, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "result", result: CommandResult, } | { "type": "error", code: string, };
+export type ServerBody = { "type": "background_tasks", tasks: Array<BackgroundTask>, } | { "type": "codex_usage", usage: CodexUsage, } | { "type": "context_usage", usage: ContextUsage | null, } | { "type": "settings", settings: AgentSettings, } | { "type": "run_completed", runId: string, outcome: RunOutcome, 
+/**
+ * Wait for this live reply's terminal presentation before notifying the reader.
+ */
+waitForMessageId?: string, } | { "type": "commands", commands: Array<SlashCommand>, } | { "type": "hello", project: string, process: ProcessStatus, } | { "type": "snapshot", throughSeq: number, status: RuntimeStatus, messages: Array<DisplayMessage>, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "event", seq: number, patches: Array<ViewPatch>, status: RuntimeStatus, dialogs: Array<Dialog>, olderHistory: boolean, } | { "type": "response_delivery", seq: number, queueMs: number, sendMs: number, } | { "type": "result", result: CommandResult, } | { "type": "error", code: string, };
 
 export type ServerMessage = { v: number, sessionId: string, epoch: string, body: ServerBody, };
 

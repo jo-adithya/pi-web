@@ -3,18 +3,18 @@ import { CopyButton } from "./components/CopyButton";
 import { SimpleResponse } from "./components/SimpleResponse";
 import { renderMarkdownParts } from "./markdown";
 import { ImageLightbox } from "./components/ImageLightbox";
-import { For, Show, createMemo, createSignal, onSettled } from "solid-js";
+import { For, Show, createMemo, createSignal, onSettled, snapshot } from "solid-js";
 import type { DisplayMessage } from "./generated/protocol";
-import type { ClientState } from "./client-state";
+import type { ClientState, ReplyArrival } from "./client-state";
 import { Markdown } from "./components/Markdown";
 import { Icon } from "./components/Icon";
 import { ChatSelectionReply } from "./components/ChatSelectionReply";
 import type { ReplyQuote } from "./reply-quote";
 import { reviewMessageContent, type ReviewCard } from "./review-cards";
 import { ReviewDiffCard, type ReviewPreviewLoader } from "./components/ReviewDiffCard";
-import type { CodeLocation } from "./code-reference";
+import type { OpenCodeReference } from "./code-reference";
 
-interface ReviewPresentation { loadOriginal?: (sourceKey: string, signal: AbortSignal) => Promise<string>; retryResponse?: (messageId: string) => void; openCode?: (location: CodeLocation) => void; reviewCards?: readonly ReviewCard[]; loadReviewPreview?: ReviewPreviewLoader }
+interface ReviewPresentation { switchView?: (anchor: HTMLElement, change: () => void) => void; loadOriginal?: (sourceKey: string, signal: AbortSignal) => Promise<string>; retryResponse?: (messageId: string) => void; saveResponse?: (messageId: string) => void; openCode?: OpenCodeReference; reviewCards?: readonly ReviewCard[]; loadReviewPreview?: ReviewPreviewLoader }
 
 /** Collects retained assistant replies up to this answer, bounded by a user prompt or an earlier presented answer. */
 function replyGroup(state: Pick<ClientState, "order" | "messages">, id: string): DisplayMessage[] {
@@ -29,13 +29,13 @@ function replyGroup(state: Pick<ClientState, "order" | "messages">, id: string):
 }
 
 /** Renders the server-owned page; navigation replaces rather than accumulates messages. */
-export function MessageList(props: ReviewPresentation & { state: Pick<ClientState, "order" | "messages">; loadImage?: (id: string) => Promise<Blob>; onReply?: (quote: ReplyQuote) => void; mobileReplyTarget?: HTMLDivElement }) {
+export function MessageList(props: ReviewPresentation & { state: Pick<ClientState, "order" | "messages"> & Partial<Pick<ClientState, "replyArrivals">>; loadImage?: (id: string) => Promise<Blob>; onReply?: (quote: ReplyQuote) => void; mobileReplyTarget?: HTMLDivElement }) {
   return <ChatSelectionReply onReply={props.onReply} mobileReplyTarget={props.mobileReplyTarget}>
-    <For each={props.state.order}>{id => <Message message={props.state.messages[id]} replies={replyGroup(props.state, id)} loadOriginal={props.loadOriginal} retryResponse={props.retryResponse} openCode={props.openCode} loadImage={props.loadImage} reviewCards={props.reviewCards} loadReviewPreview={props.loadReviewPreview} />}</For></ChatSelectionReply>;
+    <For each={props.state.order}>{id => <Message message={props.state.messages[id]} arrival={props.state.replyArrivals?.[id]} replies={replyGroup(props.state, id)} switchView={props.switchView} loadOriginal={props.loadOriginal} retryResponse={props.retryResponse} saveResponse={props.saveResponse} openCode={props.openCode} loadImage={props.loadImage} reviewCards={props.reviewCards} loadReviewPreview={props.loadReviewPreview} />}</For></ChatSelectionReply>;
 }
 
 /** Keeps HTML previews original and text replies simplified, with compaction summaries collapsed. */
-function Message(props: ReviewPresentation & { message: DisplayMessage; replies?: DisplayMessage[]; loadImage?: (id: string) => Promise<Blob> }) {
+function Message(props: ReviewPresentation & { message: DisplayMessage; arrival?: ReplyArrival; replies?: DisplayMessage[]; loadImage?: (id: string) => Promise<Blob> }) {
   const originalPreview = createMemo(() => props.message.role === "assistant" && props.message.complete && !props.message.truncated && props.message.presentation !== undefined && props.message.presentation.state !== "hidden"
     && (props.replies ?? [props.message]).some(message => !message.truncated && message.blocks.some(block => block.kind === "text" && block.text.includes("html preview") && renderMarkdownParts(block.text).some(part => part.kind === "artifact"))));
   const presentation = () => originalPreview() ? undefined : props.message.presentation;
@@ -52,13 +52,30 @@ function Message(props: ReviewPresentation & { message: DisplayMessage; replies?
     return { cards, message: cards.length ? { ...props.message, blocks } : props.message };
   });
   const originals = () => props.message.role === "assistant" ? props.replies ?? [props.message] : [review().message];
-  const originalText = () => originals().flatMap(message => message.blocks.filter(block => block.kind === "text").map(block => block.text)).join("\n\n");
-  const original = () => <For each={originals()}>{message => <MessageBody message={message} openCode={props.openCode} loadImage={props.loadImage} />}</For>;
+  const originalText = (messages: DisplayMessage[]) => messages.flatMap(message => message.blocks.filter(block => block.kind === "text").map(block => block.text)).join("\n\n");
+  const renderOriginal = (messages: DisplayMessage[]) => <For each={messages}>{message => <MessageBody message={message} openCode={props.openCode} loadImage={props.loadImage} />}</For>;
+  const hasInlineOriginal = () => originals().some(message => message.error || message.truncated || message.blocks.some(block => block.kind !== "thinking"));
+  const captureOriginal = () => {
+    const messages = originals().map(message => ({ ...message, presentation: undefined, blocks: snapshot(message.blocks) }));
+    return { render: () => renderOriginal(messages), text: originalText(messages) };
+  };
+  const savedOriginal = () => {
+    const key = props.message.sourceKey, load = props.loadOriginal;
+    return key && load ? (signal: AbortSignal) => load(key, signal) : undefined;
+  };
+  const heading = () => <h2><span class="message-avatar" aria-hidden="true">{props.message.role === "user" ? "↗" : "π"}</span>{props.message.role === "assistant" ? "Pi" : props.message.role === "user" ? "You" : props.message.role}</h2>;
   return <Show when={visible()}><Show when={props.message.role === "compactionSummary"} fallback={<>
     <Show when={review().cards.length}><div class="chat-review-attachments" role="group" aria-label="Referenced changes"><For each={review().cards}>{card => <ReviewDiffCard card={card} load={props.loadReviewPreview} />}</For></div></Show>
-    <Show when={review().message.blocks.length || props.message.error || props.message.truncated || !review().cards.length}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`} data-message-id={props.message.id} data-reply-author={props.message.role === "assistant" ? "Pi" : "You"}><header class="message-heading"><h2><span class="message-avatar" aria-hidden="true">{props.message.role === "user" ? "↗" : "π"}</span>{props.message.role === "assistant" ? "Pi" : props.message.role === "user" ? "You" : props.message.role}</h2>
-      <Show when={props.message.role === "assistant" && !presentation() && props.message.complete && props.message.blocks.some(block => block.kind === "text" && block.text)}><div class="answer-actions"><CopyButton label="Copy answer" text={originalText} /></div></Show>
-      </header><div class="message-content"><Show when={presentation()} fallback={original()}><SimpleResponse message={props.message} openCode={props.openCode} retry={props.retryResponse ? () => props.retryResponse?.(props.message.id) : undefined} loadOriginal={props.message.blocks.length === 0 && props.message.sourceKey && props.loadOriginal ? signal => props.loadOriginal!(props.message.sourceKey!, signal) : undefined} original={original} originalText={originalText} /></Show></div>
+    <Show when={review().message.blocks.length || props.message.error || props.message.truncated || !review().cards.length}><article class={`message ${props.message.role === "user" ? "user" : "assistant"}`} data-message-id={props.message.id} data-reply-author={props.message.role === "assistant" ? "Pi" : "You"}>
+      <Show when={presentation()} fallback={<>
+        <header class="message-heading">{heading()}
+          <Show when={props.message.role === "assistant" && props.message.complete && props.message.blocks.some(block => block.kind === "text" && block.text)}><div class="answer-actions"><CopyButton label="Copy answer" text={() => originalText(originals())} /></div></Show>
+        </header>
+        <div class="message-content">{renderOriginal(originals())}</div>
+      </>}>
+        <SimpleResponse message={props.message} arrival={props.arrival} heading={heading()} original={hasInlineOriginal() ? captureOriginal : undefined} loadOriginal={savedOriginal()}
+          switchView={props.switchView} openCode={props.openCode} save={props.saveResponse ? () => props.saveResponse?.(props.message.id) : undefined} retry={props.retryResponse ? () => props.retryResponse?.(props.message.id) : undefined} />
+      </Show>
     </article></Show>
   </>}><CompactionSummary message={props.message} openCode={props.openCode} loadImage={props.loadImage} /></Show></Show>;
 }

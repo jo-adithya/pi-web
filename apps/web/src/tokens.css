@@ -1,6 +1,6 @@
 /* Mineral surfaces and evergreen accents, shared by chrome, reviews, and previews. */
 :root {
-  background: var(--background);
+  background: var(--sidebar);
   color-scheme: light;
   --background: #eff0e8;
   --foreground: #292f29;

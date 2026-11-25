@@ -26,6 +26,7 @@ interface SessionSidebarProps {
   removeWorkspace: (workspace: WorkspaceItem) => void;
   choose: (item: CatalogItem) => void;
   rename: (item: CatalogItem) => void;
+  stop: (item: CatalogItem) => void;
   remove: (item: CatalogItem) => void;
   create: () => void;
   needsInput: (id: string) => boolean;
@@ -108,6 +109,7 @@ export function SessionSidebar(props: SessionSidebarProps) {
         <DropdownMenu.Trigger class="icon-button sidebar-session-trigger" aria-label={`Options for ${item.title}`} title={`Options for ${item.title}`}><Icon name="more" /></DropdownMenu.Trigger>
         <DropdownMenu.Portal><DropdownMenu.Content class="session-menu sidebar-session-actions" data-kb-top-layer="">
           <DropdownMenu.Item disabled={!props.canManage} onSelect={() => props.rename(item)}>Rename…</DropdownMenu.Item>
+          <Show when={item.lifecycle === "open"}><DropdownMenu.Item class="danger" disabled={!props.canManage || !item.runtime} onSelect={() => props.stop(item)}>Stop session…</DropdownMenu.Item></Show>
           <DropdownMenu.Item class="danger" disabled={!props.canManage || !["open", "stopped"].includes(item.lifecycle)} onSelect={() => props.remove(item)}>Delete…</DropdownMenu.Item>
         </DropdownMenu.Content></DropdownMenu.Portal>
       </DropdownMenu></div>}</For>

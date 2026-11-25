@@ -7,7 +7,6 @@ pub mod http;
 pub mod metadata;
 mod ownership;
 pub mod protocol;
-pub mod push;
 pub mod rpc;
 pub mod session;
 pub mod session_manager;
@@ -30,3 +29,6 @@ mod commit_review;
 mod branch_review;
 
 mod group_review;
+mod review_notebook;
+mod review_sources;
+mod author_notes;

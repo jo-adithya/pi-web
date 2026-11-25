@@ -105,6 +105,31 @@ it("hands the mobile drawer to command search while preserving the draft", async
   await vi.waitFor(() => expect(document.activeElement).toBe(page.getByRole("button", { name: "Open sessions" })));
 });
 
+it("keeps mobile delete confirmation open through the menu's trailing click", async () => {
+  vi.stubGlobal("matchMedia", vi.fn((query: string) => ({ matches: query === "(max-width: 760px)", media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(catalog());
+  for (const [wire] of [...socket.send.mock.calls]) socket.emit({ ...catalog(), requestId: JSON.parse(wire).requestId });
+  const trigger = page.getByRole("button", { name: "Session options" });
+  fireEvent.keyDown(trigger, { key: "Enter" }); flush();
+  const remove = await screen.findByRole("menuitem", { name: "Delete conversation…" });
+  const before = socket.send.mock.calls.length;
+  // Kobalte selects on pointer-up, removing the menu before the touch click lands.
+  fireEvent(remove, Object.assign(new MouseEvent("pointerup", { bubbles: true, button: 0 }), { pointerType: "touch" })); flush();
+  expect(screen.getByRole("dialog", { name: "Delete conversation" })).toBeTruthy();
+  fireEvent.click(document.querySelector(".action-overlay")!, { detail: 1 }); flush();
+  expect(screen.getByRole("dialog", { name: "Delete conversation" })).toBeTruthy();
+  expect(socket.send.mock.calls).toHaveLength(before);
+  // A separate, intentional backdrop tap still cancels without deleting.
+  const overlay = document.querySelector(".action-overlay")!;
+  fireEvent.pointerDown(overlay); fireEvent.pointerUp(overlay);
+  fireEvent.click(overlay, { detail: 1 }); flush();
+  expect(screen.queryByRole("dialog", { name: "Delete conversation" })).toBeNull();
+  expect(socket.send.mock.calls).toHaveLength(before);
+});
+
 it.each([false, true])("dismisses only the active mobile workspace layer (menu=%s)", async fromMenu => {
   vi.stubGlobal("matchMedia", vi.fn((query: string) => ({ matches: query === "(max-width: 760px)", media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() })));
   Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
@@ -252,6 +277,72 @@ it("opens the command palette, searches conversations, and preserves drafts", as
   fireEvent.click(trigger); flush();
   fireEvent.keyDown(screen.getByRole("combobox", { name: "Search commands and conversations" }), { key: "Escape" }); flush();
   expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+});
+
+it.each(["ctrlKey", "metaKey"])("toggles Conversation and Changes with %s+period while preserving drafts and modal focus", async modifier => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ files: [], truncated: false, note: null }))));
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  for (const frame of frames(a)) socket.emit(frame);
+  const composer = page.getByLabelText("Message Pi");
+  fireEvent.input(composer, { target: { value: "Keep this draft" } }); flush();
+  const shortcut = { key: ".", [modifier]: true };
+  fireEvent.keyDown(composer, shortcut); flush();
+  expect(page.getByRole("button", { name: "Changes", pressed: true })).toBeTruthy();
+  fireEvent.keyDown(window, { ...shortcut, repeat: true }); flush();
+  expect(page.getByRole("button", { name: "Changes", pressed: true })).toBeTruthy();
+  fireEvent.keyDown(window, { ...shortcut, shiftKey: true }); flush();
+  expect(page.getByRole("button", { name: "Changes", pressed: true })).toBeTruthy();
+  fireEvent.keyDown(window, shortcut); flush();
+  expect(page.getByRole("button", { name: "Conversation", pressed: true })).toBeTruthy();
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Keep this draft");
+  fireEvent.keyDown(window, { key: "k", [modifier]: true }); flush();
+  fireEvent.keyDown(window, shortcut); flush();
+  expect(screen.getByRole("dialog", { name: "Command palette" })).toBeTruthy();
+  expect(page.getByRole("button", { name: "Conversation", hidden: true }).getAttribute("aria-pressed")).toBe("true");
+});
+
+it.each(["ctrlKey", "metaKey"])("opens the session picker and switches MRU sessions with %s", async modifier => {
+  Socket.instances = []; vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  const socket = Socket.instances[0]; socket.onopen?.(); socket.emit(grouped());
+  for (const frame of [...frames(a), ...frames(b)]) socket.emit(frame);
+  const composer = page.getByLabelText("Message Pi");
+  fireEvent.input(composer, { target: { value: "Preserved draft" } }); flush();
+  const mru = { key: "\\", [modifier]: true };
+  fireEvent.keyDown(composer, mru); flush();
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Preserved draft");
+  const picker = { key: "o", [modifier]: true };
+  expect(fireEvent.keyDown(composer, picker)).toBe(false); flush();
+  const search = screen.getByRole("combobox", { name: "Search open sessions" });
+  expect(screen.getAllByRole("option").map(option => option.textContent)).toEqual([
+    "Conversation 1Conversation · Alpha · Current", "Conversation 2Conversation · Beta",
+  ]);
+  fireEvent.keyDown(search, mru); flush();
+  expect(screen.getByRole("dialog", { name: "Open sessions" })).toBeTruthy();
+  fireEvent.input(search, { target: { value: "beta" } }); flush();
+  fireEvent.keyDown(search, { key: "Enter" }); flush();
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(page.getByRole("button", { name: /^Conversation 2,/ }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.keyDown(window, { ...mru, repeat: true }); flush();
+  expect(page.getByRole("button", { name: /^Conversation 2,/ }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.keyDown(window, mru); flush();
+  expect((page.getByLabelText("Message Pi") as HTMLTextAreaElement).value).toBe("Preserved draft");
+  fireEvent.keyDown(window, mru); flush();
+  expect(page.getByRole("button", { name: /^Conversation 2,/ }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.keyDown(window, picker); flush();
+  expect(screen.getAllByRole("option")[0].textContent).toContain("Conversation 2");
+  fireEvent.keyDown(window, picker); flush();
+  expect(screen.queryByRole("dialog")).toBeNull();
+  socket.emit({ ...grouped(), sessions: [{ ...item(a, "Conversation 1"), lifecycle: "stopped", runtime: null }, item(b, "Conversation 2", wb)] });
+  fireEvent.keyDown(window, mru); flush();
+  expect(page.getByRole("button", { name: /^Conversation 2,/ }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.keyDown(window, picker); flush();
+  expect(screen.getAllByRole("option")).toHaveLength(1);
+  expect(screen.getByRole("option").textContent).toContain("Conversation 2");
 });
 
 it("routes palette actions through existing workspace commands and blocks nested modals", async () => {

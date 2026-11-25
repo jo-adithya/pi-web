@@ -15,10 +15,16 @@ export function dialogReturnFocus() {
  */
 export function ActionDialog(props: { title: string; description: string; close: () => void; class?: string; returnFocus?: globalThis.Element | null; hideHeading?: boolean; children: Element }) {
   const previous = props.returnFocus ?? dialogReturnFocus();
+  let backdropPressed = false;
   return <Dialog open onOpenChange={open => { if (!open) props.close(); }}>
     <Dialog.Portal>
-      <Dialog.Overlay class="action-overlay" onClick={props.close} />
-      <Dialog.Content class={`action-dialog ${props.class ?? ""}`} onCloseAutoFocus={event => {
+      <Dialog.Overlay class="action-overlay" onPointerDown={() => { backdropPressed = true; }} onPointerCancel={() => { backdropPressed = false; }} onClick={event => {
+        // Menus select on pointer-up; their trailing click must not dismiss the new modal.
+        const dismiss = backdropPressed || event.detail === 0;
+        backdropPressed = false;
+        if (dismiss) props.close();
+      }} />
+      <Dialog.Content class={`action-dialog ${props.class ?? ""}`} onPointerDown={() => { backdropPressed = false; }} onCloseAutoFocus={event => {
         event.preventDefault();
         if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
       }} onKeyDown={event => {

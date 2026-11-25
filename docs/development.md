@@ -57,8 +57,6 @@ wait for active work to finish first.
 The API and session WebSocket routes are proxied without rewriting Host, Origin or
 capability subprotocols. Vite's separate `/__pi_web_hmr` socket handles hot reload.
 Do not open the localhost Vite address: the app is configured for the HTTPS origin.
-Browser service-worker updates and locked-phone Web Push are separate from HMR;
-service-worker edits may need a reload/update cycle.
 
 ## Return to the built frontend
 

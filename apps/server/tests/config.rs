@@ -16,6 +16,12 @@ fn response_formatting_defaults_to_luna_without_a_startup_flag() {
     assert!(parse(&["--response-model", "p/m", "--response-model", "p/m"]).is_err());
 }
 #[test]
+fn source_lookups_default_on_and_can_be_disabled() {
+    assert!(parse(&[]).unwrap().unwrap().response_lookups);
+    assert!(!parse(&["--no-response-lookups"]).unwrap().unwrap().response_lookups);
+    assert!(parse(&["--response-lookups"]).unwrap().unwrap().response_lookups);
+}
+#[test]
 fn explicit_modes_and_loopback_port_validation() {
     assert_eq!(parse(&[]).unwrap().unwrap().startup, Startup::Remembered);
     assert_eq!(parse(&["--new"]).unwrap().unwrap().startup, Startup::New);
@@ -137,11 +143,4 @@ fn registry_location_and_explicit_flags_preserve_legacy_state_defaults() {
     assert!(custom.explicit_cwd);
     assert!(custom.custom_state);
     assert_eq!(custom.registry_dir, custom.state_dir.join("workspaces"));
-}
-
-#[test]
-fn explicit_push_revocation_is_an_operator_flag() {
-    let config = Config::parse(["--revoke-push".into()]).unwrap().unwrap();
-    assert!(config.revoke_push);
-    assert!(!Config::parse(Vec::<String>::new()).unwrap().unwrap().revoke_push);
 }

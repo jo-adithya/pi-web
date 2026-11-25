@@ -19,6 +19,14 @@
 :where(.pw-pad-2) { padding: 8px; }
 :where(.pw-pad-3) { padding: 16px; }
 :where(.pw-pad-4) { padding: 24px; }
+.pw-diagram { margin-block: 12px; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius, 10px); overflow: hidden; background: var(--background); color: var(--foreground); }
+.pw-diagram .pw-diagram-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--border); font: 14px system-ui, sans-serif; }
+.pw-diagram .pw-diagram-controls button { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; margin: 0; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--foreground); font: inherit; cursor: pointer; }
+.pw-diagram button:focus-visible, .pw-diagram-viewport:focus-visible { outline: 2px solid var(--primary); outline-offset: -3px; }
+.pw-diagram .pw-diagram-scale { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted-foreground); }
+.pw-diagram .pw-diagram-viewport { position: relative; width: 100%; min-height: 240px; max-height: 480px; overflow: hidden; touch-action: none; user-select: none; cursor: grab; }
+.pw-diagram .pw-diagram-viewport:active { cursor: grabbing; }
+.pw-diagram .pw-diagram-help { margin: 0; padding: 6px 10px; border-top: 1px solid var(--border); color: var(--muted-foreground); font: 12px/1.5 system-ui, sans-serif; }
 </style>
 <body>
 <script>
@@ -69,6 +77,130 @@ function materializeIcons(content) {
     path.setAttribute("d", iconPaths[name]);
     svg.append(path);
     marker.prepend(svg);
+  }
+}
+/** Gives existing vector diagrams a fitted, touch-friendly canvas without rasterizing text. */
+function materializeDiagrams() {
+  for (const svg of document.body.querySelectorAll("svg[viewBox]")) {
+    if (svg.parentElement?.closest("svg") || svg.closest('[aria-hidden="true"], [data-pan-zoom="off"], .pw-diagram')) continue;
+    const values = svg.getAttribute("viewBox").trim().split(/[\s,]+/).map(Number);
+    if (values.length !== 4 || !values.every(Number.isFinite) || values[2] < 160 || values[3] < 80) continue;
+    const original = { x: values[0], y: values[1], width: values[2], height: values[3] };
+    let view = { ...original };
+    let zoom = 1;
+    const pointers = new Map();
+    const viewer = document.createElement("div");
+    viewer.className = "pw-diagram";
+    const controls = document.createElement("div");
+    controls.className = "pw-diagram-controls";
+    controls.setAttribute("role", "group");
+    controls.setAttribute("aria-label", "Diagram zoom controls");
+    const viewport = document.createElement("div");
+    viewport.className = "pw-diagram-viewport";
+    viewport.tabIndex = 0;
+    viewport.setAttribute("role", "group");
+    viewport.setAttribute("aria-label", "Zoomable diagram. Use plus or minus to zoom, arrow keys to pan, and zero to fit.");
+    viewport.style.aspectRatio = `${original.width} / ${original.height}`;
+    const scaleLabel = document.createElement("span");
+    scaleLabel.className = "pw-diagram-scale";
+    const help = document.createElement("p");
+    help.className = "pw-diagram-help";
+    help.textContent = "Pinch to zoom · Drag to pan · Ctrl/⌘ + scroll to zoom";
+    svg.before(viewer);
+    viewer.append(controls, viewport, help);
+    viewport.append(svg);
+    // Override fixed artifact sizing and slice alignment that can crop mobile diagrams.
+    for (const [name, value] of Object.entries({ position: "absolute", inset: "0", width: "100%", height: "100%", "min-width": "0", "min-height": "0", "max-width": "none", "max-height": "none", "box-sizing": "border-box", padding: "0", margin: "0", transform: "none", display: "block" })) {
+      svg.style.setProperty(name, value, "important");
+    }
+    svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    const render = () => {
+      svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.width} ${view.height}`);
+      scaleLabel.textContent = `${Math.round(zoom * 100)}%`;
+    };
+    const fit = () => { zoom = 1; view = { ...original }; render(); };
+    const unitScale = bounds => Math.min(bounds.width / view.width, bounds.height / view.height);
+    // Anchor zoom at the gesture midpoint, including SVG letterboxing. Moving the
+    // midpoint also pans, so two-finger gestures do not jump between operations.
+    const navigate = (factor, from, to = from) => {
+      const bounds = svg.getBoundingClientRect();
+      const scale = unitScale(bounds);
+      if (!(scale > 0)) return;
+      const anchor = {
+        x: view.x + (from.x - bounds.left - (bounds.width - view.width * scale) / 2) / scale,
+        y: view.y + (from.y - bounds.top - (bounds.height - view.height * scale) / 2) / scale,
+      };
+      const nextZoom = Math.max(0.25, Math.min(32, zoom * factor));
+      factor = nextZoom / zoom;
+      view.x = anchor.x - (anchor.x - view.x) / factor;
+      view.y = anchor.y - (anchor.y - view.y) / factor;
+      view.width /= factor;
+      view.height /= factor;
+      zoom = nextZoom;
+      const nextScale = unitScale(bounds);
+      view.x -= (to.x - from.x) / nextScale;
+      view.y -= (to.y - from.y) / nextScale;
+      render();
+    };
+    const center = () => {
+      const bounds = viewport.getBoundingClientRect();
+      return { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 };
+    };
+    const button = (text, label, action) => {
+      const control = document.createElement("button");
+      control.type = "button";
+      control.textContent = text;
+      control.setAttribute("aria-label", label);
+      control.addEventListener("click", action);
+      controls.append(control);
+    };
+    button("−", "Zoom out", () => navigate(1 / 1.4, center()));
+    button("+", "Zoom in", () => navigate(1.4, center()));
+    button("Fit", "Fit entire diagram", fit);
+    controls.append(scaleLabel);
+    const gesture = () => {
+      const points = [...pointers.values()].slice(0, 2);
+      const first = points[0], second = points[1] || first;
+      return { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2, distance: Math.hypot(second.x - first.x, second.y - first.y) };
+    };
+    viewport.addEventListener("pointerdown", event => {
+      if (event.button !== 0) return;
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      viewport.setPointerCapture(event.pointerId);
+      viewport.focus({ preventScroll: true });
+    });
+    viewport.addEventListener("pointermove", event => {
+      if (!pointers.has(event.pointerId)) return;
+      const before = gesture();
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      const after = gesture();
+      navigate(before.distance > 0 && after.distance > 0 ? after.distance / before.distance : 1, before, after);
+    });
+    const release = event => pointers.delete(event.pointerId);
+    for (const name of ["pointerup", "pointercancel", "lostpointercapture"]) viewport.addEventListener(name, release);
+    viewport.addEventListener("wheel", event => {
+      // Ordinary scrolling still moves the conversation, not the diagram.
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      const pixels = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1);
+      navigate(Math.exp(-Math.max(-100, Math.min(100, pixels)) * 0.01), { x: event.clientX, y: event.clientY });
+    }, { passive: false });
+    viewport.addEventListener("keydown", event => {
+      if (event.target !== viewport || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (["+", "=", "-", "0", "Home", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) event.preventDefault();
+      if (event.key === "+" || event.key === "=") navigate(1.4, center());
+      else if (event.key === "-") navigate(1 / 1.4, center());
+      else if (event.key === "0" || event.key === "Home") fit();
+      else {
+        const moves = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+        const move = moves[event.key];
+        if (!move) return;
+        view.x += move[0] * view.width * 0.1;
+        view.y += move[1] * view.height * 0.1;
+        render();
+      }
+    });
+    fit();
   }
 }
 /** Reports bounded CSS-pixel content height without treating the viewport floor as content. */
@@ -127,6 +259,7 @@ function receiveArtifact(event) {
     executable.textContent = inert.textContent;
     inert.replaceWith(executable);
   }
+  materializeDiagrams();
   observeHeight();
 }
 window.addEventListener("message", receiveArtifact);

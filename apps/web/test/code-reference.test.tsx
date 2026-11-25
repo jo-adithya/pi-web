@@ -6,15 +6,15 @@ it("opens workspace references from inline code and Markdown links without navig
   const open = vi.fn();
   const page = render(() => <Markdown complete text={'See `src/main.ts:42` and [the handler](apps/server/src/http.rs#L150-L155).'} openCode={open} />);
   fireEvent.click(page.getByRole("link", { name: "src/main.ts:42" }));
-  expect(open).toHaveBeenLastCalledWith({ path: "src/main.ts", line: 42, endLine: 42 });
+  expect(open).toHaveBeenLastCalledWith({ path: "src/main.ts", line: 42, endLine: 42 }, page.getByRole("link", { name: "src/main.ts:42" }));
   fireEvent.click(page.getByRole("link", { name: "the handler" }));
-  expect(open).toHaveBeenLastCalledWith({ path: "apps/server/src/http.rs", line: 150, endLine: 155 });
+  expect(open).toHaveBeenLastCalledWith({ path: "apps/server/src/http.rs", line: 150, endLine: 155 }, page.getByRole("link", { name: "the handler" }));
 });
 it("supports file-only references and never nests source links inside external links", () => {
   const open = vi.fn();
   const page = render(() => <Markdown complete text={'See [the file](src/main.ts) and [`src/other.ts:2`](https://example.com).'} openCode={open} />);
   fireEvent.click(page.getByRole("link", { name: "the file" }));
-  expect(open).toHaveBeenCalledWith({ path: "src/main.ts", line: 1, endLine: 1 });
+  expect(open).toHaveBeenCalledWith({ path: "src/main.ts", line: 1, endLine: 1 }, page.getByRole("link", { name: "the file" }));
   expect(page.getAllByRole("link")).toHaveLength(2);
   expect(page.getByRole("link", { name: "src/other.ts:2" }).getAttribute("href")).toBe("https://example.com");
 });

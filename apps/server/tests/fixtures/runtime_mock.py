@@ -7,7 +7,7 @@ import time
 
 args = sys.argv[1:]
 if "--no-session" in args:
-    # Tool-free response formatter fixture, isolated from the coding transcript.
+    # Isolated formatter fixture; only explicitly enabled snapshot tools may run.
     fixture = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(fixture, "formatter-launch.json"), "w") as file:
         file.write(json.dumps({"pid": os.getpid(), "cwd": os.getcwd()}))
@@ -33,6 +33,20 @@ if "--no-session" in args:
             if os.path.exists(response_path):
                 with open(response_path, encoding="utf-8") as file:
                     answer = file.read()
+            if os.path.exists(os.path.join(fixture, "formatter-lookup")) and "--tools" in args:
+                name = "read_source"
+                block = {"type": "toolCall", "id": "call-1", "name": name, "arguments": {"path": "retry.rs", "line": 1}}
+                with open("source-snapshot.json", encoding="utf-8") as f:
+                    source = json.load(f)["retry.rs"]
+                for event in [
+                    {"type": "message_update", "assistantMessageEvent": {"type": "toolcall_start"}},
+                    {"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse", "content": [block]}},
+                    {"type": "tool_execution_start", "toolCallId": "call-1", "toolName": name, "args": block["arguments"]},
+                    {"type": "tool_execution_end", "toolCallId": "call-1", "toolName": name, "isError": False, "result": {"content": [{"type": "text", "text": source}]}},
+                ]:
+                    print(json.dumps(event), flush=True)
+                if "const RETRIES: usize = 4;" in source:
+                    answer = json.dumps({"summary": "The source sets the limit to 4.", "blocks": []})
             if timed:
                 time.sleep(0.05)
                 midpoint = len(answer) // 2
@@ -156,7 +170,17 @@ for line in sys.stdin:
         emit({"type": "message_end", "message": {"role": "user", "content": command["message"]}})
     elif kind == "prompt":
         text = command["message"]
-        if command.get("images"):
+        if text.startswith("author-note-fixture\n"):
+            import re
+            note_turn = re.search(r'\[Pi Web review notes turn ([^\]]+)\]', text).group(1)
+            note_value = {"path": "a.ts", "side": "new", "line": 2, "quote": "new", "text": "Keep retries."}
+            active = True
+            emit({"type": "agent_start"})
+            response(command, {"disposition": "started"})
+            with open("a.ts", "w") as file:
+                file.write("context\nnew\n")
+            emit({"type": "extension_ui_request", "id": "note-record", "method": "input", "title": "pi-web:review-note:v1:" + json.dumps({"turn": note_turn, "operation": {"action": "record", "id": "retry", "note": note_value}})})
+        elif command.get("images"):
             emit({"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": text}] + command["images"]}})
             emit({"type": "message_end", "message": {"role": "toolResult", "content": [{"type": "text", "text": "PRIVATE_TOOL_TEXT"}] + command["images"]}})
             response(command, {"disposition": "handled"})
@@ -353,6 +377,26 @@ for line in sys.stdin:
             emit({"type": "agent_settled", "aborted": True})
             response(command)
     elif kind == "extension_ui_response":
+        if command["id"].startswith("note-"):
+            reply = json.loads(command["value"])
+            assert "error" not in reply, reply
+            if command["id"] == "note-record":
+                note_version = reply["data"]["version"]
+                next_id, operation = "note-list", {"action": "list"}
+            elif command["id"] == "note-list":
+                assert reply["data"]["notes"][0]["note"] == note_value
+                next_id, operation = "note-delete", {"action": "delete", "id": "retry", "version": note_version}
+            elif command["id"] == "note-delete":
+                assert reply["data"]["deleted"] == "retry"
+                next_id, operation = "note-final", {"action": "record", "id": "retry", "note": note_value}
+            else:
+                assert reply["data"]["version"] > note_version
+                active = False
+                settled_once = True
+                emit({"type": "agent_settled", "aborted": False})
+                continue
+            emit({"type": "extension_ui_request", "id": next_id, "method": "input", "title": "pi-web:review-note:v1:" + json.dumps({"turn": note_turn, "operation": operation})})
+            continue
         if command.get("cancelled") and command["id"] in late_dialog_ids:
             late_dialog_ids.remove(command["id"])
             if not late_dialog_ids and pending_abort is not None:

@@ -11,6 +11,37 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+#[tokio::test]
+async fn author_note_policy_reaches_existing_runtime_without_affecting_slash_commands_or_read_only_mode() {
+    for (enabled, isolated, prompt, expected) in [
+        (true, false, "Implement recovery", true),
+        (false, false, "Implement recovery", false),
+        (true, true, "Implement recovery", false),
+        (true, false, "/example-command", false),
+    ] {
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        config.isolated = isolated;
+        let policy = config.author_notes.clone();
+        let handle = session::start(config).unwrap();
+        let mut connection = handle.connect("client".into()).await.unwrap();
+        let identity = ready(&mut connection).await;
+        policy.store(enabled, Ordering::Relaxed);
+        send(&handle, &identity, "note-prompt", BrowserAction::Prompt { text: prompt.into(), images: vec![] });
+        assert!(result(&mut connection, "note-prompt").await.ok);
+        let commands = fixture.log();
+        let sent = commands.iter().find(|command| command["type"] == "prompt" && command["message"].as_str().is_some_and(|text| text.starts_with(prompt))).unwrap()["message"].as_str().unwrap();
+        assert_eq!(sent.contains("[Project preference: author notes]"), expected);
+        if expected {
+            assert!(sent.contains("record_review_note"));
+            assert!(sent.ends_with(&format!("[Pi Web review notes turn {}:1]", identity.epoch)));
+            assert!(sent.contains("Do not record notes for questions or read-only reviews"));
+            assert!(!sent.contains(".pi/review-notes/"));
+        } else { assert_eq!(sent, prompt); }
+        assert!(handle.shutdown().await);
+    }
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture(PathBuf);
 impl Fixture {
@@ -63,13 +94,16 @@ async fn until(
     connection: &mut Connection,
     predicate: impl Fn(&ServerMessage) -> bool,
 ) -> ServerMessage {
-    for _ in 0..100 {
-        let message = next(connection).await;
-        if predicate(&message) {
-            return message;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let message = next(connection).await;
+            if predicate(&message) {
+                return message;
+            }
         }
-    }
-    panic!("too many frames");
+    })
+    .await
+    .expect("matching frame deadline")
 }
 async fn ready(connection: &mut Connection) -> ServerMessage {
     let message = until(connection, |message| matches!(&message.body, ServerBody::Snapshot { status, .. } | ServerBody::Event { status, .. } if matches!(status.process, pi_web::protocol::ProcessStatus::Failed | pi_web::protocol::ProcessStatus::Exited) || (status.process == pi_web::protocol::ProcessStatus::Ready && status.history_warning.is_none()))).await;
@@ -988,11 +1022,55 @@ async fn html_previews_bypass_response_formatting_and_survive_reconnect() {
     assert!(handle.shutdown().await);
 }
 
+#[tokio::test]
+async fn acknowledgements_keep_original_text_and_reconnect_without_a_formatter() {
+    use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
+    let fixture = Fixture::new();
+    let source = "Done!";
+    fs::write(fixture.0.join("coding-response.txt"), source).unwrap();
+    fs::write(fixture.0.join("formatter-persist-history"), "").unwrap();
+    fs::write(fixture.0.join("formatter-invalid"), "").unwrap();
+    let config = fixture.config();
+    let handle = session::start(config.clone()).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    send(&handle, &identity, "complete", BrowserAction::Prompt { text: "complete".into(), images: vec![] });
+    let frame = until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { patches, .. } if patches.iter().any(|patch| matches!(patch, ViewPatch::Message { message } if matches!(message.presentation, Some(ResponsePresentation::Ready { .. })))))).await;
+    let ServerBody::Event { patches, .. } = frame.body else { unreachable!() };
+    let response = patches.iter().find_map(|patch| match patch {
+        ViewPatch::Message { message } => match &message.presentation {
+            Some(ResponsePresentation::Ready { response, timings: Some(timings) }) => { assert_eq!(timings.model, "direct"); Some(response.clone()) }, _ => None,
+        }, _ => None,
+    }).unwrap();
+    assert_eq!(response.summary, source);
+    assert!(response.blocks.is_empty());
+    assert_eq!(response.recorded.as_ref().unwrap().tools.len(), 1);
+    assert!(handle.shutdown().await);
+    let handle = session::start(config).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let snapshot = until(&mut connection, |frame| matches!(&frame.body, ServerBody::Snapshot { messages, .. } if messages.iter().any(|message| matches!(message.presentation, Some(ResponsePresentation::Ready { .. }))))).await;
+    let ServerBody::Snapshot { messages, .. } = snapshot.body else { unreachable!() };
+    assert!(messages.iter().any(|message| matches!(&message.presentation, Some(ResponsePresentation::Ready { response: saved, timings: Some(timings) }) if *saved == response && timings.cached)));
+    assert!(!fixture.0.join("formatter-calls.jsonl").exists());
+    assert!(!fixture.0.join("formatter-launch.json").exists());
+    assert!(handle.shutdown().await);
+}
+
+/// Long source keeps formatter integration tests on the model path.
+fn formatting_source(prefix: &str) -> String {
+    format!("{prefix}\n\n{}", "Supporting source context for this completed task. ".repeat(20))
+}
+fn formatting_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("coding-response.txt"), formatting_source("**Completed** safely.")).unwrap();
+    fixture
+}
+
 /// Simplification is once per settled answer, never once per token/tool turn or browser attach.
 #[tokio::test]
 async fn response_formatter_waits_for_settlement_and_scopes_each_turns_observations() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     fs::write(fixture.0.join("formatter-timing-delays"), "").unwrap();
     fs::write(fixture.0.join("work-timing-delays"), "").unwrap();
     fs::write(fixture.0.join("retry-agent-start"), "").unwrap();
@@ -1018,6 +1096,7 @@ async fn response_formatter_waits_for_settlement_and_scopes_each_turns_observati
     assert!(timing.is_object(), "completed formatting must expose measured stages");
     assert_eq!(timing["model"], "fixture/cheap");
     assert_eq!(timing["cached"], false);
+    assert!(timing["saveMs"].is_u64(), "the live reply includes the completed save attempt");
     assert!(timing["workMs"].as_u64().expect("Pi work must be recorded separately") >= 150, "includes prompt preparation and intermediate tool turns");
     assert!(timing["startupMs"].as_u64().unwrap() >= 40);
     assert!(timing["firstTextMs"].as_u64().unwrap() >= 50);
@@ -1025,7 +1104,12 @@ async fn response_formatter_waits_for_settlement_and_scopes_each_turns_observati
     assert!(timing["totalMs"].as_u64().unwrap() >= timing["queueMs"].as_u64().unwrap() + timing["startupMs"].as_u64().unwrap() + timing["modelMs"].as_u64().unwrap() + timing["cleanupMs"].as_u64().unwrap());
     let log = || fs::read_to_string(fixture.0.join("formatter-calls.jsonl")).unwrap().lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
     assert_eq!(log().len(), 1);
+    let launch = log();
+    let args = launch[0]["args"].as_array().unwrap();
+    assert!(args.windows(2).any(|pair| pair[0] == "--system-prompt" && pair[1] == include_str!("../src/response_format/planner.txt")), "formatter must receive the bundled editing prompt");
+    assert!(args.windows(2).any(|pair| pair[0] == "--extension" && pair[1].as_str().is_some_and(|s| s.ends_with("planner-schema.ts"))), "formatter must attach the response schema adapter");
     assert!(log()[0]["input"]["answer"].as_str().unwrap().starts_with("Earlier finding: restart is required.\n\n**Completed** safely."), "all replies reach one formatter request in chronological order");
+    assert_eq!(log()[0]["input"]["userQuery"], "format-multiple");
     assert!(!log()[0]["input"].to_string().contains("PRIVATE_THINKING"));
     assert!(!log()[0]["input"].to_string().contains("Hello"));
     let mut observer = handle.connect("observer".into()).await.unwrap();
@@ -1042,8 +1126,12 @@ async fn response_formatter_waits_for_settlement_and_scopes_each_turns_observati
     until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { patches, .. } if patches.iter().any(|patch| matches!(patch, ViewPatch::Message { message } if matches!(message.presentation, Some(ResponsePresentation::Ready { .. })))))).await;
     assert_eq!(log().len(), 2, "duplicate settlement adds no call, but a new turn gets its own observations");
     assert!(!log()[1]["input"].to_string().contains("Earlier finding:"), "a new query must not borrow earlier replies");
+    assert_eq!(log()[1]["input"]["userQuery"], "format-duplicate");
+    assert!(!log()[1]["input"].to_string().contains("format-multiple"), "no earlier queries belong in the formatter input");
     let saved: Vec<serde_json::Value> = fs::read_dir(fixture.0.join("state/response-formats")).unwrap().map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap()).collect();
-    assert!(saved.iter().any(|entry| entry["presentation"]["timings"] == *timing), "original timings must survive restart");
+    let mut historical = timing.clone();
+    historical.as_object_mut().unwrap().remove("saveMs");
+    assert!(saved.iter().any(|entry| entry["presentation"]["timings"] == historical), "historical timings must survive without live delivery measurements");
     assert!(handle.shutdown().await);
     let handle = session::start(config).unwrap();
     let mut connection = handle.connect("client".into()).await.unwrap();
@@ -1057,7 +1145,7 @@ async fn response_formatter_waits_for_settlement_and_scopes_each_turns_observati
 #[tokio::test]
 async fn response_formatter_publishes_only_one_reply_after_the_entire_run_settles() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     fs::write(fixture.0.join("pause-final-settlement"), "").unwrap();
     fs::write(fixture.0.join("formatter-hold"), "").unwrap();
     let handle = session::start(fixture.config()).unwrap();
@@ -1095,9 +1183,9 @@ async fn response_formatter_publishes_only_one_reply_after_the_entire_run_settle
 #[tokio::test]
 async fn response_formatter_preserves_parser_failure_after_restart_without_inference() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     fs::write(fixture.0.join("formatter-persist-history"), "").unwrap();
-    fs::write(fixture.0.join("formatter-response.json"), r#"{"summary":"DO_NOT_PERSIST_MODEL_TEXT","blocks":[{"type":"workflow","title":"Unrecognized block","text":"DO_NOT_PERSIST_MODEL_TEXT"}]}"#).unwrap();
+    fs::write(fixture.0.join("formatter-response.json"), r#"{"summary":"DO_NOT_PERSIST_MODEL_TEXT","blocks":"DO_NOT_PERSIST_MODEL_TEXT"}"#).unwrap();
     let config = fixture.config();
     let handle = session::start(config.clone()).unwrap();
     let mut connection = handle.connect("client".into()).await.unwrap();
@@ -1108,7 +1196,7 @@ async fn response_formatter_preserves_parser_failure_after_restart_without_infer
     let expected = patches.iter().find_map(|patch| match patch {
         ViewPatch::Message { message } => match &message.presentation { Some(ResponsePresentation::Error { message, .. }) => Some(message.clone()), _ => None }, _ => None,
     }).unwrap();
-    assert!(expected.contains(r#"unknown variant "workflow""#) && expected.contains("line ") && expected.contains("column "), "{expected}");
+    assert!(expected.contains("invalid type; expected a sequence") && expected.contains("line ") && expected.contains("column "), "{expected}");
     assert!(!expected.contains("DO_NOT_PERSIST_MODEL_TEXT"));
     let files: Vec<_> = fs::read_dir(fixture.0.join("state/response-formats")).unwrap().map(|entry| entry.unwrap().path()).collect();
     assert_eq!(files.len(), 1);
@@ -1130,9 +1218,12 @@ async fn response_formatter_preserves_parser_failure_after_restart_without_infer
 #[tokio::test]
 async fn response_formatter_errors_are_retryable_without_reprompting_pi() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
+    fs::write(fixture.0.join("coding-response.txt"), "Check `retry.rs`. ").unwrap();
+    fs::write(fixture.0.join("retry.rs"), "// original\n").unwrap();
     fs::write(fixture.0.join("formatter-invalid"), "").unwrap();
     let mut config = fixture.config();
+    config.response_lookups = true;
     config.response_model = pi_web::config::ResponseModel { provider: "fixture".into(), id: "cheap".into() };
     let handle = session::start(config).unwrap();
     let mut connection = handle.connect("client".into()).await.unwrap();
@@ -1156,6 +1247,9 @@ async fn response_formatter_errors_are_retryable_without_reprompting_pi() {
     assert_eq!(timings.work_ms, None, "a formatting retry must not reuse the previous run clock or include user retry delay");
     assert_eq!(fs::read_to_string(fixture.0.join("formatter-calls.jsonl")).unwrap().lines().count(), 2);
     let calls: Vec<serde_json::Value> = fs::read_to_string(fixture.0.join("formatter-calls.jsonl")).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(calls[0]["input"]["sourceFiles"], serde_json::json!(["retry.rs"]));
+    assert!(calls[1]["input"].get("sourceFiles").is_none(), "retry must not sample the current workspace");
+    assert!(calls[1]["input"].get("userQuery").is_none(), "retry does not pull user text from the transcript");
     assert_eq!(calls[0]["input"]["answer"], calls[1]["input"]["answer"], "retry uses every original reply, not just the final message");
     assert!(calls[1]["input"]["answer"].as_str().unwrap().starts_with("Earlier finding:"));
     assert_eq!(fixture.log().iter().filter(|command| command["type"] == "prompt" && command["message"] == "format-multiple").count(), 1, "retry must not rerun agent work");
@@ -1165,8 +1259,53 @@ async fn response_formatter_errors_are_retryable_without_reprompting_pi() {
 }
 
 #[tokio::test]
+async fn response_formatter_retries_only_storage_after_a_paid_answer() {
+    use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
+    let fixture = formatting_fixture();
+    let hold = fixture.0.join("formatter-hold");
+    fs::write(&hold, "").unwrap();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    send(&handle, &identity, "complete", BrowserAction::Prompt { text: "complete".into(), images: vec![] });
+    let calls = fixture.0.join("formatter-calls.jsonl");
+    tokio::time::timeout(Duration::from_secs(3), async { while !calls.exists() { tokio::time::sleep(Duration::from_millis(5)).await; } }).await.unwrap();
+    // Move only this fixture's storage after cache lookup, before the completed answer is saved.
+    let records = fixture.0.join("state/response-formats");
+    let moved = fixture.0.join("held-records");
+    fs::rename(&records, &moved).unwrap(); fs::remove_file(hold).unwrap();
+    fn unsaved(patch: &ViewPatch) -> Option<(&String, &ResponsePresentation)> {
+        let ViewPatch::Message { message } = patch else { return None; };
+        let p @ ResponsePresentation::Unsaved { .. } = message.presentation.as_ref()? else { return None; };
+        Some((&message.id, p))
+    }
+    let frame = until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { patches, .. } if patches.iter().any(|p| unsaved(p).is_some()))).await;
+    let ServerBody::Event { patches, .. } = frame.body else { unreachable!() };
+    let (message_id, p) = patches.iter().find_map(unsaved).unwrap();
+    let state = serde_json::to_value(p).unwrap();
+    assert_eq!(state["response"]["summary"], "I finished the work.");
+    send(&handle, &identity, "do-not-infer", BrowserAction::RetryResponse { message_id: message_id.clone() });
+    assert!(!result(&mut connection, "do-not-infer").await.ok);
+    let save = || BrowserAction::RetryResponseSave { message_id: message_id.clone() };
+    send(&handle, &identity, "still-full", save());
+    assert!(!result(&mut connection, "still-full").await.ok);
+    fs::rename(moved, &records).unwrap();
+    send(&handle, &identity, "save", save());
+    assert!(result(&mut connection, "save").await.ok);
+    let saved = fs::read_dir(records).unwrap().next().unwrap().unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(saved.path()).unwrap()).unwrap();
+    assert_eq!(record["presentation"]["state"], "ready");
+    assert_eq!(record["presentation"]["response"], state["response"]);
+    let mut historical = state["timings"].clone();
+    assert!(historical.as_object_mut().unwrap().remove("saveMs").is_some());
+    assert_eq!(record["presentation"]["timings"], historical);
+    assert_eq!(fs::read_to_string(calls).unwrap().lines().count(), 1);
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
 async fn response_formatter_is_nonblocking_and_reaps_its_child_on_shutdown() {
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     fs::write(fixture.0.join("formatter-hold"), "").unwrap();
     let mut config = fixture.config();
     config.response_model = pi_web::config::ResponseModel { provider: "fixture".into(), id: "cheap".into() };
@@ -1190,7 +1329,7 @@ async fn response_formatter_is_nonblocking_and_reaps_its_child_on_shutdown() {
 #[tokio::test]
 async fn response_formatter_accepts_large_streamed_json_and_restores_it_without_inference() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     let table = serde_json::json!({"type":"table","title":"Data","columns":["A","B","C","D","E","F"],"rows":vec![vec!["x".repeat(190); 6]; 32]});
     let expected = serde_json::json!({"summary":"Four detailed tables.","blocks":vec![table; 4]});
     let text = expected.to_string();
@@ -1253,7 +1392,7 @@ async fn history_pages_and_lazy_originals_release_old_payloads_without_model_cal
     let identity = ready(&mut connection).await;
     for index in 0..45 {
         fs::write(fixture.0.join("formatter-response.json"), serde_json::json!({"summary":format!("Saved reply {index}"),"blocks":[]}).to_string()).unwrap();
-        fs::write(fixture.0.join("coding-response.txt"), format!("Original reply {index}")).unwrap();
+        fs::write(fixture.0.join("coding-response.txt"), formatting_source(&format!("Original reply {index}"))).unwrap();
         send(&handle, &identity, &format!("turn-{index}"), BrowserAction::Prompt { text: "complete".into(), images: vec![] });
         until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { patches, .. } if patches.iter().any(|patch| matches!(patch, ViewPatch::Message { message } if matches!(&message.presentation, Some(ResponsePresentation::Ready { response, .. }) if response.summary == format!("Saved reply {index}")))))).await;
     }
@@ -1272,7 +1411,7 @@ async fn history_pages_and_lazy_originals_release_old_payloads_without_model_cal
     assert!(older.iter().filter(|message| message.role == "assistant").all(|message| message.blocks.is_empty()));
     let key = older.iter().find_map(|message| message.source_key.clone()).unwrap();
     let original = handle.read_history(HistoryRequest::Original { cursor: Some(cursor.clone()), source_key: key.clone() }).await.unwrap();
-    assert!(matches!(original, HistoryResponse::Original { text, .. } if text == "Original reply 25"));
+    assert!(matches!(original, HistoryResponse::Original { text, .. } if text == formatting_source("Original reply 25")));
     let mut next = older_cursor;
     for range in [15..25, 5..15] {
         let HistoryResponse::Page { messages, older_cursor, .. } = handle.read_history(HistoryRequest::Page { cursor: next, start: None }).await.unwrap() else { panic!("expected older page") };
@@ -1288,7 +1427,7 @@ async fn history_pages_and_lazy_originals_release_old_payloads_without_model_cal
     send(&handle, &identity, "working", BrowserAction::Prompt { text: "keep-working".into(), images: vec![] });
     until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { status, .. } if status.activity == pi_web::view::Activity::Running)).await;
     let original = handle.read_history(HistoryRequest::Original { cursor: Some(cursor), source_key: key }).await.unwrap();
-    assert!(matches!(original, HistoryResponse::Original { text, .. } if text == "Original reply 25"));
+    assert!(matches!(original, HistoryResponse::Original { text, .. } if text == formatting_source("Original reply 25")));
     assert_eq!(fs::read_to_string(fixture.0.join("formatter-calls.jsonl")).unwrap().lines().count(), 45, "navigation and Original must never invoke a formatter");
     assert!(handle.shutdown().await);
 }
@@ -1307,7 +1446,7 @@ async fn response_formatter_keeps_all_results_beyond_eight_entries_and_48_kib_on
         let summary = format!("Saved result {index}");
         let response = serde_json::json!({"summary":summary,"blocks":(0..4).map(|block| serde_json::json!({"type":"note","title":format!("Context {block}"),"text":"x".repeat(1100)})).collect::<Vec<_>>()});
         fs::write(fixture.0.join("formatter-response.json"), response.to_string()).unwrap();
-        fs::write(fixture.0.join("coding-response.txt"), format!("Original reply {index}")).unwrap();
+        fs::write(fixture.0.join("coding-response.txt"), formatting_source(&format!("Original reply {index}"))).unwrap();
         send(&handle, &identity, &format!("complete-{index}"), BrowserAction::Prompt { text: "complete".into(), images: vec![] });
         let frame = until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { patches, .. } if patches.iter().any(|patch| matches!(patch, ViewPatch::Message { message } if matches!(&message.presentation, Some(ResponsePresentation::Ready { response, .. }) if response.summary == summary))))).await;
         let ServerBody::Event { patches, .. } = frame.body else { unreachable!() };
@@ -1335,7 +1474,7 @@ async fn response_formatter_keeps_all_results_beyond_eight_entries_and_48_kib_on
 #[tokio::test]
 async fn response_formatter_restores_saved_history_after_server_restart_without_inference() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     fs::write(fixture.0.join("formatter-persist-history"), "").unwrap();
     let source = "  const value = \"<script>literal()</script>\";\r\n";
     let mut generated = serde_json::json!({"summary":"Useful result. ".repeat(100),"canvas":{"layout":"task_outcome","headline":"Completed","focus":9},"blocks":vec![serde_json::json!({"type":"note","title":"Supporting context","text":"Useful detail. ".repeat(200)}); 10]});
@@ -1373,11 +1512,11 @@ async fn response_formatter_restores_saved_history_after_server_restart_without_
 #[tokio::test]
 async fn response_formatter_delivers_visual_blocks_in_one_formatting_call() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     let expected = serde_json::json!({"summary":"Visual component example. Values are illustrative.","blocks":[
         {"type":"table","title":"Comparison","columns":["Option","Time"],"rows":[["A","2 s"],["B","3 s"]]},
         {"type":"facts","title":"Key facts","items":[{"label":"Layouts","value":"4"}]},
-        {"type":"comparison","title":"Change","before":"Long text.","after":"Short visual answer."},
+        {"type":"comparison","title":"Display","left":{"title":"Transcript","text":"Long text."},"right":{"title":"Simple answer","text":"Short visual answer."}},
         {"type":"flow","title":"Answer path","items":["Pi","Formatter","UI"]}
     ]});
     fs::write(fixture.0.join("formatter-response.json"), expected.to_string()).unwrap();
@@ -1409,8 +1548,8 @@ async fn response_formatter_delivers_visual_blocks_in_one_formatting_call() {
 #[tokio::test]
 async fn response_formatter_delivers_adaptive_plans_and_resolves_only_observed_references() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
-    let expected = serde_json::json!({"summary":"One server routes the request.","canvas":{"layout":"explanation","headline":"Sessions stay separate","focus":0},"blocks":[
+    let fixture = formatting_fixture();
+    let expected = serde_json::json!({"summary":"One server routes the request.","canvas":{"layout":"explanation","headline":"Sessions stay separate","focus":null,"composition":{"type":"section","title":"Routing context","children":[{"type":"columns","ratio":"leading","children":[{"type":"block","index":0},{"type":"block","index":1}]}]}},"blocks":[
         {"type":"diagram","title":"Routing","nodes":[{"id":"a","label":"Browser","kind":"input"},{"id":"b","label":"Server","kind":"process"}],"edges":[{"from":"a","to":"b","label":"request","relation":"direct"}]},
         {"type":"evidence","title":"Observed work","items":["tool:0"]}
     ]});
@@ -1434,7 +1573,7 @@ async fn response_formatter_delivers_adaptive_plans_and_resolves_only_observed_r
 #[tokio::test]
 async fn response_formatter_rejects_unavailable_reference_ids_without_inventing_observations() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
     fs::write(fixture.0.join("formatter-response.json"), r#"{"summary":"Done","blocks":[{"type":"evidence","title":"Work","items":["file:7"]}]}"#).unwrap();
     let handle = session::start(fixture.config()).unwrap();
     let mut connection = handle.connect("client".into()).await.unwrap();
@@ -1446,11 +1585,59 @@ async fn response_formatter_rejects_unavailable_reference_ids_without_inventing_
 }
 
 #[tokio::test]
+async fn response_formatter_can_read_cited_source_without_attaching_it_to_the_initial_prompt() {
+    use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
+    let fixture = formatting_fixture();
+    fs::write(fixture.0.join("retry.rs"), "const RETRIES: usize = 4;\n").unwrap();
+    fs::write(fixture.0.join("coding-response.txt"), "The retry limit is defined in `retry.rs:1`.").unwrap();
+    fs::write(fixture.0.join("formatter-lookup"), "").unwrap();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    send(&handle, &identity, "complete", BrowserAction::Prompt { text: "complete".into(), images: vec![] });
+    let frame = until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { patches, .. } if patches.iter().any(|patch| matches!(patch, ViewPatch::Message { message } if matches!(message.presentation, Some(ResponsePresentation::Ready { .. } | ResponsePresentation::Error { .. })))))).await;
+    let received = serde_json::to_string(&frame).unwrap();
+    assert!(received.contains("The source sets the limit to 4."), "only the final answer after lookup should be delivered");
+    assert!(!received.contains("const RETRIES"));
+    let log = fs::read_to_string(fixture.0.join("formatter-calls.jsonl")).unwrap();
+    let call: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(call["input"]["sourceFiles"], serde_json::json!(["retry.rs"]));
+    assert!(!call["input"].to_string().contains("const RETRIES"));
+    assert!(call["args"].as_array().unwrap().windows(2).any(|pair| pair[0] == "--tools" && pair[1] == "search_source,read_source"));
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
+async fn response_formatter_keeps_the_final_literal_diff_even_with_a_prose_draft() {
+    use pi_web::{response_format::{ResponseCard, ResponsePresentation}, view::ViewPatch};
+    let fixture = formatting_fixture();
+    let patch = "- <TabsContent key={kindFilter} value={kindFilter}>\n+ <TabsContent value={kindFilter}>\n";
+    fs::write(fixture.0.join("coding-response.txt"), format!("Remove only the panel’s key.\n\n```diff\n{patch}```\n\nFiltered-out cards still unmount.")).unwrap();
+    fs::write(fixture.0.join("formatter-response.json"), r#"{"summary":"Remove only the panel’s key. Filtered-out cards still unmount.","blocks":[]}"#).unwrap();
+    let handle = session::start(fixture.config()).unwrap();
+    let mut connection = handle.connect("client".into()).await.unwrap();
+    let identity = ready(&mut connection).await;
+    send(&handle, &identity, "complete", BrowserAction::Prompt { text: "complete".into(), images: vec![] });
+    let frame = until(&mut connection, |frame| matches!(&frame.body, ServerBody::Event { patches, .. } if patches.iter().any(|patch| matches!(patch, ViewPatch::Message { message } if matches!(message.presentation, Some(ResponsePresentation::Ready { .. } | ResponsePresentation::Error { .. })))))).await;
+    let ServerBody::Event { patches, .. } = frame.body else { unreachable!() };
+    let response = patches.iter().find_map(|patch| match patch {
+        ViewPatch::Message { message } => match &message.presentation { Some(ResponsePresentation::Ready { response, .. }) => Some(response), _ => None },
+        _ => None,
+    }).expect("the original short diff belongs in a usable Simple reply");
+    assert!(matches!(&response.blocks[..], [ResponseCard::Code { code, language: Some(language), snippet_diff: None, .. }] if code == patch && language == "diff"));
+    assert!(response.summary.contains("Filtered-out cards still unmount."));
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
 async fn response_formatter_rejects_tool_attempts() {
     use pi_web::{response_format::ResponsePresentation, view::ViewPatch};
-    let fixture = Fixture::new();
+    let fixture = formatting_fixture();
+    fs::write(fixture.0.join("coding-response.txt"), "See `main.rs`.").unwrap();
+    fs::write(fixture.0.join("main.rs"), "fn main() {}\n").unwrap();
     fs::write(fixture.0.join("formatter-tool"), "").unwrap();
     let mut config = fixture.config();
+    config.response_lookups = true;
     config.response_model = pi_web::config::ResponseModel { provider: "fixture".into(), id: "cheap".into() };
     let handle = session::start(config).unwrap();
     let mut connection = handle.connect("client".into()).await.unwrap();
@@ -1520,7 +1707,9 @@ async fn tool_execution_payloads_never_reach_browser_frames() {
         loop {
             let frame = next(&mut connection).await;
             let serialized = serde_json::to_string(&frame).unwrap();
-            for private in ["tool-1", "fixture.txt", "fixture content", "\"tools\"", "\"tool\""] {
+            // Ready replies can share this frame and include sanitized recorded.tools.
+            assert!(serde_json::to_value(&frame).unwrap()["body"].get("tools").is_none());
+            for private in ["tool-1", "fixture.txt", "fixture content", "\"tool\""] {
                 assert!(!serialized.contains(private), "tool payload published: {serialized}");
             }
             completed |= serialized.contains("Completed");
@@ -1818,7 +2007,7 @@ async fn run_completion_is_live_only_and_once_per_settlement() {
     })
     .await;
     assert!(
-        matches!(completed.body, ServerBody::RunCompleted { run_id, outcome: pi_web::protocol::RunOutcome::Success } if run_id == "1")
+        matches!(completed.body, ServerBody::RunCompleted { run_id, outcome: pi_web::protocol::RunOutcome::Success, wait_for_message_id: Some(id) } if run_id == "1" && !id.is_empty())
     );
     send(&handle, &identity, "replay", BrowserAction::Attach);
     loop {

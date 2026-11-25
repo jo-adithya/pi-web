@@ -108,6 +108,20 @@ it("notifies once for live completion, never for snapshots, stale epochs or disc
   expect(completed).toHaveBeenLastCalledWith("session", "error");
 });
 
+it.each(["ready", "error"] as const)("waits for the matching simplified reply (%s) before notifying", terminal => {
+  const { model, completed } = setup();
+  const done = { type: "run_completed", runId: "1", outcome: "success", waitForMessageId: "reply" } as const;
+  model.receive(frame(done));
+  let seq = 0;
+  const update = (id: string, state: "pending" | "ready" | "error") => model.receive(frame({ type: "event", seq: ++seq, dialogs: [], olderHistory: false, status: initialState().status,
+    patches: [{ kind: "message", message: { id, role: "assistant", complete: true, truncated: false, blocks: [], error: null,
+      presentation: state === "ready" ? { state, response: { summary: "Finished", blocks: [] } } : state === "error" ? { state, message: "Try again", retryable: true } : { state } } }] }));
+  update("reply", "pending"); update("another", "ready");
+  expect(completed).not.toHaveBeenCalled();
+  update("reply", terminal); update("reply", terminal); model.receive(frame(done));
+  expect(completed).toHaveBeenCalledExactlyOnceWith("session", terminal === "error" ? "error" : "success");
+});
+
 async function chooseOption(trigger: HTMLElement, name: string) {
   fireEvent.keyDown(trigger, { key: "Enter" }); flush();
   fireEvent.keyDown(screen.getByRole("option", { name }), { key: "Enter" }); flush();

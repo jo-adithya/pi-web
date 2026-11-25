@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-li
 import { flush } from "solid-js";
 import { LocalReview } from "../src/LocalReview";
 import { createSessionModel } from "../src/session-model";
+import { emptyNotebook } from "../src/review-notebook";
 import { createBranchList, fetchBranches, type BranchList } from "../src/branch-review";
 
 const branches = { branches: [{ ref: "refs/heads/main", name: "main", kind: "local" }, { ref: "refs/remotes/origin/main", name: "origin/main", kind: "remote" }], truncated: false };
@@ -12,11 +13,12 @@ function openPicker(trigger: HTMLElement) {
   fireEvent.click(trigger); flush();
 }
 const snapshot = { files: [{ path: "main.ts", previousPath: null, status: "modified", patch: "@@ -1 +1 @@\n-old\n+new\n", fingerprint: "file" }], truncated: false, note: null };
+const reviewState = (url: string) => url.endsWith("/notebook") ? emptyNotebook() : url.endsWith("/source") ? { enabled: false } : snapshot;
 beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(window, "scrollTo").mockImplementation(() => {}); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it("compares a picked branch immediately without offering manual entry", async () => {
-  const request = vi.fn(async (url: string, _init: RequestInit) => new Response(JSON.stringify(url.endsWith("/branches") ? branches : snapshot)));
+  const request = vi.fn(async (url: string, _init: RequestInit) => new Response(JSON.stringify(url.endsWith("/branches") ? branches : reviewState(url))));
   vi.stubGlobal("fetch", request);
   const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
@@ -32,7 +34,7 @@ it("compares a picked branch immediately without offering manual entry", async (
   fireEvent.click(screen.getByRole("option", { name: "origin/main · Remote (stored locally)" })); flush();
   expect(picker.textContent).toContain("origin/main");
   await waitFor(() => { flush(); expect(model.review.target()).toEqual({ scope: "branch", base: "refs/remotes/origin/main" }); expect(model.review.busy()).toBe(false); });
-  expect(request.mock.calls.filter(([url]) => !url.endsWith("/branches"))).toHaveLength(2);
+  expect(request.mock.calls.filter(([url]) => url === "/review/s")).toHaveLength(2);
   expect(page.container.querySelector(".review-base .field-label")).toBeNull();
   expect(page.queryByText(/Committed changes since divergence; excludes uncommitted edits/)).toBeNull();
   expect(page.queryByText(/may be stale/)).toBeNull();
@@ -44,7 +46,7 @@ it("compares a picked branch immediately without offering manual entry", async (
 it("does not reload changes or cancel a pending search while typing with a selected base", async () => {
   let reply!: (value: Response) => void;
   const request = vi.fn(async (url: string, init: RequestInit) => {
-    if (!url.endsWith("/branches")) return new Response(JSON.stringify(snapshot));
+    if (!url.endsWith("/branches")) return new Response(JSON.stringify(reviewState(url)));
     const query = JSON.parse(init.body as string).query;
     return query ? new Promise<Response>(resolve => { reply = resolve; }) : new Response(JSON.stringify(branches));
   });
@@ -73,7 +75,7 @@ it("does not reload changes or cancel a pending search while typing with a selec
 it("searches beyond the initial branch limit and compares only when a branch is picked", async () => {
   const initial = { branches: Array.from({ length: 100 }, (_, i) => ({ ref: `refs/heads/feature-${i}`, name: `feature-${i}`, kind: "local" })), truncated: true };
   const request = vi.fn(async (url: string, init: RequestInit) => {
-    if (!url.endsWith("/branches")) return new Response(JSON.stringify(snapshot));
+    if (!url.endsWith("/branches")) return new Response(JSON.stringify(reviewState(url)));
     const query = (JSON.parse(init.body as string).query ?? "").trim().toLowerCase();
     return new Response(JSON.stringify(!query ? initial : { branches: query === "origin/main" ? [branches.branches[1]] : [], truncated: false }));
   });
@@ -110,7 +112,7 @@ it("can reload a failed branch list without offering manual entry", async () => 
   let failed = true;
   vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("/branches") && failed
     ? new Response(JSON.stringify({ error: "Branches unavailable" }), { status: 422 })
-    : new Response(JSON.stringify(url.endsWith("/branches") ? branches : snapshot))));
+    : new Response(JSON.stringify(url.endsWith("/branches") ? branches : reviewState(url)))));
   const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await page.findByRole("article"); fireEvent.click(page.getByRole("button", { name: "Branch" }));
@@ -130,7 +132,7 @@ it("reopens a blank-base review without an error and retries an interrupted bran
   let reply!: (value: Response) => void, loads = 0;
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     if (url.endsWith("/branches") && ++loads === 1) return new Promise<Response>(resolve => { reply = resolve; });
-    return new Response(JSON.stringify(url.endsWith("/branches") ? branches : snapshot));
+    return new Response(JSON.stringify(url.endsWith("/branches") ? branches : reviewState(url)));
   }));
   const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
   const first = render(() => <LocalReview model={model} conversation={() => {}} />);
@@ -149,7 +151,7 @@ it("reopens a blank-base review without an error and retries an interrupted bran
 
 it("keeps a missing selected base displayed after reload and dismisses keyboard choices without changing it", async () => {
   let current = branches;
-  vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/branches") ? current : snapshot))));
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/branches") ? current : reviewState(url)))));
   const model = createSessionModel("s", () => true, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
   await page.findByRole("article"); fireEvent.click(page.getByRole("button", { name: "Branch" }));

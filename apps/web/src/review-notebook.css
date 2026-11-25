@@ -1,0 +1,20 @@
+.review-notebook { margin: .75rem 0; padding: .8rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); font-size: .82rem; overflow-wrap: anywhere; }
+.notebook-heading, .notebook-controls { display: flex; gap: .6rem; align-items: end; flex-wrap: wrap; }
+.notebook-heading { align-items: center; justify-content: space-between; }
+.review-notebook h2 { font-size: 1rem; margin: 0; }
+.review-notebook h3 { font-size: .88rem; }
+.notebook-help { color: var(--muted-foreground); font-size: .76rem; line-height: 1.5; }
+.review-notebook details, .hunk-discussion details { margin: .5rem 0; }
+.review-notebook summary, .hunk-discussion summary { cursor: pointer; padding: .35rem 0; }
+.review-notebook label, .hunk-discussion label { display: flex; flex-direction: column; gap: .3rem; margin: .5rem 0; }
+.review-notebook input, .hunk-discussion input, .hunk-discussion textarea { min-width: 0; width: 100%; padding: .5rem; background: var(--background); color: var(--foreground); border: 1px solid var(--border); border-radius: var(--radius-sm); font: inherit; }
+.notebook-controls > label { flex: 1 1 12rem; }
+.review-notebook pre, .hunk-discussion pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow-y: auto; padding: .6rem; border: 1px solid var(--border); font: .76rem/1.6 var(--font-mono); }
+.hunk-discussion { padding: .4rem .8rem; background: var(--card); border-block: 1px solid var(--border); font: .82rem/1.5 var(--font-sans, sans-serif); overflow-wrap: anywhere; }
+.hunk-discussion:empty { display: none; }
+.review-thread { border-left: 3px solid var(--primary); padding-left: .75rem; }
+.review-thread-author { border-left-color: var(--border); }
+.review-thread-message { padding: .5rem 0; border-bottom: 1px solid var(--border); }
+.review-thread-message p { white-space: pre-wrap; }
+.notebook-outdated { padding: .5rem 0; border-bottom: 1px solid var(--border); }
+@media (max-width: 640px) { .notebook-controls { align-items: stretch; flex-direction: column; } .notebook-controls > label { flex-basis: auto; } .hunk-discussion { padding-inline: .5rem; } }

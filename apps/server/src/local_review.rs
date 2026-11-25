@@ -93,6 +93,8 @@ pub(crate) struct Review {
     /// Absent outside the first metadata page or when the full diff exceeds 4 MiB.
     #[serde(rename = "snapshotKey", skip_serializing_if = "Option::is_none")]
     snapshot_key: Option<String>,
+    #[serde(rename = "checkoutKey", skip_serializing_if = "Option::is_none")]
+    checkout_key: Option<String>,
 }
 
 /// Lists up to 100 metadata entries per page, or loads one fresh member, within ten seconds.
@@ -122,6 +124,8 @@ pub(crate) async fn review(
         cancelled: &mut cancelled,
     };
     let (args, identity) = prepare_snapshot(&mut git, &request).await?;
+    // Historical commits are not evidence of the current working-copy authoring turn.
+    let checkout = if matches!(request.scope, Scope::Commit) { None } else { crate::author_notes::Checkout::read(&mut git).await.ok() };
     let (current_branch, jj_context) = if request.path.is_none() && request.cursor.is_none() {
         git.checkout_context().await?
     } else { (None, None) };
@@ -223,6 +227,7 @@ pub(crate) async fn review(
         line_stats,
         next_cursor: None,
         snapshot_key,
+        checkout_key: None,
         current_branch,
         jj_context,
     };
@@ -360,6 +365,9 @@ pub(crate) async fn review(
     }
     if result.truncated {
         result.note = Some("Some content was omitted: review limits, non-UTF-8 paths/content, or untracked files. Limits: 100 files per page, 64 KiB per patch, 1 MiB JSON response.".into());
+    }
+    if let Some(before) = checkout {
+        if crate::author_notes::Checkout::read(&mut git).await.ok().as_ref() == Some(&before) { result.checkout_key = Some(before.key); }
     }
     Ok(result)
 }
@@ -717,7 +725,7 @@ pub(crate) struct Git<'a> {
 }
 impl Git<'_> {
     /// Reads the local checkout name, including unborn branches; detached HEAD has no name.
-    async fn current_branch(&mut self) -> Result<Option<String>, &'static str> {
+    pub(crate) async fn current_branch(&mut self) -> Result<Option<String>, &'static str> {
         let bytes = self.run(&["branch", "--show-current"], 4096).await?;
         let name = String::from_utf8(bytes).map_err(|_| "Invalid Git branch name")?;
         let name = name.trim_end_matches('\n');
@@ -740,7 +748,7 @@ impl Git<'_> {
         self.run_program("git", args, limit).await
     }
     /// Runs a bounded local VCS read under the review deadline; errors kill and reap the child.
-    async fn run_program(&mut self, program: &str, args: &[&str], limit: usize) -> Result<Vec<u8>, &'static str> {
+    pub(crate) async fn run_program(&mut self, program: &str, args: &[&str], limit: usize) -> Result<Vec<u8>, &'static str> {
         if Instant::now() >= self.deadline {
             return Err("Git review timed out");
         }
@@ -904,6 +912,7 @@ mod tests {
             line_stats: None,
             next_cursor: None,
             snapshot_key: None,
+            checkout_key: None,
             current_branch: None,
             jj_context: None,
         };
@@ -942,6 +951,7 @@ mod tests {
             line_stats: None,
             next_cursor: None,
             snapshot_key: None,
+            checkout_key: None,
             current_branch: Some("\"".repeat(4095)),
             jj_context: None,
         };

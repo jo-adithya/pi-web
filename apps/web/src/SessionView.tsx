@@ -12,6 +12,10 @@ import { DismissibleAlert } from "./components/DismissibleAlert";
 import { AgentControls } from "./components/AgentControls";
 import { Toast } from "./components/Toast";
 import type { WorkPhase } from "./generated/protocol";
+import type { OpenCodeReference, CodeLocation } from "./code-reference";
+import { reviewMessageContent, type ReviewCardFile } from "./review-cards";
+import { createMediaQuery } from "./theme";
+import { ReplyCodePreview } from "./components/ReplyCodePreview";
 
 const workPhaseLabels: Record<WorkPhase, string> = {
   thinking: "Thinking…", writing: "Writing…", reading: "Reading files…", editing: "Editing files…",
@@ -39,7 +43,7 @@ export function SessionView(props: { model: SessionModel; changes?: () => void }
   const activityLabel = () => {
     if (!online() || !state.synced || state.status.process !== "ready") return "";
     switch (state.status.activity) {
-      case "idle": return pending() ? "Sending…" : state.order.some(id => state.messages[id]?.presentation?.state === "pending") ? "Preparing your answer…" : "";
+      case "idle": return pending() ? "Sending…" : "";
       case "submitting": return "Sending…";
       case "running": return state.status.workPhase ? workPhaseLabels[state.status.workPhase] : "Working…";
       case "retrying": return "Retrying…";
@@ -56,17 +60,93 @@ export function SessionView(props: { model: SessionModel; changes?: () => void }
     return usage?.tokens != null ? `${Math.round(usage.tokens / usage.contextWindow * 1000) / 10}%` : "—";
   };
   const [replyTarget, setReplyTarget] = createSignal<HTMLDivElement>();
+  const [codePreview, setCodePreview] = createSignal<{ location: CodeLocation; trigger: HTMLElement; captured?: ReviewCardFile | null; autoLoadCurrent: boolean; top: number }>();
+  const mobile = createMediaQuery("(max-width: 760px)");
+  const [hiddenFraction, setHiddenFraction] = createSignal(0);
+  const collapse = () => mobile() && !model.quote() ? hiddenFraction() : 0;
+  let composerPanel!: HTMLDivElement;
+  const narrowPreview = createMediaQuery("(max-width: 1000px)");
   let scroller!: HTMLDivElement; let reading!: HTMLDivElement; let composer!: HTMLFormElement; let imagePicker!: HTMLInputElement;
   /** Prepares an editable prompt, preserving any draft already in the composer. */
   function startPrompt(prompt: string) {
     if (draft()) return;
-    setDraft(prompt); flush();
+    setHiddenFraction(0); setDraft(prompt); flush();
     composer.querySelector("textarea")?.focus();
   }
   const canAttach = () => model.canConfigure() && !!state.settings.model?.images && !model.uploading() && model.attachments().length < 4;
-  const scrollRoot = document.documentElement;
-  const scrollToLatest = () => { scrollRoot.scrollTop = scrollRoot.scrollHeight; };
-  const trackScroll = () => setStick(scrollRoot.scrollHeight - scrollRoot.scrollTop - scrollRoot.clientHeight < 80);
+  const scrollToLatest = () => { scroller.scrollTop = scroller.scrollHeight; };
+  let scrollAnchor = 0;
+  let settleFrame = 0;
+  const stopSettle = () => { cancelAnimationFrame(settleFrame); settleFrame = 0; };
+  const settleComposer = () => {
+    stopSettle();
+    const from = collapse();
+    if (from === 0 || from === 1 || composerPanel.contains(document.activeElement)) return;
+    const to = from >= 0.5 ? 1 : 0;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) { setHiddenFraction(to); return; }
+    const started = performance.now();
+    const advance = (now: number) => {
+      const t = Math.min(1, Math.max(0, (now - started) / 150));
+      setHiddenFraction(to + (from - to) * (1 - t) ** 3);
+      settleFrame = t < 1 ? requestAnimationFrame(advance) : 0;
+    };
+    settleFrame = requestAnimationFrame(advance);
+  };
+  const trackScroll = () => {
+    stopSettle();
+    const top = Math.max(0, scroller.scrollTop);
+    const remaining = scroller.scrollHeight - top - scroller.clientHeight;
+    // Leave the follow-latest zone before resizing the transcript; otherwise
+    // its resize observer would scroll back to the bottom during the swipe.
+    const following = remaining < 80 && (stick() || remaining <= 2);
+    setStick(mobile() ? following : remaining < 80);
+    if (!mobile() || following || composer.contains(document.activeElement)) {
+      setHiddenFraction(0);
+    } else if (composerPanel.offsetHeight) {
+      const delta = (scrollAnchor - top) / composerPanel.offsetHeight;
+      setHiddenFraction(value => Math.max(0, Math.min(1, value + delta)));
+    }
+    scrollAnchor = top;
+  };
+  /** Pauses following and holds the toggle at the same height during a view switch. */
+  function switchReplyView(anchor: HTMLElement, change: () => void) {
+    const top = anchor.getBoundingClientRect().top;
+    setStick(false);
+    change(); flush();
+    const shift = anchor.getBoundingClientRect().top - top;
+    if (shift) scroller.scrollTop += shift;
+  }
+  /** Resolves captures only from the prompt that belongs to the clicked reference. */
+  const previewReference: OpenCodeReference = (location, trigger, fallback) => {
+    const id = trigger.closest<HTMLElement>("[data-message-id]")?.dataset.messageId;
+    const index = id ? state.order.indexOf(id) : -1;
+    let captured: ReviewCardFile | null | undefined;
+    for (let i = index; i >= 0; i--) {
+      const message = state.messages[state.order[i]];
+      if (message.role === "compactionSummary") break;
+      if (message.role !== "user") continue;
+      const files = message.blocks.flatMap(block => block.kind === "text" ? reviewMessageContent(block.text, model.reviewCards.cards()).cards : [])
+        .flatMap(card => card.files.filter(file => file.path === location.path).map(file => card.ambiguous ? null : file));
+      captured = files.length === 1 ? files[0] : files.length ? null : undefined;
+      break;
+    }
+    const top = trigger.getBoundingClientRect().top;
+    const presentation = id ? state.messages[id]?.presentation : undefined;
+    const restored = presentation?.state === "ready" && presentation.timings?.cached;
+    const historical = !!model.historyPage() || !!restored || state.order.slice(index + 1).some(key => state.messages[key].role === "user");
+    const autoLoadCurrent = fallback !== "explicit" && !historical;
+    switchReplyView(trigger, () => setCodePreview({ location, trigger, captured, autoLoadCurrent, top }));
+  };
+  function closeCodePreview() {
+    const opened = codePreview();
+    setCodePreview(undefined); flush();
+    if (opened?.trigger.isConnected) {
+      const shift = opened.trigger.getBoundingClientRect().top - opened.top;
+      if (shift) scroller.scrollTop += shift;
+      opened.trigger.focus({ preventScroll: true });
+    }
+  }
+  createEffect(() => [state.epoch, model.historyPage()?.cursor] as const, () => setCodePreview(undefined));
   let disposed = false;
   let scrollFrame: number | undefined;
   /** Coalesces layout changes into one scroll, respecting pauses made before the frame runs. */
@@ -84,18 +164,20 @@ export function SessionView(props: { model: SessionModel; changes?: () => void }
     const content = message?.querySelector<HTMLElement>(".simple-response-content");
     if (!content || content.getAttribute("aria-label") !== "Simple answer") return;
     const margin = parseFloat(getComputedStyle(content).scrollMarginTop) || 0;
-    const available = scrollRoot.clientHeight - composer.getBoundingClientRect().height - margin;
+    const available = scroller.clientHeight - margin;
     if (content.getBoundingClientRect().height <= available) return;
     setStick(false);
-    scrollRoot.scrollTop = Math.max(0, scrollRoot.scrollTop + content.getBoundingClientRect().top - margin);
+    scroller.scrollTop = Math.max(0, scroller.scrollTop + content.getBoundingClientRect().top - scroller.getBoundingClientRect().top - margin);
   });
-  createEffect(() => model.historyPage()?.cursor, cursor => { if (cursor) scrollRoot.scrollTop = 0; });
+  createEffect(() => model.historyPage()?.cursor, cursor => { if (cursor) scroller.scrollTop = 0; });
   // Sending resumes following immediately, even before transcript content grows.
   createEffect(() => pending(), sending => { if (sending) scheduleScroll(); });
   onSettled(() => {
-    // The document owns conversation scrolling at every screen size.
-    scrollRoot.scrollTop = model.scroll;
-    window.addEventListener("scroll", trackScroll, { passive: true });
+    scroller.scrollTop = model.scroll;
+    scrollAnchor = scroller.scrollTop;
+    scroller.addEventListener("scroll", trackScroll, { passive: true });
+    scroller.addEventListener("scrollend", settleComposer);
+    scroller.addEventListener("pointerdown", stopSettle);
     window.addEventListener("resize", scheduleScroll);
     const observer = new ResizeObserver(scheduleScroll);
     observer.observe(reading, { box: "border-box" });
@@ -105,8 +187,11 @@ export function SessionView(props: { model: SessionModel; changes?: () => void }
       disposed = true;
       observer.disconnect();
       if (scrollFrame !== undefined) cancelAnimationFrame(scrollFrame);
-      model.scroll = scrollRoot.scrollTop;
-      window.removeEventListener("scroll", trackScroll);
+      model.scroll = scroller.scrollTop;
+      stopSettle();
+      scroller.removeEventListener("scrollend", settleComposer);
+      scroller.removeEventListener("pointerdown", stopSettle);
+      scroller.removeEventListener("scroll", trackScroll);
       window.removeEventListener("resize", scheduleScroll);
     };
   });
@@ -146,7 +231,7 @@ export function SessionView(props: { model: SessionModel; changes?: () => void }
                 </div></div>
                 <div class="welcome-signature" aria-hidden="true"><span>π</span><span>Think it through. Make it happen.</span><Icon name="arrowRight" /></div>
               </div></Show>
-              <MessageList state={state} loadOriginal={model.loadOriginal} retryResponse={online() && !model.historyPage() && state.status.process === "ready" ? messageId => { model.send({ type: "retry_response", messageId }); } : undefined} openCode={location => { model.openCode(location); props.changes?.(); }} reviewCards={model.reviewCards.cards()} loadReviewPreview={model.loadReviewPreview} mobileReplyTarget={replyTarget()} loadImage={model.loadImage} onReply={quote => {
+              <MessageList state={state} switchView={switchReplyView} loadOriginal={model.loadOriginal} saveResponse={online() && !model.historyPage() ? messageId => { model.send({ type: "retry_response_save", messageId }); } : undefined} retryResponse={online() && !model.historyPage() && state.status.process === "ready" ? messageId => { model.send({ type: "retry_response", messageId }); } : undefined} openCode={previewReference} reviewCards={model.reviewCards.cards()} loadReviewPreview={model.loadReviewPreview} mobileReplyTarget={replyTarget()} loadImage={model.loadImage} onReply={quote => {
                 if (!model.quoteReply(quote)) return;
                 window.getSelection()?.removeAllRanges(); flush();
                 composer.querySelector("textarea")?.focus();
@@ -155,8 +240,10 @@ export function SessionView(props: { model: SessionModel; changes?: () => void }
             </div>
           </div>
         </div>
-        <div class="composer">
-          <Show when={!stick()}><Button class="latest" aria-label="Jump to latest" title="Jump to latest" onClick={() => { scrollToLatest(); setStick(true); }}><Icon name="chevronDown" /></Button></Show>
+        <div class="composer-track" style={{ "grid-template-rows": `${1 - collapse()}fr` }}>
+        <div class="composer-track-slot" onFocusIn={() => { stopSettle(); setHiddenFraction(0); }}>
+        <div class="composer" ref={composerPanel}>
+          <Show when={!stick()}><Button class="latest" aria-label="Jump to latest" title="Jump to latest" onClick={() => { setHiddenFraction(0); scrollToLatest(); setStick(true); }}><Icon name="chevronDown" /></Button></Show>
           <div ref={setReplyTarget} class="mobile-reply-slot" />
           <div class="composer-activity">
             <BackgroundTasks tasks={state.backgroundTasks} />
@@ -207,7 +294,12 @@ export function SessionView(props: { model: SessionModel; changes?: () => void }
           </form>
           <p class="composer-footnote"><span class="composer-hint"><kbd>↵</kbd> Send <span>·</span> <kbd>Shift ↵</kbd> New line <span>·</span> <kbd>/</kbd> Commands</span><CodexUsageFooter model={model} /><span class="lsp-status" title="Language server status reported by Pi; — means unavailable">{online() && state.status.process === "ready" ? state.status.lspStatus || "LSP —" : "LSP —"}</span><span class="context-usage" title="Estimated share of the model context window used; — means unavailable">Context {contextPercent()}</span></p>
         </div>
+        </div>
+        </div>
       </section>
+      <Show when={codePreview()} keyed>{preview => <ReplyCodePreview location={preview.location} trigger={preview.trigger} captured={preview.captured}
+        autoLoadCurrent={preview.autoLoadCurrent} narrow={narrowPreview()} close={closeCodePreview} loadDiff={model.loadReviewPreview} loadSource={model.loadSource}
+        openChanges={props.changes ? () => { model.openCode(preview.location); props.changes?.(); } : undefined} />}</Show>
     </div>
     <Show when={state.dialogs[0]} keyed>{dialog => <ExtensionDialog dialog={dialog} answer={answer => send({ type: "ui_reply", dialogId: dialog.id, answer })} />}</Show>
   </>;

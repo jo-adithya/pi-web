@@ -3,11 +3,11 @@ import argparse, collections, json, os, pathlib, selectors, signal, subprocess, 
 
 class Probe:
     """Drain bounded RPC records and stderr while retaining only test-sized event history."""
-    def __init__(self, cwd, session, extra_args=(), dialog_response=None):
-        """Default to cancelling dialogs; an explicit test responder may return None to hold one."""
+    def __init__(self, cwd, session, extra_args=(), dialog_response=None, tools="read"):
+        """Default to read-only tools and cancelled dialogs; tools=None uses native tool defaults."""
         self.dialog_response = dialog_response or (lambda request: {'cancelled': True})
         self.started = time.monotonic()
-        self.p = subprocess.Popen(['pi-bolt', '--mode', 'rpc', '--session', str(session), '--no-context-files', '--no-skills', '--no-prompt-templates', '--no-mcp', '--tools', 'read', '--offline', *extra_args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        self.p = subprocess.Popen(['pi-bolt', '--mode', 'rpc', '--session', str(session), '--no-context-files', '--no-skills', '--no-prompt-templates', '--no-mcp', *(['--tools', tools] if tools is not None else []), '--offline', *extra_args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         self.sel = selectors.DefaultSelector()
         self.sel.register(self.p.stdout, selectors.EVENT_READ, 'out')
         self.sel.register(self.p.stderr, selectors.EVENT_READ, 'err')

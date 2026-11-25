@@ -2,7 +2,7 @@
 //! Decoding these shapes does not authorize commands or validate session identity.
 
 use crate::view::{Activity, BlockKind, DisplayBlock, DisplayMessage, ViewPatch};
-use crate::response_format::{ResponsePresentation, ResponseTimings, SimpleResponse, ResponseCard, ResponseFact, ResponseCheck, ResponseCheckStatus, CanvasPlan, CanvasLayout, DiagramNode, DiagramNodeKind, DiagramEdge, DiagramRelation, ChartValue, TimelineItem, TimelineKind, ResponseFinding, FindingSeverity, RecordedEvidence, RecordedTool, RecordedFile, ToolOutcome, FileCaptureState, FileChangeKind};
+use crate::response_format::{ResponsePresentation, ResponseTimings, SimpleResponse, ResponseCard, ComparisonMode, ComparisonSide, TablePurpose, ResponseFact, ResponseCheck, ResponseCheckStatus, CanvasPlan, CanvasLayout, CanvasNode, ComparisonPanel, ColumnRatio, DiagramNode, DiagramNodeKind, DiagramEdge, DiagramRelation, ChartValue, TimelineItem, TimelineKind, PathGroup, PathStep, PathAnnotation, AnnotationKind, ResponseFinding, FindingSeverity, RecordedEvidence, RecordedTool, RecordedFile, ToolOutcome, FileCaptureState, FileChangeKind};
 use serde::{Deserialize, Serialize};
 use ts_rs::{Config, TS};
 
@@ -198,6 +198,8 @@ pub enum BrowserAction {
     RefreshCodexUsage,
     /// Retries a failed derived presentation; never re-prompts the coding session.
     RetryResponse { message_id: String },
+    /// Persists the validated result already held in this runtime. No inference.
+    RetryResponseSave { message_id: String },
     SetModel {
         provider: String,
         model_id: String,
@@ -364,6 +366,10 @@ pub enum ServerBody {
     RunCompleted {
         run_id: String,
         outcome: RunOutcome,
+        /// Wait for this live reply's terminal presentation before notifying the reader.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        wait_for_message_id: Option<String>,
     },
     Commands {
         commands: Vec<SlashCommand>,
@@ -385,6 +391,13 @@ pub enum ServerBody {
         status: RuntimeStatus,
         dialogs: Vec<Dialog>,
         older_history: bool,
+    },
+    /// Delivery of the preceding reply-bearing event or snapshot on this socket.
+    /// Durations describe the server queue and local write, not network transit.
+    ResponseDelivery {
+        seq: u32,
+        queue_ms: u32,
+        send_ms: u32,
     },
     Result {
         result: CommandResult,
@@ -573,6 +586,9 @@ pub fn typescript_bindings() -> String {
         (RecordedFile::docs(), RecordedFile::decl(&config)),
         (RecordedEvidence::docs(), RecordedEvidence::decl(&config)),
         (CanvasLayout::docs(), CanvasLayout::decl(&config)),
+        (ColumnRatio::docs(), ColumnRatio::decl(&config)),
+        (ComparisonPanel::docs(), ComparisonPanel::decl(&config)),
+        (CanvasNode::docs(), CanvasNode::decl(&config)),
         (CanvasPlan::docs(), CanvasPlan::decl(&config)),
         (DiagramNodeKind::docs(), DiagramNodeKind::decl(&config)),
         (DiagramNode::docs(), DiagramNode::decl(&config)),
@@ -581,8 +597,15 @@ pub fn typescript_bindings() -> String {
         (ChartValue::docs(), ChartValue::decl(&config)),
         (TimelineKind::docs(), TimelineKind::decl(&config)),
         (TimelineItem::docs(), TimelineItem::decl(&config)),
+        (AnnotationKind::docs(), AnnotationKind::decl(&config)),
+        (PathAnnotation::docs(), PathAnnotation::decl(&config)),
+        (PathStep::docs(), PathStep::decl(&config)),
+        (PathGroup::docs(), PathGroup::decl(&config)),
         (FindingSeverity::docs(), FindingSeverity::decl(&config)),
         (ResponseFinding::docs(), ResponseFinding::decl(&config)),
+        (ComparisonMode::docs(), ComparisonMode::decl(&config)),
+        (ComparisonSide::docs(), ComparisonSide::decl(&config)),
+        (TablePurpose::docs(), TablePurpose::decl(&config)),
         (ResponseCard::docs(), ResponseCard::decl(&config)),
         (SimpleResponse::docs(), SimpleResponse::decl(&config)),
         (ResponseTimings::docs(), ResponseTimings::decl(&config)),

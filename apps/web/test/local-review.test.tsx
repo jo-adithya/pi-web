@@ -91,14 +91,14 @@ it.each([false, true])("restores filters after visiting chat and restores positi
   const first = render(() => <LocalReview model={model} conversation={() => {}} />);
   await first.findByRole("heading", { name: file.path });
   fireEvent.input(first.getByRole("searchbox", { name: "Filter files" }), { target: { value: "a.ts" } }); flush();
-  document.documentElement.scrollTop = 420;
+  first.getByRole("region", { name: "Local changes" }).scrollTop = 420;
   first.unmount(); different = changed;
   vi.mocked(window.scrollTo).mockClear();
   const second = render(() => <LocalReview model={model} conversation={() => {}} />);
   await second.findByRole("heading", { name: file.path });
   expect((second.getByRole("searchbox", { name: "Filter files" }) as HTMLInputElement).value).toBe("a.ts");
-  await waitFor(() => expect(window.scrollTo).toHaveBeenCalledWith({ top: changed ? 0 : 420, left: 0, behavior: "instant" }));
-  document.documentElement.scrollTop = 0;
+  await waitFor(() => expect(second.getByRole("region", { name: "Local changes" }).scrollTop).toBe(changed ? 0 : 420));
+  expect(window.scrollTo).not.toHaveBeenCalled();
 });
 
 it("edits a collected note against its captured code without sending or changing the composer", async () => {
@@ -578,6 +578,7 @@ it("keeps compact file controls named and preserves review, navigation and draft
 it("shows scope-wide line totals without loading all patches and refreshes them with the scope", async () => {
   const entries = [file, { ...file, path: "src/b.ts" }];
   const request = vi.fn(async (_url: string, init: RequestInit) => {
+    if (_url.endsWith("/source")) return new Response(JSON.stringify({ enabled: false }));
     const input = JSON.parse(init.body as string);
     return new Response(JSON.stringify(input.path ? snapshot(entries.filter(entry => entry.path === input.path)) : {
       ...snapshot(entries.map(entry => ({ ...entry, patch: null, fingerprint: null }))),
@@ -601,7 +602,7 @@ it("shows scope-wide line totals without loading all patches and refreshes them 
   expect(page.queryByText(/Snapshot:/)).toBeNull();
   expect(page.queryByText("575 lines changed")).toBeNull();
   await page.findByLabelText("Reviewed");
-  expect(request).toHaveBeenCalledTimes(2);
+  expect(request.mock.calls.filter(([url]) => url === "/review/s")).toHaveLength(2);
   fireEvent.click(page.getByLabelText("Reviewed")); flush();
   expect(page.getByText("+500 added")).toBeTruthy();
   fireEvent.click(page.getByRole("button", { name: "Staged" }));
@@ -1323,8 +1324,11 @@ it("opens the file picker, closes it on selection and jumps to the selected diff
   expect(page.getByRole("heading", { name: "src/b.ts" })).toBeTruthy();
   expect(vi.mocked(HTMLElement.prototype.scrollIntoView).mock.instances).toContain(page.getByRole("article", { name: "Diff for src/b.ts" }));
   expect(document.activeElement).toBe(page.getByRole("article", { name: "Diff for src/b.ts" }));
+  // Closing the modal restores the window position; review navigation uses its own scroller.
+  expect(window.scrollTo).toHaveBeenCalledExactlyOnceWith(window.scrollX, window.scrollY);
+  vi.mocked(window.scrollTo).mockClear();
   page.unmount();
-  expect(window.scrollTo).toHaveBeenCalledWith({ top: 0, left: 0, behavior: "instant" });
+  expect(window.scrollTo).not.toHaveBeenCalled();
 });
 
 it("dismisses the file modal with Close or Escape and restores trigger focus", async () => {
@@ -1358,11 +1362,11 @@ it("cancels a pending scroll when leaving changes", async () => {
 });
 
 it("aborts the snapshot request when leaving changes", async () => {
-  const request = vi.fn(() => new Promise<Response>(() => {})); vi.stubGlobal("fetch", request);
+  const request = vi.fn((url: string, _init: RequestInit) => url.endsWith("/source") ? Promise.resolve(new Response(JSON.stringify({ enabled: false }))) : new Promise<Response>(() => {})); vi.stubGlobal("fetch", request);
   const model = createSessionModel("session", () => true, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={() => {}} />);
-  await waitFor(() => expect(request).toHaveBeenCalledOnce());
-  const signal = (request.mock.calls as unknown as [string, RequestInit][])[0][1].signal!;
+  await waitFor(() => expect(request.mock.calls.filter(([url]) => url === "/review/session")).toHaveLength(1));
+  const signal = request.mock.calls.find(([url]) => url === "/review/session")![1].signal!;
   page.unmount(); expect(signal.aborted).toBe(true);
 });
 

@@ -638,10 +638,30 @@ async fn explanation_rejects_invalid_outputs_and_mode_mismatches() {
 }
 
 #[tokio::test]
+async fn notebook_review_preserves_question_and_requests_high_reasoning() {
+    let f = Fixture::with_mode(Some("explain-usage")).await;
+    let mut input = explanation_request();
+    input["explain"]["task"] = serde_json::json!("review");
+    input["explain"]["question"] = serde_json::json!("Does this preserve retries?");
+    let (status, body) = f.request(&input.to_string(), true, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let launch: serde_json::Value = serde_json::from_slice(&fs::read(f.root.join("group-launch.json")).unwrap()).unwrap();
+    assert!(launch["args"].as_array().unwrap().windows(2).any(|pair| pair[0] == "--thinking" && pair[1] == "high"));
+    let commands = fs::read_to_string(f.root.join("group-commands.jsonl")).unwrap();
+    let prompt = commands.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).find(|value| value["type"] == "prompt").unwrap();
+    let supplied: serde_json::Value = serde_json::from_str(prompt["message"].as_str().unwrap().split_once('\n').unwrap().1).unwrap();
+    assert_eq!(supplied["explain"]["task"], "review");
+    assert_eq!(supplied["explain"]["question"], "Does this preserve retries?");
+    f.runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn explanation_invalid_requests_never_launch() {
     let f = Fixture::with_mode(Some("explain")).await;
     for (field, value) in [
         ("explain", serde_json::json!({"title":" "})),
+        ("explain", serde_json::json!({"title":"Review", "task":"edit"})),
+        ("explain", serde_json::json!({"title":"Review", "question":"a".repeat(4001)})),
         ("readsRemaining", serde_json::json!(1)),
         ("details", serde_json::json!([])),
         ("files", serde_json::json!([])),

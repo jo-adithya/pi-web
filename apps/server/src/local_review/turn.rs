@@ -269,7 +269,8 @@ async fn comparison(root: &Path, before: &Baseline) -> Result<Review, &'static s
     let old_path = scratch.0.join("before");
     let new_path = scratch.0.join("after");
     let (current_branch, jj_context) = git.checkout_context().await?;
-    let mut review = Review { files: Vec::new(), truncated: false, note: Some("Captured from turn start to settlement, including any concurrent edits. Content only; not an attribution or filesystem transaction. Snapshots are runtime-only. Binary, symlink and oversized content is omitted.".into()), line_stats: None, next_cursor: None, snapshot_key: None, current_branch, jj_context };
+    let checkout = crate::author_notes::Checkout::read(&mut git).await.ok();
+    let mut review = Review { files: Vec::new(), truncated: false, note: Some("Captured from turn start to settlement, including any concurrent edits. Content only; not an attribution or filesystem transaction. Snapshots are runtime-only. Binary, symlink and oversized content is omitted.".into()), line_stats: None, next_cursor: None, snapshot_key: None, checkout_key: None, current_branch, jj_context };
     let mut total = 1024 + serde_json::to_vec(&review).map_err(|_| "Cannot encode review metadata")?.len();
     for path in paths {
         if Instant::now() >= git.deadline {
@@ -335,6 +336,9 @@ async fn comparison(root: &Path, before: &Baseline) -> Result<Review, &'static s
         )? {
             break;
         }
+    }
+    if let Some(before) = checkout {
+        if crate::author_notes::Checkout::read(&mut git).await.ok().as_ref() == Some(&before) { review.checkout_key = Some(before.key); }
     }
     Ok(review)
 }

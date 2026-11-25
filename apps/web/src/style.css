@@ -11,7 +11,8 @@
   text-size-adjust: 100%;
 }
 * { box-sizing: border-box; }
-body { margin: 0; min-width: min(320px, 100%); background: var(--background); color: var(--foreground); -webkit-font-smoothing: antialiased; }
+html, body { height: 100%; overflow: hidden; }
+body { margin: 0; min-width: min(320px, 100%); background: var(--sidebar); color: var(--foreground); -webkit-font-smoothing: antialiased; }
 button, input, textarea, select { font: inherit; color: inherit; }
 input, textarea, select, .select-trigger { font-size: var(--input-font-size); }
 button, summary, select { -webkit-tap-highlight-color: transparent; }
@@ -45,8 +46,9 @@ a:hover { color: var(--foreground); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 /* One compact project switcher sits above a flat, independently scrollable inbox. */
-.workspace { min-height: 100dvh; display: flex; }
+.workspace { height: 100dvh; display: flex; overflow: hidden; background: var(--sidebar); }
 .sidebar { position: sticky; top: 0; height: 100dvh; width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: .4rem; padding: .5rem .8rem .65rem; background: var(--sidebar); border-right: 1px solid var(--border); min-height: 0; }
+.sidebar:not(.sidebar-drawer) { padding: .4rem .5rem; border: 0; }
 .sidebar[hidden] { display: none; }
 .sidebar-brand { display: flex; align-items: center; gap: .6rem; min-height: 2.65rem; margin-bottom: .4rem; padding-inline: .3rem; }
 .sidebar-brand > strong { font-size: .98rem; font-weight: 650; letter-spacing: -.035em; }
@@ -130,7 +132,16 @@ a:hover { color: var(--foreground); }
 .theme-picker .select-trigger { min-width: 0; width: 100%; min-height: 1.7rem; border-color: transparent; background: transparent; padding: .15rem 0; }
 
 /* Chat chrome stays quiet, with a readable center column and floating composer. */
-.chat-panel { --header-height: 3rem; min-width: 0; flex: 1; display: flex; flex-direction: column; background: var(--card); }
+.chat-panel { --header-height: 3rem; min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--card); }
+.workspace > main.chat-panel { --panel-inset: .4rem; --panel-top-inset: .2rem; margin: var(--panel-top-inset) var(--panel-inset) var(--panel-inset); border: 1px solid var(--border); border-radius: calc(var(--radius) * 1.5); }
+@media (max-width: 760px) {
+  .workspace > main.chat-panel { margin: 0; border: 0; border-radius: 0; }
+}
+@media (min-width: 761px) {
+  .workspace > main.chat-panel { margin-left: 0; }
+  .workspace > .sidebar[hidden] + .chat-panel { margin-left: var(--panel-inset); }
+  .workspace > .chat-panel > .workspace-controls { padding-block: var(--panel-inset); }
+}
 .workspace-controls { position: relative; z-index: 4; flex-shrink: 0; height: var(--header-height); display: flex; align-items: center; gap: .65rem; padding: .25rem 1rem; border-bottom: 1px solid var(--border); background: var(--card); }
 .workspace-controls .icon-button { border-radius: var(--radius-sm); color: var(--muted-foreground); }
 .workspace-controls .icon-button:hover { background: var(--secondary); }
@@ -158,16 +169,15 @@ a:hover { color: var(--foreground); }
 .session-menu [role=menuitem][data-disabled] { opacity: .45; cursor: default; }
 .session-menu .danger { color: var(--error); }
 .session-actions { min-width: 12rem; }
-.phone-push-scope { display: block; width: 16rem; max-width: calc(100vw - 3rem); padding: .4rem .65rem; color: var(--muted-foreground); font-size: .75rem; line-height: 1.4; }
-.workspace-notice { font-size: .85rem; margin: 0; padding: .65rem 1.7rem; color: var(--error); background: var(--error-muted); overflow-wrap: anywhere; }
+.workspace-notice { flex-shrink: 0; font-size: .85rem; margin: 0; padding: .65rem 1.7rem; color: var(--error); background: var(--error-muted); overflow-wrap: anywhere; }
 .workspace-body { display: flex; min-height: 0; flex: 1; }
-.conversation { --composer-fade-height: 2rem; flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+.conversation { --composer-fade-height: 2rem; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
 .transcript-area { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .transcript { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 /* Keep the final message clear of the strongest part of the composer fade. */
 .reading { width: min(100%, 980px); margin: 0 auto; padding: 1.1rem 2rem 2.5rem; }
 .reading > :last-child { margin-bottom: 0; }
-.transcript { scroll-padding-top: calc(var(--header-height) + .75rem); }
+.transcript { scroll-padding-top: .75rem; }
 .empty { max-width: 54ch; margin: auto; color: var(--muted-foreground); }
 .empty h2 { font-size: clamp(1.65rem, 3vw, 2.1rem); font-weight: 500; color: var(--foreground); margin: 1rem 0 .75rem; letter-spacing: -.035em; }
 .empty p { font-size: .95rem; line-height: 1.65; }
@@ -228,7 +238,7 @@ a:hover { color: var(--foreground); }
 .markdown .code-block pre { margin: 0; padding-top: 2.5rem; }
 .code-block .copy-action { position: absolute; top: .4rem; right: .5rem; max-width: calc(100% - 1rem); justify-content: flex-end; }
 @media (hover: hover) and (pointer: fine) {
-  .copy-button { opacity: 0; }
+  :where(.answer-actions, .code-block) .copy-button { opacity: 0; }
   .message:hover .answer-actions .copy-button, .code-block:hover .copy-button, .copy-action:focus-within .copy-button { opacity: 1; }
 }
 /* Compaction is a quiet milestone, not another assistant response. */
@@ -275,6 +285,7 @@ a:hover { color: var(--foreground); }
   .html-artifact:not([data-collapsed="true"]):not([data-source="true"]):not(.artifact-fullscreen):is(:hover, :focus-within) > .artifact-toolbar { opacity: 1; pointer-events: auto; }
 }
 @media (hover: none), (pointer: coarse) {
+  .html-artifact:not(.artifact-fullscreen) > .artifact-toolbar { position: relative; top: auto; right: auto; width: fit-content; margin: 0 0 .25rem auto; }
   .artifact-toolbar button { min-height: 44px; }
 }
 .action-dialog.artifact-fullscreen { inset: 0; transform: none; display: flex; flex-direction: column; width: 100%; height: 100dvh; max-height: none; margin: 0; padding: 0; border: 0; border-radius: 0; overflow: hidden; }
@@ -282,6 +293,7 @@ a:hover { color: var(--foreground); }
 .artifact-fullscreen .artifact-toolbar { position: relative; top: auto; right: auto; align-self: flex-end; flex-shrink: 0; margin: max(.25rem, env(safe-area-inset-top)) .25rem .25rem; }
 .artifact-source { margin: 0; padding: 1rem; height: 420px; overflow: auto; white-space: pre; font-size: .8rem; }
 .markdown > :last-child { margin-bottom: 0; }
+.markdown-plain-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .markdown :not(pre) > code { background: var(--muted); padding: .12rem .3rem; border-radius: .3rem; }
 .markdown pre { background: var(--background); border: 1px solid var(--border); padding: 1rem; border-radius: var(--radius); }
 .markdown table { display: block; overflow: auto; border-collapse: collapse; }
@@ -316,6 +328,9 @@ a:hover { color: var(--foreground); }
 .agent-controls .select-trigger:hover:not(:disabled) { background: var(--muted); }
 .agent-controls .select-trigger:disabled { opacity: .6; }
 .model-control { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+@media (min-width: 761px) {
+  .model-control .select-trigger, .thinking-control .select-trigger { font-size: .73rem; }
+}
 .thinking-control { flex: 0 1 auto; }
 .fast-status { margin-inline-start: .3rem; padding: .15rem .45rem; border-radius: .4rem; background: var(--accent); color: var(--accent-foreground); overflow-wrap: anywhere; }
 .settings-pending { font-size: .7rem; }
@@ -392,12 +407,10 @@ a:hover { color: var(--foreground); }
   .statuses { gap: .5rem; }
   .composer-hint { display: none; }
 }
-/* Keep ancestors overflow-visible so controls stick to the document viewport. */
+/* The transcript scrolls between the fixed workspace header and composer. */
 .workspace-body, .conversation, .transcript-area { min-width: 0; }
-.transcript { flex: 1 0 auto; overflow: visible; overscroll-behavior: auto; scrollbar-gutter: auto; }
-.workspace-controls { position: sticky; top: 0; }
-/* Paint over subpixel bottom seams without extending the document's scrollable area. */
-.composer { position: sticky; bottom: 0; z-index: 3; background: var(--card); box-shadow: 0 1px 0 var(--card); }
+.workspace-empty { overflow-y: auto; }
+.composer { position: relative; z-index: 3; background: var(--card); }
 .composer::before { content: ""; position: absolute; z-index: -1; inset: calc(-1 * var(--composer-fade-height)) 0 100%; background: linear-gradient(to top, var(--card), color-mix(in srgb, var(--card) 90%, transparent) 30%, color-mix(in srgb, var(--card) 45%, transparent) 65%, transparent); pointer-events: none; }
 
 @media (max-width: 760px) {
@@ -430,6 +443,10 @@ a:hover { color: var(--foreground); }
   .message.assistant .markdown h2 { font-size: 1.15rem; }
   .message.assistant .markdown h3 { font-size: 1rem; }
   .composer { --composer-inline-padding: .65rem; padding: 0 var(--composer-inline-padding) max(.25rem, env(safe-area-inset-bottom)); }
+  /* Release space to the transcript without resizing the composer itself. */
+  .conversation { overflow: clip; }
+  .composer-track { display: grid; flex: none; }
+  .composer-track-slot { min-height: 0; }
   .composer-heading { padding: .6rem .75rem 0; font-size: .6rem; }
   .composer-heading > span:last-child { display: none; }
   .composer .prompt-input { margin: .3rem .35rem .5rem; }
@@ -455,6 +472,12 @@ a:hover { color: var(--foreground); }
   .prompt-starter > span:not(.starter-icon) { font-size: .72rem; }
   .welcome-review { margin-top: .5rem; min-height: var(--mobile-control-size); padding: .15rem .5rem; font-size: .8rem; }
   .workspace-notice { padding-inline: 1rem; }
+  /* Reserve horizontal drags before Firefox starts native panning. Nested
+     scrollports (such as wide code blocks) keep their own touch behavior. */
+  .workspace:not(.pinch-zoomed) :is(.chat-panel, .transcript, .workspace-empty),
+  body:not(:has(.workspace.pinch-zoomed)) :is(.sidebar-drawer, .sidebar-overlay, .sidebar-drawer .session-list) {
+    touch-action: pan-y pinch-zoom;
+  }
   .sidebar-drawer { width: min(310px, calc(100vw - 3rem)); }
 }
 @media (pointer: coarse) {

@@ -28,7 +28,6 @@ async fn setup_options(origin: Option<&str>, images: bool) -> (Fixture, Router, 
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join("assets")).unwrap();
     fs::write(root.join("index.html"), "<h1>fixture</h1>").unwrap();
-    fs::write(root.join("sw.js"), include_str!("../../web/public/sw.js")).unwrap();
     let executable = if images {
         use std::os::unix::fs::PermissionsExt;
         let path = root.join("pi-fixture");
@@ -60,8 +59,7 @@ async fn setup_options(origin: Option<&str>, images: bool) -> (Fixture, Router, 
         root.clone(),
         stopping,
     );
-    let push = pi_web::push::PushService::start(&root.join("push"), origin.unwrap_or("http://127.0.0.1:9876").into()).unwrap();
-    (Fixture(root), http::router(state.with_push(push)), runtime)
+    (Fixture(root), http::router(state), runtime)
 }
 #[tokio::test]
 async fn history_requires_same_origin_explicit_proof_and_a_registered_session() {
@@ -558,27 +556,6 @@ async fn static_assets_are_local_bounded_and_have_strict_browser_headers() {
 }
 
 #[tokio::test]
-async fn phone_push_requires_exact_boundary_and_proof_and_bounded_json() {
-    let (_fixture, router, runtime) = setup().await;
-    for (host, origin, proof, body, expected) in [
-        ("127.0.0.1:9876", Some("http://127.0.0.1:9876"), Some("a".repeat(64)), r#"{"operation":"setup"}"#.to_owned(), StatusCode::OK),
-        ("127.0.0.1:9876", None, Some("a".repeat(64)), "{}".into(), StatusCode::FORBIDDEN),
-        ("127.0.0.1:9876", Some("https://evil.test"), Some("a".repeat(64)), "{}".into(), StatusCode::FORBIDDEN),
-        ("evil.test", Some("http://127.0.0.1:9876"), Some("a".repeat(64)), "{}".into(), StatusCode::FORBIDDEN),
-        ("127.0.0.1:9876", Some("http://127.0.0.1:9876"), None, "{}".into(), StatusCode::UNAUTHORIZED),
-        ("127.0.0.1:9876", Some("http://127.0.0.1:9876"), Some("b".repeat(64)), "{}".into(), StatusCode::UNAUTHORIZED),
-        ("127.0.0.1:9876", Some("http://127.0.0.1:9876"), Some("a".repeat(64)), "x".repeat(4097), StatusCode::PAYLOAD_TOO_LARGE),
-        ("127.0.0.1:9876", Some("http://127.0.0.1:9876"), Some("a".repeat(64)), r#"{"operation":"setup","unexpected":true}"#.into(), StatusCode::BAD_REQUEST),
-    ] {
-        let mut request = Request::builder().method("POST").uri("/push").header("host", host).header("content-type", "application/json");
-        if let Some(origin) = origin { request = request.header("origin", origin); }
-        if let Some(proof) = proof { request = request.header("x-pi-capability", proof); }
-        let response = router.clone().oneshot(request.body(Body::from(body)).unwrap()).await.unwrap();
-        assert_eq!(response.status(), expected); assert!(response.headers().get("access-control-allow-origin").is_none());
-    }
-    runtime.shutdown().await;
-}
-#[tokio::test]
 async fn install_assets_have_correct_types_and_same_origin_csp() {
     let (fixture, router, runtime) = setup().await;
     for (name, mime, body) in [
@@ -595,17 +572,6 @@ async fn install_assets_have_correct_types_and_same_origin_csp() {
         assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("manifest-src 'self';"));
         assert_eq!(axum::body::to_bytes(response.into_body(), 1024).await.unwrap().as_ref(), body);
     }
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
-async fn root_worker_is_javascript_uncached_and_allowed_by_csp() {
-    let (_fixture, router, runtime) = setup().await;
-    let response = router.oneshot(Request::builder().uri("/sw.js").header("host", "127.0.0.1:9876").body(Body::empty()).unwrap()).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers()["content-type"].to_str().unwrap().contains("javascript"));
-    assert_eq!(response.headers()["cache-control"], "no-store");
-    assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("worker-src 'self'"));
     runtime.shutdown().await;
 }
 

@@ -40,7 +40,15 @@ const OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
 /// Dropping a disconnected receiver releases all queued permits.
 pub struct Frame {
     pub text: String,
+    pub(crate) delivery: Option<FrameDelivery>,
     _permit: OwnedSemaphorePermit,
+}
+
+/// Queue stamp for a reply-bearing frame. A socket measures its own write separately.
+pub(crate) struct FrameDelivery {
+    pub epoch: String,
+    pub seq: u32,
+    pub queued: Instant,
 }
 pub struct Connection {
     pub frames: mpsc::Receiver<Frame>,
@@ -49,6 +57,7 @@ pub struct Connection {
 pub struct SessionHandle {
     pub(crate) images: crate::images::Images,
     pub(crate) turns: crate::local_review::TurnChanges,
+    pub(crate) author_notes: crate::author_notes::AuthorCapture,
     tx: mpsc::Sender<Control>,
     stop: watch::Sender<bool>,
     stopped: watch::Receiver<Option<bool>>,
@@ -200,11 +209,13 @@ enum Done {
     Steer(String, Result<Value, rpc::Error>),
     TurnCaptured,
     Formatted(String, String, crate::response_format::ResponsePresentation),
+    SavedResponse(String, String, String, Result<crate::response_format::ResponsePresentation, &'static str>),
     Cancel(String, u64, Result<Option<String>, rpc::Error>),
     Ui(String, Result<(), rpc::Error>),
     Terminated(rpc::Exit),
 }
 struct Runtime {
+    author_notes: crate::author_notes::AuthorCapture,
     turns: crate::local_review::TurnChanges,
     images: crate::images::Images,
     config: Config,
@@ -247,8 +258,7 @@ struct Runtime {
     read_pending: bool,
     revision: u64,
     settled: u64,
-    push: Option<crate::push::PushService>,
-    push_run_active: bool,
+    run_active: bool,
     seq: u32,
     patches: Vec<ViewPatch>,
     patch_bytes: usize,
@@ -293,7 +303,6 @@ pub fn start(config: Config) -> io::Result<SessionHandle> {
         Arc::new(store),
         metadata,
         crate::ownership::Ownership::default(),
-        None,
         response_model,
     )
 }
@@ -304,7 +313,6 @@ pub(crate) fn start_owned(
     store: Arc<MetadataStore>,
     mut metadata: SessionMetadata,
     ownership: crate::ownership::Ownership,
-    push: Option<crate::push::PushService>,
     response_model: watch::Receiver<config::ResponseModel>,
 ) -> io::Result<SessionHandle> {
     if metadata.cwd != config.cwd {
@@ -345,8 +353,10 @@ pub(crate) fn start_owned(
     });
     let images = crate::images::Images::default();
     let turns = crate::local_review::TurnChanges::default();
+    let author_notes = crate::author_notes::AuthorCapture::new(&store);
     let view = ViewState::with_response_formatting(true);
     let runtime = Runtime {
+        author_notes: author_notes.clone(),
         turns: turns.clone(),
         images: images.clone(),
         config,
@@ -389,8 +399,7 @@ pub(crate) fn start_owned(
         read_pending: false,
         revision: 0,
         settled: 0,
-        push,
-        push_run_active: false,
+        run_active: false,
         seq: 0,
         patches: Vec::new(),
         patch_bytes: 0,
@@ -409,6 +418,7 @@ pub(crate) fn start_owned(
         let _ = stopped_tx.send(Some(clean));
     });
     Ok(SessionHandle {
+        author_notes,
         images,
         turns,
         tx,
@@ -663,6 +673,14 @@ impl Runtime {
             Ok(Admission::Fresh(token)) => token,
         };
         match message.action {
+            BrowserAction::RetryResponseSave { message_id } => {
+                let presentation = self.view.messages().into_iter().find(|msg| msg.id == message_id).and_then(|msg| msg.presentation);
+                if self.jobs.len() >= 32 { self.result(&id, false, "formatter_unavailable", None, None); }
+                else if let Some(p @ crate::response_format::ResponsePresentation::Unsaved { .. }) = presentation {
+                    let formatter = self.formatter.clone(); let epoch = self.epoch.clone();
+                    self.jobs.spawn(async move { Done::SavedResponse(epoch, id, message_id, formatter.retry_save(p).await) });
+                } else { self.result(&id, false, "response_not_unsaved", None, None); }
+            }
             BrowserAction::RetryResponse { message_id } => {
                 let messages = self.view.messages();
                 let message = messages.iter().find(|message| message.id == message_id);
@@ -746,7 +764,7 @@ impl Runtime {
                 self.clear_progress();
                 self.run_started = Some(Instant::now());
                 self.response_evidence.begin();
-                self.response_replies = crate::response_format::ReplyText::default();
+                self.response_replies = crate::response_format::ReplyText::for_prompt(&text);
                 self.view.activity = Activity::Submitting;
                 self.status.error = None;
                 self.status.last_outcome = None;
@@ -758,8 +776,15 @@ impl Runtime {
                     request_id: id.clone(),
                     written: notice,
                 });
+                let note_turn = (self.config.author_notes.load(std::sync::atomic::Ordering::Relaxed) && !self.config.isolated && !text.trim_start().starts_with('/')).then(|| format!("{}:{}", self.epoch, self.settled + 1));
+                let text = if let Some(turn) = &note_turn {
+                    let instructions = include_str!("../../shared/author-note-tools.txt");
+                    format!("{text}\n\n[Project preference: author notes]\n{instructions}\n[Pi Web review notes turn {turn}]")
+                } else { text };
                 let turns = self.turns.clone(); let root = self.config.cwd.clone();
+                let author_notes = self.author_notes.clone();
                 self.jobs.spawn(async move {
+                    if let Some(turn) = note_turn { author_notes.begin(&root, turn).await; }
                     turns.begin(&root).await;
                     Done::Prompt(
                         id,
@@ -893,7 +918,7 @@ impl Runtime {
                 self.seq = 0;
                 self.revision = 0;
                 self.settled = 0;
-                self.push_run_active = false;
+                self.run_active = false;
                 self.turns.reset();
                 self.patches.clear();
                 self.patch_bytes = 0;
@@ -1081,20 +1106,32 @@ impl Runtime {
             )
         });
     }
+    fn publish_format(&mut self, id: &str, presentation: crate::response_format::ResponsePresentation) {
+        let patches = self.view.present(id, Some(presentation));
+        self.push_patches(patches);
+        if self.metadata.persisted {
+            let patches = self.view.release_originals();
+            self.push_patches(patches);
+        }
+    }
     fn done(&mut self, done: Done) {
         if self.exit_observed && !matches!(done, Done::Terminated(..)) {
             return;
         }
         match done {
-            Done::Formatted(epoch, id, presentation) => {
+            Done::SavedResponse(epoch, request, message_id, result) => {
                 if epoch == self.epoch {
-                    let patches = self.view.present(&id, Some(presentation));
-                    self.push_patches(patches);
-                    if self.metadata.persisted {
-                        let patches = self.view.release_originals();
-                        self.push_patches(patches);
+                    match result {
+                        Ok(presentation) => {
+                            self.publish_format(&message_id, presentation);
+                            self.result(&request, true, "response_saved", None, None);
+                        }
+                        Err(code) => self.result(&request, false, code, None, None),
                     }
                 }
+            }
+            Done::Formatted(epoch, id, presentation) => {
+                if epoch == self.epoch { self.publish_format(&id, presentation); }
             }
             Done::QuotaAck(token, response) => {
                 self.quota.ack(
@@ -1130,7 +1167,7 @@ impl Runtime {
                 self.send_settings();
                 if self.settings_refresh {
                     self.settings_refresh = false;
-                    self.request_state(StateReason::Settings);
+                    self.request_capabilities();
                 } else if self.state_requests == 0
                     && self
                         .setting_pending
@@ -1440,17 +1477,12 @@ impl Runtime {
             }
             self.format_candidate = None;
             self.run_started.get_or_insert_with(Instant::now);
-            self.push_run_active = true;
+            self.run_active = true;
         }
         self.response_evidence.observe(&event, self.run_started.map_or(0, |start| start.elapsed().as_millis().min(9_007_199_254_740_991) as u64));
-        let settling_run = self.push_run_active;
+        let settling_run = self.run_active;
         if event["type"] == "agent_settled" {
-            // This gate belongs to the runtime epoch, independent of attached clients.
-            if std::mem::take(&mut self.push_run_active) && event["aborted"] != true {
-                if let Some(push) = &self.push {
-                    push.completed();
-                }
-            }
+            self.run_active = false;
             self.settled += 1;
             self.status.last_outcome = Some(
                 if event["aborted"] == true {
@@ -1467,15 +1499,9 @@ impl Runtime {
                 }
                 .into(),
             );
-            let outcome = match self.status.last_outcome.as_deref() {
-                Some("aborted") => RunOutcome::Aborted,
-                Some("error") => RunOutcome::Error,
-                _ => RunOutcome::Success,
-            };
-            self.send(ServerBody::RunCompleted {
-                run_id: self.settled.to_string(),
-                outcome,
-            });
+            let notes = self.author_notes.clone(); let root = self.config.cwd.clone();
+            let turn = format!("{}:{}", self.epoch, self.settled);
+            self.jobs.spawn(async move { notes.finish(&root, &turn).await; Done::TurnCaptured });
             self.request_state(StateReason::Settled);
         }
         if self.background.apply(&event) {
@@ -1507,14 +1533,29 @@ impl Runtime {
             self.revision = self.revision.wrapping_add(1);
             self.push_patches(patches);
         }
-        let replies = settled.then(|| self.response_replies.take());
-        if settled && (settling_run || self.format_candidate.is_some()) {
+        if settled {
+            let (replies, user_query) = self.response_replies.take_for_format();
             let candidate = self.format_candidate.take().or_else(|| self.view.messages().into_iter().rev()
-                .find(|message| !message.complete && message.presentation == Some(crate::response_format::ResponsePresentation::Hidden))
+                .find(|message| settling_run && !message.complete && message.presentation == Some(crate::response_format::ResponsePresentation::Hidden))
                 .map(|message| (message.id, Err("This response was interrupted before it finished"))));
-            if let Some((id, source)) = candidate {
-                self.format_response(id, if aborted { Err("This run was cancelled. View the original for details.") } else { source.and(replies.unwrap()) }, false, run_started, recorded);
-            } else {
+            let candidate = candidate.map(|(id, source)| {
+                let context = recorded.map(|recorded| crate::response_format::FormatContext::for_live_reply(
+                    recorded, user_query.filter(|_| settling_run), source.as_deref().ok(),
+                ));
+                (id, if aborted { Err("This run was cancelled. View the original for details.") } else { source.and(replies) }, context)
+            });
+            let wait_for_message_id = candidate.as_ref().and_then(|(id, source, _)| {
+                (!source.as_ref().is_ok_and(|text| crate::response_format::has_html_preview(text))).then(|| id.clone())
+            });
+            let outcome = match self.status.last_outcome.as_deref() {
+                Some("aborted") => RunOutcome::Aborted,
+                Some("error") => RunOutcome::Error,
+                _ => RunOutcome::Success,
+            };
+            self.send(ServerBody::RunCompleted { run_id: self.settled.to_string(), outcome, wait_for_message_id });
+            if let Some((id, source, context)) = candidate {
+                self.format_response(id, source, false, run_started, context);
+            } else if settling_run {
                 let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
                 self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
             }
@@ -1522,9 +1563,9 @@ impl Runtime {
         self.finish_cancel();
     }
     /// Presents HTML previews directly; other replies get derived presentation with the settled run's clock.
-    fn format_response(&mut self, id: String, source: Result<String, &'static str>, retry: bool, run_started: Option<Instant>, recorded: Option<crate::response_format::RecordedEvidence>) {
+    fn format_response(&mut self, id: String, source: Result<String, &'static str>, retry: bool, run_started: Option<Instant>, live: Option<crate::response_format::FormatContext>) {
         if source.as_ref().is_ok_and(|text| crate::response_format::has_html_preview(text)) {
-            if recorded.is_some() {
+            if live.is_some() {
                 let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
                 self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
             }
@@ -1532,11 +1573,13 @@ impl Runtime {
             self.push_patches(patches);
             return;
         }
-        let source = if self.jobs.len() >= 32 { Err("Simple response workers are busy. Retry shortly.") } else { source };
-        let source = source.and_then(|text| resolve_executable(&self.config).map(|executable| (executable, text)).map_err(|_| "Configured Pi executable is unavailable"));
+        let source = admit_response(source, self.jobs.len(), || {
+            crate::response_format::query_text(&self.view.messages(), &id, self.view.older_history).map(|_| ())
+        }).and_then(|text| resolve_executable(&self.config).map(|executable| (executable, text)).map_err(|_| ("Configured Pi executable is unavailable", false)));
         match source {
             Ok((executable, text)) => {
                 let formatter = self.formatter.with_model(self.response_model.borrow().clone());
+                let source_lookups = self.config.response_lookups;
                 let epoch = self.epoch.clone();
                 let source_key = self.view.messages().iter().find(|message| message.id == id).map(|message| crate::response_format::scoped_source_key(message, &epoch));
                 let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
@@ -1544,10 +1587,13 @@ impl Runtime {
                 let patches = self.view.present(&id, Some(crate::response_format::ResponsePresentation::Pending));
                 self.push_patches(patches);
                 self.jobs.spawn(async move {
-                    let context = if let Some(mut recorded) = recorded {
+                    let context = if let Some(mut context) = live {
                         let _ = tokio::time::timeout_at(prepare_started + Duration::from_secs(5), turns.finish(&root, generation)).await;
-                        turns.response_files(generation, &mut recorded);
-                        crate::response_format::FormatContext { source_key, recorded, prepare_started: Some(prepare_started) }
+                        turns.response_files(generation, &mut context.recorded);
+                        context.source_key = source_key;
+                        context.prepare_started = Some(prepare_started);
+                        context.lookup_root = source_lookups.then_some(root);
+                        context
                     } else {
                         let reader = formatter.clone(); let answer = text.clone();
                         match tokio::task::spawn_blocking(move || reader.saved_context(source_key, &answer)).await {
@@ -1558,12 +1604,12 @@ impl Runtime {
                     Done::Formatted(epoch, id, formatter.format(executable, text, retry, run_started, context).await)
                 });
             }
-            Err(message) => {
-                if recorded.is_some() {
+            Err((message, retryable)) => {
+                if live.is_some() {
                     let turns = self.turns.clone(); let root = self.config.cwd.clone(); let generation = turns.generation();
                     self.jobs.spawn(async move { turns.finish(&root, generation).await; Done::TurnCaptured });
                 }
-                let patches = self.view.present(&id, Some(crate::response_format::ResponsePresentation::Error { message: message.into(), retryable: false, timings: None }));
+                let patches = self.view.present(&id, Some(crate::response_format::ResponsePresentation::Error { message: message.into(), retryable, timings: None }));
                 self.push_patches(patches);
             }
         }
@@ -1654,6 +1700,22 @@ impl Runtime {
             self.fail("Extension sent an invalid dialog identity");
             return;
         };
+        if method == "input" && let Some(encoded) = event["title"].as_str().and_then(|title| title.strip_prefix(crate::author_notes::PREFIX)) {
+            if self.jobs.len() >= 32 { self.cancel_dialog(id.to_owned()); return; }
+            let request = (encoded.len() <= 8192).then(|| serde_json::from_str::<crate::author_notes::Request>(encoded)).transpose();
+            let allowed = !self.config.isolated && self.config.author_notes.load(std::sync::atomic::Ordering::Relaxed) && self.run_active && !self.cancelling;
+            let Some(process) = self.process.clone() else { return; };
+            let notes = self.author_notes.clone(); let root = self.config.cwd.clone(); let id = id.to_owned();
+            self.jobs.spawn(async move {
+                let result = if !allowed { Err("Author-note tools require an active opted-in implementation turn") }
+                    else if let Ok(Some(request)) = request {
+                        tokio::time::timeout(Duration::from_secs(12), notes.tool(&root, request)).await.unwrap_or(Err("Note operation timed out; list notes before retrying"))
+                    } else { Err("Invalid or oversized review-note request") };
+                let reply = match result { Ok(data) => serde_json::json!({"data":data}), Err(error) => serde_json::json!({"error":error}) };
+                Done::Ui(String::new(), process.extension_ui_response(&id, UiAnswer::Value { value: reply.to_string() }).await)
+            });
+            return;
+        }
         let options: Vec<_> = event["options"]
             .as_array()
             .into_iter()
@@ -2005,7 +2067,7 @@ impl Runtime {
         self.seq = 0;
         self.revision = 0;
         self.settled = 0;
-        self.push_run_active = false;
+        self.run_active = false;
         self.patches.clear();
         self.patch_bytes = 0;
         self.status.last_outcome = None;
@@ -2274,6 +2336,17 @@ impl Runtime {
     }
     /// Nonblocking fanout with independent queue and byte budgets per subscriber.
     fn send_to(&mut self, target: Option<&str>, body: ServerBody) {
+        use crate::response_format::ResponsePresentation::{Error, Ready, Unsaved};
+        let completed = |message: &crate::view::DisplayMessage| {
+            matches!(message.presentation, Some(Ready { .. } | Unsaved { .. } | Error { .. }))
+        };
+        let delivery_seq = match &body {
+            ServerBody::Snapshot { through_seq, messages, .. } if messages.iter().any(completed) => Some(*through_seq),
+            ServerBody::Event { seq, patches, .. } if patches.iter().any(|patch| {
+                matches!(patch, ViewPatch::Message { message } if completed(message))
+            }) => Some(*seq),
+            _ => None,
+        };
         let message = ServerMessage {
             v: 1,
             session_id: self.metadata.app_id.clone(),
@@ -2297,6 +2370,7 @@ impl Runtime {
                             .sender
                             .try_send(Frame {
                                 text: text.clone(),
+                                delivery: delivery_seq.map(|seq| FrameDelivery { epoch: self.epoch.clone(), seq, queued: Instant::now() }),
                                 _permit: permit,
                             })
                             .is_ok()
@@ -2358,6 +2432,24 @@ fn invalidate_jobs(jobs: &mut JoinSet<Done>) {
 #[path = "session/epoch_tests.rs"]
 mod epoch_tests;
 
+/// Saturation is retryable only when the live window can reconstruct the completed run.
+fn admit_response(source: Result<String, &'static str>, jobs: usize, retained: impl FnOnce() -> Result<(), &'static str>) -> Result<String, (&'static str, bool)> {
+    let text = source.map_err(|reason| (reason, false))?;
+    if jobs < 32 { return Ok(text); }
+    retained().map_err(|reason| (reason, false))?;
+    Err(("Simple response workers are busy. Retry shortly.", true))
+}
+
+#[cfg(test)]
+#[test]
+fn saturation_offers_retry_only_for_recoverable_source() {
+    let full = || Ok("Complete".to_owned());
+    assert_eq!(admit_response(full(), 31, || unreachable!()).unwrap(), "Complete");
+    assert!(matches!(admit_response(full(), 32, || Ok(())), Err((_, true))));
+    assert_eq!(admit_response(full(), 32, || Err("clipped")), Err(("clipped", false)));
+    assert_eq!(admit_response(Err("interrupted"), 32, || unreachable!()), Err(("interrupted", false)));
+}
+
 fn valid_head(head: &HistoryHead) -> bool {
     !head.session_id.is_empty()
         && head.session_id.len() <= 1024
@@ -2367,7 +2459,7 @@ fn valid_head(head: &HistoryHead) -> bool {
             .is_none_or(|s| !s.is_empty() && s.len() <= 1024)
         && head.session_file.as_ref().is_none_or(|s| s.len() <= 4096)
 }
-/// Builds a main-session launch with the bundled visual skill and configured adapters.
+/// Makes the optional visual skill available alongside configured adapters.
 fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::ProcessSpec> {
     let executable = resolve_executable(config)?;
     let root = config.state_dir.join("pi-sessions");
@@ -2384,13 +2476,14 @@ fn launch_spec(config: &Config, session: Option<&Path>) -> io::Result<rpc::Proce
             .join("pi/skills/pi-web-visuals/SKILL.md")
             .canonicalize()?
             .into_os_string(),
-        "--append-system-prompt".into(),
-        "Pi Web supports HTML previews. Use them proactively for complex explanations or data visualization when clearer than lengthy prose. Read the pi-web-visuals skill first.".into(),
     ];
     if !config.isolated
         && let Ok(adapter) = config.quota_adapter.canonicalize()
     {
         args.extend([OsString::from("--extension"), adapter.into_os_string()]);
+    }
+    if !config.isolated {
+        args.extend([OsString::from("--extension"), PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pi/review-notes.ts").canonicalize()?.into_os_string()]);
     }
     if let Some(session) = session {
         args.push("--session".into());
@@ -2426,7 +2519,7 @@ mod artifact_prompt_tests {
     use super::*;
 
     #[test]
-    fn main_session_launch_teaches_the_opt_in_artifact_format() {
+    fn main_session_keeps_visuals_optional_without_an_always_on_prompt() {
         let root =
             std::env::temp_dir().join(format!("pi-web-artifact-launch-{}", std::process::id()));
         for isolated in [false, true] {
@@ -2438,18 +2531,8 @@ mod artifact_prompt_tests {
             config.cwd = root.clone();
             config.isolated = isolated;
             let spec = launch_spec(&config, None).unwrap();
-            let prompt = spec
-                .args
-                .windows(2)
-                .find(|pair| pair[0] == "--append-system-prompt");
-            let prompt = prompt.expect("main sessions need the visual skill routing hint")[1]
-                .to_string_lossy();
-            assert!(prompt.contains("pi-web-visuals"));
-            assert!(prompt.contains("proactively"));
-            assert!(prompt.contains("data visualization"));
-            assert!(prompt.contains("lengthy prose"));
-            assert!(!prompt.contains("var(--background)"));
-            assert!(!prompt.contains("html preview"));
+            assert!(!spec.args.iter().any(|arg| arg == "--append-system-prompt"),
+                "normal answers use composable summaries without an extra visual nudge");
             let skill = spec
                 .args
                 .windows(2)
@@ -2466,8 +2549,13 @@ mod artifact_prompt_tests {
             );
             let instructions = std::fs::read_to_string(path).unwrap();
             assert!(instructions.starts_with("---\nname: pi-web-visuals\n"));
+            let description = instructions.lines().find(|line| line.starts_with("description:")).unwrap();
+            assert!(description.contains("explicitly requests a visual"));
+            assert!(description.contains("cannot express"));
+            assert!(instructions.contains("Composable summaries are the default"));
             assert!(instructions.contains("html preview"));
-            assert!(instructions.contains("var(--background)"));
+            assert!(instructions.contains("`--background`"));
+            assert!(instructions.contains("`var(--name)`"));
         }
         std::fs::remove_dir_all(root).unwrap();
     }

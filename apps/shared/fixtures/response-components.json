@@ -1,0 +1,82 @@
+{
+  "tables": {
+    "summary": "Wait for the migration before restarting. For storage, use the database for shared access.",
+    "summarySource": null,
+    "canvas": null,
+    "blocks": [
+      {
+        "type": "table",
+        "purpose": "conditional",
+        "title": "Restart rules",
+        "columns": ["Condition", "Action"],
+        "rows": [["Migration finished", "Restart"], ["Otherwise", "Leave the service running"]]
+      },
+      {
+        "type": "table",
+        "purpose": "decision",
+        "title": "Storage choices",
+        "columns": ["Storage", "Best for"],
+        "rows": [["Files", "Local use"], ["Database", "Shared use"]]
+      }
+    ]
+  },
+  "composedComparison": {
+    "summary": "Tool calls and listings would share one decision. The change is proposed, not tested.",
+    "canvas": { "layout": "review", "focus": null, "composition": {
+      "type": "section", "title": "One access decision", "children": [
+        { "type": "comparison_panels", "mode": "change", "left": { "title": "Current", "blocks": [1, 0] }, "right": { "title": "Proposed", "blocks": [2, 3] } },
+        { "type": "block", "index": 4 }
+      ]
+    } },
+    "blocks": [
+      { "type": "code", "title": "Call site", "language": "js", "code": "return mayCall(tool);" },
+      { "type": "path", "title": "Separate decisions", "groups": [
+        { "label": "Call", "steps": [{ "text": "Evaluate the rule." }] },
+        { "label": "List", "steps": [{ "text": "Evaluate it again.", "annotation": { "kind": "risk", "text": "Results can disagree" } }] }
+      ] },
+      { "type": "path", "title": "Shared decision", "status": "Design only", "groups": [
+        { "label": "Either entry point", "steps": [{ "text": "Load a snapshot." }, { "text": "Return the verdict." }] }
+      ] },
+      { "type": "note", "title": "Proposed rule", "text": "> Use the same verdict for listing and calling." },
+      { "type": "checks", "title": "Verification", "items": [{ "status": "skipped", "text": "No tests were run." }] }
+    ]
+  },
+  "paths": {
+    "summary": "The proposal shares the decision; it has not been tested.",
+    "canvas": { "layout": "explanation", "focus": null, "composition": {
+      "type": "section", "title": "One access decision", "children": [{ "type": "columns", "ratio": "equal", "children": [
+        { "type": "block", "index": 0 }, { "type": "block", "index": 1 }
+      ] }]
+    } },
+    "blocks": [
+      { "type": "path", "title": "Current", "groups": [
+        { "label": "Call a tool", "steps": [{ "text": "Read the rules.", "annotation": { "kind": "cost", "text": "2 queries" } }, { "text": "Evaluate `mayCall`." }] },
+        { "label": "List tools", "steps": [{ "text": "Check each rule again.", "annotation": { "kind": "risk", "text": "Decisions can disagree" } }] }
+      ] },
+      { "type": "path", "title": "Shared decision", "status": "Design only", "groups": [
+        { "label": "Either entry point", "steps": [{ "text": "Load one snapshot." }, { "text": "Return one verdict." }] }
+      ] }
+    ]
+  },
+  "comparisons": {
+    "summary": "These are proposed configurations and separate data sources.",
+    "summarySource": null,
+    "canvas": null,
+    "blocks": [
+      {
+        "type": "comparison",
+        "mode": "change",
+        "title": "Request routing proposal",
+        "left": { "title": "Current", "text": "Each request opens a connection." },
+        "right": { "title": "Proposed", "text": "Requests reuse a **shared** connection." }
+      },
+      {
+        "type": "comparison",
+        "mode": "alternatives",
+        "title": "How Atlas discovers data",
+        "left": { "title": "Postgres", "text": "Atlas can list **tables and columns**." },
+        "right": { "title": "Maximo", "text": "Atlas can see a `maximo_query` tool." }
+      }
+    ]
+  }
+}

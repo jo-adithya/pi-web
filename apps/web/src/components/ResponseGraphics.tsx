@@ -1,21 +1,30 @@
 import { For, Match, Show, Switch, createMemo, createSignal, createUniqueId, onSettled } from "solid-js";
 import type { DiagramEdge, DiagramNode, RecordedEvidence, ResponseCard } from "../generated/protocol";
-import type { CodeLocation } from "../code-reference";
+import { codeReference, type OpenCodeReference } from "../code-reference";
 import { Markdown } from "./Markdown";
-import { rankedFindings } from "../response-plan";
+import { annotationLabels, rankedFindings } from "../response-plan";
 import "./response-canvas.css";
 
-type Graphic = Extract<ResponseCard, { type: "diagram" | "chart" | "timeline" | "findings" | "evidence" }>;
+type Graphic = Extract<ResponseCard, { type: "diagram" | "chart" | "timeline" | "findings" | "evidence" | "path" }>;
 export function isGraphic(card: ResponseCard): card is Graphic {
-  return ["diagram", "chart", "timeline", "findings", "evidence"].includes(card.type);
+  return ["diagram", "chart", "timeline", "findings", "evidence", "path"].includes(card.type);
 }
 
 /** Draws app-owned visuals from validated data. Evidence blocks bind only recorded IDs;
  * other graphics remain explicitly attributed to Pi. */
-export function ResponseGraphic(props: { card: Graphic; recorded?: RecordedEvidence; openCode?: (location: CodeLocation) => void }) {
+export function ResponseGraphic(props: { card: Graphic; recorded?: RecordedEvidence; openCode?: OpenCodeReference }) {
   return <Switch>
     <Match when={props.card.type === "diagram" ? props.card : undefined}>{card => <Diagram card={card()} />}</Match>
     <Match when={props.card.type === "chart" ? props.card : undefined}>{card => <BarChart card={card()} />}</Match>
+    <Match when={props.card.type === "path" ? props.card.groups : undefined}>{groups => <div class="response-path-groups">
+      <For each={groups()}>{group => <div class="response-path-group">
+        <h4>{group.label}</h4>
+        <ol role="list" aria-label={group.label}><For each={group.steps}>{step => <li>
+          <Markdown text={step.text} complete allowArtifacts={false} openCode={props.openCode && ((location, trigger) => props.openCode?.(location, trigger, "explicit"))} />
+          <Show when={step.annotation}>{note => <span class="response-path-annotation" data-kind={note().kind}>{annotationLabels[note().kind]}: {note().text}</span>}</Show>
+        </li>}</For></ol>
+      </div>}</For>
+    </div>}</Match>
     <Match when={props.card.type === "timeline" ? props.card.items : undefined}>{items => <>
       <ol class="response-timeline" role="list" aria-label={props.card.title}><For each={items()}>{item => <li data-kind={item.kind}>
         <span class="response-timeline-kind">{item.kind === "hypothesis" ? "Hypothesis" : item.kind === "next" ? "Next check" : "Pi-reported"}</span>
@@ -25,10 +34,9 @@ export function ResponseGraphic(props: { card: Graphic; recorded?: RecordedEvide
     <Match when={props.card.type === "findings" ? props.card.items : undefined}>{items => <>
       <p class="response-provenance">Pi’s assessment · severity is not independent verification</p>
       <ol class="response-findings" role="list" aria-label={props.card.title}><For each={rankedFindings(items())}>{item => <li data-severity={item.severity}>
-        <span class="response-finding-severity">{item.severity}</span><div><strong>{item.title}</strong>
-          <Markdown text={item.text} complete allowArtifacts={false} openCode={props.openCode} />
-          <Show when={item.location}><code class="response-finding-location">{item.location}</code></Show>
-        </div>
+        <div class="response-finding-heading"><strong>{item.title}</strong><span class="response-finding-severity">{item.severity}</span></div>
+        <Markdown text={item.text} complete allowArtifacts={false} openCode={props.openCode && ((location, trigger) => props.openCode?.(location, trigger, "explicit"))} />
+        <Show when={item.location}>{label => <FindingLocation label={label()} openCode={props.openCode} />}</Show>
       </li>}</For></ol>
     </>}</Match>
     <Match when={props.card.type === "evidence" ? props.card.items : undefined}>{ids => <Evidence ids={ids()} recorded={props.recorded!} openCode={props.openCode} />}</Match>
@@ -58,7 +66,16 @@ function BarChart(props: { card: Extract<Graphic, { type: "chart" }> }) {
   </>;
 }
 
-function Evidence(props: { ids: string[]; recorded: RecordedEvidence; openCode?: (location: CodeLocation) => void }) {
+/** Opens recognized workspace coordinates; other source labels stay literal and copyable. */
+function FindingLocation(props: { label: string; openCode?: OpenCodeReference }) {
+  const location = () => props.openCode && codeReference(props.label.trim(), "line");
+  return <Show when={location()} fallback={<code class="response-finding-location">{props.label}</code>}>{value =>
+    <button type="button" class="response-finding-location" aria-label={`Preview source at ${props.label}`}
+      onClick={event => props.openCode?.(value(), event.currentTarget, "explicit")}><code>{props.label}</code></button>
+  }</Show>;
+}
+
+function Evidence(props: { ids: string[]; recorded: RecordedEvidence; openCode?: OpenCodeReference }) {
   const files = () => props.recorded.files.filter(file => props.ids.includes(file.id));
   const tools = () => props.recorded.tools.filter(tool => props.ids.includes(tool.id));
   return <div class="response-evidence">
@@ -66,7 +83,7 @@ function Evidence(props: { ids: string[]; recorded: RecordedEvidence; openCode?:
     <Show when={files().length}>
       <ul class="response-files" role="list" aria-label="Captured file changes"><For each={files()}>{file => <li data-change={file.change}>
         <span class="response-file-symbol" aria-hidden="true">{file.change === "added" ? "+" : file.change === "deleted" ? "−" : "~"}</span>
-        <Show when={props.openCode} fallback={<code>{file.path}</code>}><button type="button" class="response-file-link" aria-label={`Open ${file.path} in Changes`} onClick={() => props.openCode?.({ path: file.path, line: 1, endLine: 1 })}>{file.path}</button></Show>
+        <Show when={props.openCode} fallback={<code>{file.path}</code>}><button type="button" class="response-file-link" aria-label={`Preview ${file.path}`} onClick={event => props.openCode?.({ path: file.path, line: 1, endLine: 1 }, event.currentTarget)}>{file.path}</button></Show>
         <span class="response-file-delta"><Show when={file.added !== null} fallback={<span>Counts unavailable</span>}><span class="response-lines-added">+{file.added}</span><span class="response-lines-removed">−{file.removed}</span></Show></span>
       </li>}</For></ul>
       <p class="response-provenance">Changes observed during this turn. Concurrent edits may be included. Links open current Changes/source views, not a historical snapshot.</p>
@@ -135,9 +152,15 @@ function placeNodes(nodes: DiagramNode[], edges: DiagramEdge[], columns: number)
   }
   return { nodes: placed, width, height: 24 + row * (boxHeight + 58) - 34, boxHeight, horizontal: false };
 }
+/** Places and indexes a graph once for a given width bucket. */
+function graphGeometry(nodes: DiagramNode[], edges: DiagramEdge[], columns: number) {
+  const frame = placeNodes(nodes, edges, columns);
+  return { ...frame, byId: new Map(frame.nodes.map(item => [item.node.id, item])) };
+}
+
 /** Routes one existing edge as an SVG path, keeping return paths outside the node columns. */
-function connection(edge: DiagramEdge, nodes: PlacedNode[], height: number, width: number, horizontal: boolean, frameHeight: number) {
-  const from = nodes.find(item => item.node.id === edge.from)!; const to = nodes.find(item => item.node.id === edge.to)!;
+function connection(edge: DiagramEdge, { byId, boxHeight: height, width, horizontal, height: frameHeight }: ReturnType<typeof graphGeometry>) {
+  const from = byId.get(edge.from)!; const to = byId.get(edge.to)!;
   if (from === to) {
     const x = from.x + 78, y = from.y + height / 2;
     return `M${x} ${y - 16} C${x + 48} ${y - 58} ${x + 48} ${y + 58} ${x} ${y + 16}`;
@@ -169,16 +192,18 @@ function Diagram(props: { card: Extract<Graphic, { type: "diagram" }> }) {
     const observer = new ResizeObserver(entries => { const width = entries[0].contentRect.width; setColumns(width >= 560 ? 3 : width < 360 ? 1 : 2); });
     observer.observe(container); return () => observer.disconnect();
   });
-  const geometry = () => placeNodes(props.card.nodes, props.card.edges, columns());
+  const geometry = createMemo(() => graphGeometry(props.card.nodes, props.card.edges, columns()));
+  const labels = createMemo(() => new Map(props.card.nodes.map(node => [node.id, node.label])));
+  const label = (id: string) => labels().get(id)!;
   return <>
     <p class="response-provenance">Pi’s explanation · <Show when={props.card.edges.some(edge => edge.relation === "hypothesis")} fallback={<>connections follow the source</>}>Dashed links are hypotheses</Show></p>
     <div class="response-diagram" data-compact={props.card.nodes.length <= 4 ? "true" : "false"} ref={container} tabindex={0} role="region" aria-label={`Diagram: ${props.card.title}`}>
       <svg viewBox={`0 0 ${geometry().width} ${geometry().height}`} role="img" aria-label={props.card.title} aria-describedby={`${marker}-description`}>
-        <desc id={`${marker}-description`}>Nodes: {props.card.nodes.map(node => node.label).join("; ")}. Connections: {props.card.edges.map(edge => `${props.card.nodes.find(node => node.id === edge.from)!.label} → ${props.card.nodes.find(node => node.id === edge.to)!.label}: ${edge.label}${edge.relation === "hypothesis" ? " (hypothesis)" : ""}`).join(". ")}</desc>
+        <desc id={`${marker}-description`}>Nodes: {props.card.nodes.map(node => node.label).join("; ")}. Connections: {props.card.edges.map(edge => `${label(edge.from)} → ${label(edge.to)}: ${edge.label}${edge.relation === "hypothesis" ? " (hypothesis)" : ""}`).join(". ")}</desc>
         <defs><marker id={marker} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10" fill="currentColor" /></marker></defs>
         <For each={props.card.edges}>{edge => <g class="response-diagram-edge" data-relation={edge.relation}>
           <Show when={edge.label}><title>{edge.label}</title></Show>
-          <path d={connection(edge, geometry().nodes, geometry().boxHeight, geometry().width, geometry().horizontal, geometry().height)} fill="none" marker-end={`url(#${marker})`} />
+          <path d={connection(edge, geometry())} fill="none" marker-end={`url(#${marker})`} />
         </g>}</For>
         <For each={geometry().nodes}>{item => <g class="response-diagram-node" data-kind={item.node.kind}>
           <rect x={item.x - 78} y={item.y} width="156" height={geometry().boxHeight} rx="12" />
@@ -188,7 +213,7 @@ function Diagram(props: { card: Extract<Graphic, { type: "diagram" }> }) {
       </svg>
     </div>
     <Show when={props.card.edges.length}><div class="response-connections"><strong>Connections</strong><ul role="list" aria-label="Diagram connections"><For each={props.card.edges}>{edge => <li>
-      <strong>{props.card.nodes.find(node => node.id === edge.from)!.label} → {props.card.nodes.find(node => node.id === edge.to)!.label}</strong>{edge.label ? `: ${edge.label}` : ""}{edge.relation === "hypothesis" ? " (hypothesis)" : ""}
+      <strong>{label(edge.from)} → {label(edge.to)}</strong>{edge.label ? `: ${edge.label}` : ""}{edge.relation === "hypothesis" ? " (hypothesis)" : ""}
     </li>}</For></ul></div></Show>
   </>;
 }

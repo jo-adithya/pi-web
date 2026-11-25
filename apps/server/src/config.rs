@@ -1,4 +1,4 @@
-//! Operator-only startup configuration. Browser commands cannot select paths,
+//! Startup configuration and shared project preferences. Browser commands cannot select paths,
 //! executables, extension files, bind addresses or arbitrary Pi arguments.
 use std::{
     fs::File,
@@ -9,15 +9,15 @@ use std::{
 pub const HELP: &str = "pi-web [--cwd PATH] [--new | --session FILE] [--port PORT]\n\
   [--state-dir PATH] [--session-root PATH] [--pi EXECUTABLE]\n\
   [--web-dir PATH] [--head-adapter PATH] [--quota-adapter PATH] [--isolated]\n\
-  [--remote-origin https://HOSTNAME] [--revoke-push]\n\
-  [--response-model PROVIDER/MODEL]\n\n\
+  [--remote-origin https://HOSTNAME]\n\
+  [--response-model PROVIDER/MODEL] [--no-response-lookups]\n\n\
 Binds only 127.0.0.1. Open the printed URL to authenticate this browser.\n\
 --remote-origin selects one private HTTPS proxy origin (default port 443; no trailing slash).\n\
 Defaults to the remembered exact session for the canonical project.\n\
 --new creates a new session without deleting prior Pi files.\n\
 Simple responses are always on (default openai-codex/gpt-6-luna); Settings saves the model server-wide.\n\
 --response-model changes the initial default only when no response model has been saved.\n\
---revoke-push clears persistent phone subscriptions and exits; stop the server first.\n\
+--no-response-lookups disables the formatter’s default read-only access to cited or turn-changed code.\n\
 --isolated disables optional extensions, MCP, context discovery and all tools but read.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +88,7 @@ impl Default for ResponseModel {
     }
 }
 
-/// Validated startup options. Only the project directory may later be selected by a browser.
+/// Validated startup options and shared project preferences. Only the project directory may later be selected by a browser.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cwd: PathBuf,
@@ -105,9 +105,11 @@ pub struct Config {
     pub head_adapter: PathBuf,
     pub quota_adapter: PathBuf,
     pub isolated: bool,
-    pub revoke_push: bool,
     /// Initial default when no server-wide response model preference has been saved.
     pub response_model: ResponseModel,
+    pub response_lookups: bool,
+    /// Shared project preference; existing session actors observe changes before the next prompt.
+    pub author_notes: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Config {
     /// Parses without creating files or starting Pi. `None` requests help.
@@ -126,8 +128,8 @@ impl Config {
         let mut head_adapter = manifest.join("pi/history-head.ts");
         let mut quota_adapter = manifest.join("pi/codex-usage.ts");
         let mut isolated = false;
-        let mut revoke_push = false;
         let mut response_model = None;
+        let mut response_lookups = true;
         while let Some(flag) = args.next() {
             if flag == "--help" || flag == "-h" {
                 return Ok(None);
@@ -139,8 +141,8 @@ impl Config {
                 startup = Startup::New;
                 continue;
             }
-            if flag == "--revoke-push" {
-                revoke_push = true;
+            if matches!(flag.as_str(), "--response-lookups" | "--no-response-lookups") {
+                response_lookups = flag == "--response-lookups";
                 continue;
             }
             if flag == "--isolated" {
@@ -245,8 +247,9 @@ impl Config {
             head_adapter,
             quota_adapter,
             isolated,
-            revoke_push,
             response_model: response_model.unwrap_or_default(),
+            response_lookups,
+            author_notes: Default::default(),
         }))
     }
     /// Derives runtime options for a registered folder, retaining operator-only options.
@@ -260,6 +263,7 @@ impl Config {
         config.cwd = cwd;
         config.state_dir = state_dir;
         config.startup = Startup::Remembered;
+        config.author_notes = Default::default();
         config
     }
     pub(crate) fn additional_state_dir(&self, cwd: &std::path::Path) -> PathBuf {

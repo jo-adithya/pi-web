@@ -15,7 +15,7 @@ fn releasing_a_previous_original_preserves_the_current_stream_mapping() {
     start(&mut state);
     state.apply(&json!({"type":"message_end","message":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":"Original first answer"}]}}));
     let first = state.messages().last().unwrap().id.clone();
-    state.present(&first, Some(ResponsePresentation::Ready { response: SimpleResponse { summary: "Saved.".into(), blocks: vec![], canvas: None, recorded: None }, timings: None }));
+    state.present(&first, Some(ResponsePresentation::Ready { response: SimpleResponse { summary: "Saved.".into(), summary_source: None, blocks: vec![], canvas: None, recorded: None }, timings: None }));
     state.apply(&json!({"type":"message_start","message":{"role":"user","content":"Second"}}));
     state.apply(&json!({"type":"message_end","message":{"role":"user","content":"Second"}}));
     start(&mut state);

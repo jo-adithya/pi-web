@@ -4,7 +4,7 @@ import { flush } from "solid-js";
 import { SessionView } from "../src/SessionView";
 import { createSessionModel, type SessionModel } from "../src/session-model";
 import { initialState } from "../src/client-state";
-import type { Activity } from "../src/generated/protocol";
+import type { Activity, SimpleResponse } from "../src/generated/protocol";
 
 const sessionId = "10000000-0000-4000-8000-000000000001";
 const epoch = "20000000-0000-4000-8000-000000000001";
@@ -240,11 +240,69 @@ it("shows formatting as a distinct phase until the answer is ready", () => {
   model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [{ kind: "message", message: {
     id: "formatting", role: "assistant", complete: true, truncated: false, error: null, blocks: [], presentation: { state: "pending" },
   } }], dialogs: [], olderHistory: false, status: { ...model.state.status, activity: "idle", notice: null } } }); flush();
-  expect(view.getByRole("status", { name: "Agent activity" }).textContent).toBe("Preparing your answer…");
+  expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
+  expect(view.getAllByText("Pi finished. Simplifying…")).toHaveLength(1);
+  expect(view.queryByRole("button", { name: "View original" })).toBeNull();
   model.receive({ v: 1, sessionId, epoch, body: { type: "event", seq: model.state.seq + 1, patches: [{ kind: "message", message: {
     id: "formatting", role: "assistant", complete: true, truncated: false, error: null, blocks: [], presentation: { state: "ready", response: { summary: "Done.", blocks: [] } },
   } }], dialogs: [], olderHistory: false, status: { ...model.state.status } } }); flush();
   expect(view.queryByRole("status", { name: "Agent activity" })).toBeNull();
+});
+
+it.each(["Markdown link", "finding location"] as const)("opens only this exchange's captured patch from a %s", kind => {
+  const model = session();
+  const target = { scope: "unstaged" } as const;
+  model.reviewCards.remember({ reference: "Attached reference A", target, selection: true, files: [{ path: "auth.ts", previousPath: null, status: "modified", lines: [{ kind: "add", next: 4, text: "+const earlierChange = true;" }] }] });
+  model.reviewCards.remember({ reference: "Attached reference B", target, selection: true, files: [{ path: "auth.ts", previousPath: null, status: "modified", lines: [{ kind: "add", next: 4, text: "+const capturedChange = true;" }, { kind: "add", next: 5, text: "+return capturedChange;" }] }] });
+  const load = vi.spyOn(model, "loadReviewPreview");
+  const response: SimpleResponse = kind === "Markdown link" ? { summary: "See `auth.ts:4`.", blocks: [] } : {
+    summary: "Reconnect can drop the saved cursor.",
+    canvas: { layout: "review", focus: null },
+    blocks: [{ type: "findings", title: "Issues", items: [{ severity: "high", title: "Missing cursor", text: "A second request then starts at the first page.", location: "auth.ts:4-5" }] }],
+  };
+  model.receive({ v: 1, sessionId, epoch, body: { type: "snapshot", throughSeq: 1, messages: [
+    { id: "a", role: "user", complete: true, blocks: [{ kind: "text", text: "Attached reference A" }], error: null, truncated: false },
+    { id: "b", role: "user", complete: true, blocks: [{ kind: "text", text: "Attached reference B" }], error: null, truncated: false },
+    { id: "reply", role: "assistant", complete: true, blocks: [], error: null, truncated: false, presentation: { state: "ready", response } },
+  ], dialogs: [], olderHistory: false, status: { ...model.state.status } } });
+  const view = render(() => <SessionView model={model} />); flush();
+  expect(view.queryByRole("complementary", { name: "Code reference" })).toBeNull();
+  const trigger = kind === "Markdown link" ? view.getByRole("link", { name: "auth.ts:4" }) : view.getByRole("button", { name: "Preview source at auth.ts:4-5" });
+  fireEvent.click(trigger); flush();
+  const pane = view.getByRole("complementary", { name: "Code reference" });
+  expect(pane.textContent).toContain("Captured review excerpt");
+  expect(pane.textContent).toContain("capturedChange");
+  expect(pane.textContent).not.toContain("earlierChange");
+  expect(pane.querySelectorAll('[data-reference="true"]')).toHaveLength(kind === "finding location" ? 2 : 1);
+  expect(load).not.toHaveBeenCalled();
+  fireEvent.click(view.getByRole("button", { name: "Close preview" })); flush();
+  expect(document.activeElement).toBe(trigger);
+  load.mockRestore();
+});
+
+it("does not substitute an earlier capture or current code for an uncaptured finding", async () => {
+  const model = session();
+  model.reviewCards.remember({ reference: "Earlier attached reference", target: { scope: "unstaged" }, selection: true, files: [{ path: "src/queue.ts", previousPath: null, status: "modified", lines: [{ kind: "add", next: 8, text: "+earlierValue();" }] }] });
+  const loadDiff = vi.spyOn(model, "loadReviewPreview");
+  const loadSource = vi.spyOn(model, "loadSource").mockResolvedValue({ path: "src/queue.ts", firstLine: 8, text: "currentValue();" });
+  model.receive({ v: 1, sessionId, epoch, body: { type: "snapshot", throughSeq: 1, messages: [
+    { id: "previous", role: "user", complete: true, blocks: [{ kind: "text", text: "Earlier attached reference" }], error: null, truncated: false },
+    { id: "latest", role: "user", complete: true, blocks: [{ kind: "text", text: "Check the queue again." }], error: null, truncated: false },
+    { id: "finding", role: "assistant", complete: true, blocks: [], error: null, truncated: false, presentation: { state: "ready", response: {
+      summary: "Queued work can be lost.", blocks: [{ type: "findings", title: "Issues", items: [{ severity: "high", title: "Missing entry", text: "The retry can remove the entry.", location: "src/queue.ts:8" }] }],
+    } } },
+  ], dialogs: [], olderHistory: false, status: { ...model.state.status } } });
+  const view = render(() => <SessionView model={model} />); flush();
+  fireEvent.click(view.getByRole("button", { name: "Preview source at src/queue.ts:8" })); flush();
+  const pane = view.getByRole("complementary", { name: "Code reference" });
+  expect(pane.textContent).toContain("No captured review excerpt is available");
+  expect(pane.textContent).not.toContain("earlierValue");
+  expect(loadDiff).not.toHaveBeenCalled();
+  expect(loadSource).not.toHaveBeenCalled();
+  fireEvent.click(view.getByRole("button", { name: "Show current file" }));
+  expect(await view.findByText("Current workspace file · not a captured diff")).toBeTruthy();
+  expect(pane.textContent).toContain("currentValue");
+  loadSource.mockRestore(); loadDiff.mockRestore();
 });
 
 it("shows prompt submission immediately and hides stale activity after disconnection", () => {
@@ -325,7 +383,7 @@ it("dismisses a local notice without losing the underlying extension status", ()
 it("jumps to the latest transcript content and hides the jump button", () => {
   const model = session(); model.setStick(false);
   const view = render(() => <SessionView model={model} />); flush();
-  const transcript = document.documentElement;
+  const transcript = view.container.querySelector<HTMLDivElement>(".transcript")!;
   Object.defineProperty(transcript, "scrollHeight", { configurable: true, value: 2000 });
   fireEvent.click(view.getByRole("button", { name: "Jump to latest" })); flush();
   expect(transcript.scrollTop).toBe(2000);

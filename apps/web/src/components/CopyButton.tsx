@@ -1,9 +1,11 @@
 import { createSignal, onSettled } from "solid-js";
 import { Button } from "@kobalte/core/button";
+import { Icon } from "./Icon";
 
 /** Copies the supplied plain text on demand, with local success or recovery feedback. */
-export function CopyButton(props: { label: string; text: () => string }) {
+export function CopyButton(props: { label: string; iconOnly?: boolean; text: () => string }) {
   const [message, setMessage] = createSignal("");
+  const copied = () => message() === "Copied";
   const [busy, setBusy] = createSignal(false);
   let disposed = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -23,5 +25,10 @@ export function CopyButton(props: { label: string; text: () => string }) {
       }
     }
   }
-  return <span class="copy-action"><Button type="button" class="copy-button" aria-label={props.label} disabled={busy()} onClick={copy}>{message() === "Copied" ? "Copied" : props.label}</Button><span class={message() === "Copied" ? "sr-only" : "copy-status"} role="status">{message()}</span></span>;
+  return <span class="copy-action">
+    <Button type="button" class="copy-button" aria-label={props.label} title={props.iconOnly ? (copied() ? "Copied" : props.label) : undefined} disabled={busy()} onClick={copy}>
+      {props.iconOnly ? <Icon name={copied() ? "check" : "copy"} /> : copied() ? "Copied" : props.label}
+    </Button>
+    <span class={copied() ? "sr-only" : "copy-status"} role="status">{message()}</span>
+  </span>;
 }

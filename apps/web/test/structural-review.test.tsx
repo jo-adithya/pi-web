@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-li
 import { flush } from "solid-js";
 import { LocalReview } from "../src/LocalReview";
 import { createSessionModel } from "../src/session-model";
+import { emptyNotebook } from "../src/review-notebook";
 import { fetchStructuralReview, createStructuralReview, type StructuralResult } from "../src/structural-review";
 
 const file = { path: "src/main.rs", previousPath: null, status: "modified", fingerprint: "snapshot-a", patch: '@@ -1 +1 @@\n-fn main() { old(); }\n+fn main() { new(); }\n' };
@@ -15,13 +16,14 @@ beforeEach(() => { HTMLElement.prototype.scrollIntoView = vi.fn(); vi.spyOn(wind
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it("loads structural comparison only on request and opens Ask Pi with the original file diff", async () => {
-  const fetch = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/structural") ? result : snapshot)));
+  const fetch = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/notebook") ? emptyNotebook() : url.endsWith("/source") ? { enabled: false } : url.endsWith("/structural") ? result : snapshot)));
   vi.stubGlobal("fetch", fetch);
   const transport = vi.fn(() => true), conversation = vi.fn();
   const model = createSessionModel("s", transport, () => true, undefined, () => "cap");
   const page = render(() => <LocalReview model={model} conversation={conversation} />);
   await waitFor(() => { flush(); expect(page.getByRole("region", { name: "Unified diff" })).toBeTruthy(); });
-  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(fetch.mock.calls.filter(([url]) => url === "/review/s")).toHaveLength(1);
+  expect(fetch.mock.calls.some(([url]) => url.endsWith("/structural"))).toBe(false);
   fireEvent.click(page.getByRole("button", { name: "Structural" })); flush();
   await waitFor(() => { flush(); expect(page.getByRole("region", { name: "Structural diff" })).toBeTruthy(); });
   expect(fetch).toHaveBeenLastCalledWith("/review/s/structural", expect.objectContaining({

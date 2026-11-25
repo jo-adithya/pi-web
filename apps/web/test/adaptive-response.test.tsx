@@ -4,6 +4,7 @@ import { flush } from "solid-js";
 import { SimpleResponse } from "../src/components/SimpleResponse";
 import { responseText } from "../src/response-copy";
 import { decodeServer, initialState } from "../src/client-state";
+import responseFixtures from "../../shared/fixtures/response-components.json";
 import type { CanvasLayout, DisplayMessage, RecordedEvidence, SimpleResponse as Response } from "../src/generated/protocol";
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
@@ -20,13 +21,157 @@ const recorded: RecordedEvidence = { filesState: "captured", omittedFiles: false
 };
 function show(response: Response, openCode = vi.fn()) {
   const message: DisplayMessage = { id: "answer", role: "assistant", complete: true, error: null, truncated: false, blocks: [], presentation: { state: "ready", response } };
-  const view = render(() => <SimpleResponse message={message} original={() => <p>Original stays separate.</p>} openCode={openCode} />);
+  const view = render(() => <SimpleResponse message={message} original={() => ({ render: () => <p>Original stays separate.</p>, text: "Original stays separate." })} openCode={openCode} />);
   flush(); return { ...view, openCode };
 }
 function wire(response: unknown) {
   return JSON.stringify({ v: 1, sessionId: "s", epoch: "e", body: { type: "snapshot", throughSeq: 1, status: initialState().status,
     messages: [{ id: "answer", role: "assistant", complete: true, error: null, truncated: false, blocks: [], presentation: { state: "ready", response } }], dialogs: [], olderHistory: false } });
 }
+function decodeReply(response: unknown): Response {
+  const frame = decodeServer(wire(response));
+  const presentation = frame?.body.type === "snapshot" ? frame.body.messages[0].presentation : undefined;
+  if (presentation?.state !== "ready") throw new Error("Expected a ready presentation");
+  return presentation.response;
+}
+
+it("shows and copies the summary without an empty headline", () => {
+  const response: Response = { summary: "Still readable.", canvas: { layout: "result", focus: null }, blocks: [] };
+  expect(() => decodeServer(wire(response))).not.toThrow();
+  const view = show(response);
+  expect(view.getByText("Still readable.")).toBeTruthy();
+  expect(view.container.querySelector("h2")).toBeNull();
+  expect(responseText(response)).toBe("Still readable.");
+});
+
+it("keeps mixed native blocks inside named comparison panels and copies them in panel order", () => {
+  const response = decodeReply(responseFixtures.composedComparison);
+  const view = show(response);
+  const left = view.getByRole("region", { name: "Current" }), right = view.getByRole("region", { name: "Proposed" });
+  expect(within(left).getByRole("list", { name: "List" })).toBeTruthy();
+  expect(left.querySelector("pre code")?.textContent).toBe("return mayCall(tool);");
+  expect(within(right).getByText("Design only")).toBeTruthy();
+  expect(right.querySelector("blockquote")?.textContent).toContain("Use the same verdict for listing and calling.");
+  const shared = view.getByText("No tests were run.");
+  expect(left.contains(shared) || right.contains(shared)).toBe(false);
+  const text = responseText(response);
+  const parts = ["One access decision", "Current", "Separate decisions", "Call site", "```js\nreturn mayCall(tool);\n```", "Proposed\n", "Shared decision (Design only)", "> Use the same verdict", "Verification", "No tests were run."];
+  const positions = parts.map(part => text.indexOf(part));
+  expect(positions.every((n, i) => n >= 0 && (!i || n > positions[i - 1]))).toBe(true);
+});
+
+it("uses neutral panels for alternatives without inferring a change from titles", () => {
+  const composition = { type: "comparison_panels", mode: "alternatives", left: { title: "Before", blocks: [0] }, right: { title: "After", blocks: [1] } };
+  const response = decodeReply({ summary: "Two named alternatives.", blocks: responseFixtures.composedComparison.blocks.slice(0, 2), canvas: { layout: "explanation", focus: null, composition } });
+  const view = show(response);
+  expect(view.getByRole("region", { name: "Before" }).parentElement?.dataset.mode).toBe("alternatives");
+  expect(view.getByRole("region", { name: "After" }).textContent).toContain("Separate decisions");
+});
+
+it("rejects empty, duplicated, missing and out-of-range comparison panel references", () => {
+  const { summary, blocks } = responseFixtures.composedComparison;
+  for (const [before, after] of [[[], [1, 2, 3, 4]], [[0, 1], [1, 2, 3, 4]], [[0, 1], [2, 3]], [[0, 1], [2, 3, 4, 5]]]) {
+    const composition = { type: "comparison_panels", mode: "alternatives", left: { title: "A", blocks: before }, right: { title: "B", blocks: after } };
+    expect(() => decodeServer(wire({ summary, blocks, canvas: { layout: "comparison", focus: null, composition } }))).toThrow("Invalid server message");
+  }
+});
+
+it("renders native paths in paired columns and copies annotations with their step", () => {
+  const response = decodeReply(responseFixtures.paths);
+  const view = show(response);
+  expect(view.container.querySelectorAll('.response-composition-columns > [data-component="path"]')).toHaveLength(2);
+  expect(view.getByRole("heading", { name: "One access decision" })).toBeTruthy();
+  const steps = within(view.getByRole("list", { name: "Call a tool" })).getAllByRole("listitem");
+  expect(steps[0].textContent).toContain("Cost: 2 queries");
+  expect(steps[1].querySelector("code")?.textContent).toBe("mayCall");
+  expect(view.getByText("Design only").closest("section")?.textContent).toContain("Return one verdict.");
+  expect(responseText(response)).toContain("Call a tool\n1. Read the rules. — Cost: 2 queries\n2. Evaluate `mayCall`.");
+  expect(responseText(response)).toContain("Shared decision (Design only)");
+  expect(responseText(response)).toContain("Risk: Decisions can disagree");
+  expect(view.container.querySelector("iframe")).toBeNull();
+});
+
+it("accepts a standalone path but rejects empty groups, missing steps and malformed annotations", () => {
+  const path = responseFixtures.paths.blocks[0];
+  const reply = (block: unknown) => ({ summary: "One path", blocks: [block] });
+  expect(decodeReply(reply(path)).blocks).toHaveLength(1);
+  for (const groups of [[], [{ label: "Entry", steps: [] }], [{ label: "Entry", steps: [{ text: "Read", annotation: { kind: "verified", text: "done" } }] }]]) {
+    expect(() => decodeServer(wire(reply({ ...path, groups })))).toThrow("Invalid server message");
+  }
+});
+
+it("shows and copies the two option titles instead of Before and After", () => {
+  const response = decodeReply({ summary: "Atlas discovers data differently for each source.", blocks: [responseFixtures.comparisons.blocks[1]] });
+  const view = show(response);
+  expect(view.getByRole("heading", { name: "How Atlas discovers data" })).toBeTruthy();
+  expect(view.getAllByRole("heading", { level: 4 }).map(heading => heading.textContent)).toEqual(["Postgres", "Maximo"]);
+  expect(view.container.querySelector("strong")?.textContent).toBe("tables and columns");
+  expect(view.container.querySelector("code")?.textContent).toBe("maximo_query");
+  expect(responseText(response)).toBe([
+    "Atlas discovers data differently for each source.", "How Atlas discovers data",
+    "Postgres:", "Atlas can list **tables and columns**.", "Maximo:", "Atlas can see a `maximo_query` tool.",
+  ].join("\n\n"));
+});
+
+it("keeps a comparison's mode when its display titles are renamed", () => {
+  const response = decodeReply({ summary: "Proposal only.", blocks: [responseFixtures.comparisons.blocks[0]] });
+  const view = show(response);
+  expect(view.getByRole("heading", { name: "Current" })).toBeTruthy();
+  expect(view.getByRole("heading", { name: "Proposed" })).toBeTruthy();
+  expect(view.container.querySelector(".simple-response-comparison")?.getAttribute("data-mode")).toBe("change");
+  expect(responseText(response)).toContain("Proposed:\n\nRequests reuse a **shared** connection.");
+});
+
+it("keeps custom conditional and decision headings attached to their rows", () => {
+  const { summary, blocks } = responseFixtures.tables;
+  const response = decodeReply({ summary, blocks });
+  const view = show(response);
+  const conditions = within(view.getByRole("table", { name: "Restart rules" }));
+  const otherwise = conditions.getByRole("row", { name: "Otherwise Leave the service running" });
+  expect([...otherwise.querySelectorAll(".simple-table-label")].map(label => label.textContent)).toEqual(["Condition", "Action"]);
+  const choices = within(view.getByRole("table", { name: "Storage choices" }));
+  expect(choices.getByRole("rowheader", { name: "Database" })).toBeTruthy();
+  expect(responseText(response)).toContain("| Otherwise | Leave the service running |");
+});
+
+it("renders mixed composables in source order and copies section headings", () => {
+  const response: Response = { summary: "A mixed result.", canvas: { layout: "result", headline: "Grouped result", focus: null,
+    composition: { type: "stack", children: [
+      { type: "section", title: "Investigation context", children: [{ type: "block", index: 1 }] },
+      { type: "columns", ratio: "leading", children: [{ type: "block", index: 2 }, { type: "block", index: 0 }] },
+    ] } }, blocks: [
+      { type: "details", title: "Optional", text: "Extra detail." },
+      { type: "warning", title: "Risk", text: "Still visible." },
+      diagram,
+    ] };
+  expect(decodeServer(wire(response))).not.toBeNull();
+  const view = show(response);
+  expect(view.getByRole("heading", { name: "Investigation context" })).toBeTruthy();
+  expect(view.container.querySelectorAll('.response-composition-columns > *')).toHaveLength(2);
+  const blocks = [...view.container.querySelectorAll(".response-canvas-block")];
+  expect(blocks.map(block => block.getAttribute("data-component"))).toEqual(["warning", "diagram", "details"]);
+  expect(view.getByText("Still visible.").closest("details")).toBeNull();
+  const text = responseText(response);
+  expect(text.indexOf("Investigation context")).toBeLessThan(text.indexOf("Warning: Risk"));
+  expect(text.indexOf("Session routing")).toBeLessThan(text.indexOf("Optional"));
+});
+
+it("rejects invalid composition references, shapes and excessive nesting", () => {
+  const base = { summary: "Result", canvas: { layout: "result", headline: "Result", focus: null, composition: {} }, blocks: [diagram] };
+  for (const composition of [
+    { type: "block", index: 1 },
+    { type: "stack", children: [] },
+    { type: "stack", children: [{ type: "block", index: 0 }, { type: "block", index: 0 }] },
+    { type: "columns", ratio: "equal", children: [{ type: "block", index: 0 }] },
+    { type: "section", title: " ", children: [{ type: "block", index: 0 }] },
+    { type: "disclosure", children: [{ type: "block", index: 0 }] },
+  ]) {
+    expect(() => decodeServer(wire({ ...base, canvas: { ...base.canvas, composition } }))).toThrow("Invalid server message");
+  }
+  let nested: unknown = { type: "block", index: 0 };
+  for (let i = 0; i < 6; i++) nested = { type: "stack", children: [nested] };
+  expect(() => decodeServer(wire({ ...base, canvas: { ...base.canvas, composition: nested } }))).toThrow("Invalid server message");
+});
 
 it.each<CanvasLayout>(["result", "explanation", "investigation", "review", "plan", "comparison"])("composes a %s canvas around one dominant visual", layout => {
   const view = show({ summary: "Each request reaches its own session.", canvas: { layout, headline: "Sessions stay separate", focus: 1 }, blocks: [
@@ -77,6 +222,17 @@ it("prioritizes severe findings and treats SVG labels as literal text", () => {
   expect(within(findings).getAllByRole("listitem")[0].textContent).toContain("Important issue");
   expect(view.getByRole("img", { name: "Literal labels" }).querySelector(".response-node-label")?.textContent).toBe("<script>bad()</script>");
   expect(view.container.querySelector("script, foreignObject")).toBeNull();
+});
+
+it("keeps file-only, nonlocal and invalid finding locations as literal text", () => {
+  const references = ["src/main.ts", "/tmp/example.ts:2", "../outside.ts:2", "https://example.test/change#L2", "src/main.ts:8-4"];
+  const view = show({ summary: "Sources to verify.", blocks: [{ type: "findings", title: "Findings", items: references.map(location => ({
+    severity: "medium", title: "A finding", text: "A source label alone does not identify a valid workspace line.", location,
+  })) }] });
+  const list = within(view.getByRole("list", { name: "Findings" }));
+  for (const location of references) expect(list.getByText(location).textContent).toBe(location);
+  expect(list.queryAllByRole("button")).toHaveLength(0);
+  expect(list.queryAllByRole("link")).toHaveLength(0);
 });
 
 it("uses a wide diagram on desktop and a readable single column on narrow screens", () => {
@@ -135,8 +291,8 @@ it("binds file and tool references to recorded data and opens the current Change
   const view = show({ summary: "A file changed.", canvas: { layout: "result", headline: "Session update", focus: 0 }, recorded,
     blocks: [{ type: "evidence", title: "Recorded work", items: ["file:0", "tool:0"] }] });
   expect(view.getByText("+2")).toBeTruthy(); expect(view.getByText("−1")).toBeTruthy();
-  fireEvent.click(view.getByRole("button", { name: "Open src/session.ts in Changes" }));
-  expect(view.openCode).toHaveBeenCalledWith({ path: "src/session.ts", line: 1, endLine: 1 });
+  fireEvent.click(view.getByRole("button", { name: "Preview src/session.ts" }));
+  expect(view.openCode).toHaveBeenCalledWith({ path: "src/session.ts", line: 1, endLine: 1 }, expect.any(HTMLButtonElement));
   expect(view.getByText(/Concurrent edits may be included/)).toBeTruthy();
   expect(view.getByText(/not proof that tests passed/)).toBeTruthy();
 });
@@ -169,7 +325,7 @@ it("accepts unlimited text and collection sizes for all remaining components", (
     { type: "findings", title: text, items: Array(20).fill({ title: text, text, location: text, severity: "high" }) },
     { type: "checks", title: text, items: Array(20).fill({ status: "unverified", text }) },
     { type: "chart", title: text, unit: text, items: Array(20).fill({ label: text, value: "1e100" }) },
-    { type: "comparison", title: text, before: text, after: text },
+    { type: "comparison", title: text, left: { title: text, text }, right: { title: text, text } },
     { type: "details", title: text, text }, { type: "warning", title: text, text },
   ] };
   expect(() => decodeServer(wire(response))).not.toThrow();

@@ -30,7 +30,7 @@ export function developmentServer(env: Record<string, string | undefined>): Serv
     headers: { "Referrer-Policy": "no-referrer", "Cache-Control": "no-store" },
     hmr: { protocol: "wss", host: url.hostname, clientPort: 443, path: "/__pi_web_hmr" },
     proxy: {
-      "^/(?:auth|push|sw\\.js)(?:\\?|$)": { target, changeOrigin: false },
+      "^/auth(?:\\?|$)": { target, changeOrigin: false },
       "^/images/": { target, changeOrigin: false },
       "^/review/": { target, changeOrigin: false },
       "^/ws(?:\\?|$)": { target, changeOrigin: false, ws: true },

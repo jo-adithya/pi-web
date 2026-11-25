@@ -302,7 +302,7 @@ it.each([
 
 it("requires server approval for a well-formed pasted token", async () => {
   sessionStorage.clear(); Socket.instances = [];
-  const fetcher = vi.fn().mockResolvedValue({ ok: false });
+  const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
   vi.stubGlobal("fetch", fetcher); vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
   const input = await page.findByLabelText("Terminal login link") as HTMLInputElement;
@@ -358,9 +358,59 @@ it.each([
   expect(input.value).toBe("");
 });
 
+it.each(["offline", "timeout", 408, 503, 403] as const)("can retry login after %s without losing the stored credential", async failure => {
+  Socket.instances = [];
+  const fetcher = vi.fn();
+  if (typeof failure === "number") fetcher.mockResolvedValueOnce(new Response(null, { status: failure }));
+  else fetcher.mockRejectedValueOnce(failure === "offline" ? new TypeError("Offline") : new DOMException("Timed out", "TimeoutError"));
+  fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }));
+  vi.stubGlobal("fetch", fetcher); vi.stubGlobal("WebSocket", Socket);
+  const page = render(() => <App />);
+  const retry = await page.findByRole("button", { name: "Retry connection" });
+  expect(page.queryByLabelText("Terminal login link")).toBeNull();
+  expect(sessionStorage.getItem(storageKey)).toBe(first);
+  expect(Socket.instances).toHaveLength(0);
+  fireEvent.click(retry);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(fetcher).toHaveBeenLastCalledWith("/auth", expect.objectContaining({ body: JSON.stringify({ capability: first }) }));
+  expect(Socket.instances[0].protocols).toEqual(["pi-web.v1", `pi-web.cap.${first}`]);
+  expect(page.queryByRole("button", { name: "Retry connection" })).toBeNull();
+});
+
+it("retries the new terminal link in memory without storing it before approval", async () => {
+  Socket.instances = [];
+  const fetcher = vi.fn().mockRejectedValueOnce(new TypeError("Offline")).mockResolvedValueOnce(new Response(null, { status: 204 }));
+  vi.stubGlobal("fetch", fetcher); vi.stubGlobal("WebSocket", Socket);
+  history.replaceState(null, "", `/#cap=${second}`);
+  const page = render(() => <App />);
+  const retry = await page.findByRole("button", { name: "Retry connection" });
+  expect(location.hash).toBe("");
+  expect(page.container.textContent).not.toContain(second);
+  expect(sessionStorage.getItem(storageKey)).toBe(first);
+  expect(Socket.instances).toHaveLength(0);
+  fireEvent.click(retry);
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  expect(Socket.instances[0].protocols).toEqual(["pi-web.v1", `pi-web.cap.${second}`]);
+  expect(sessionStorage.getItem(storageKey)).toBe(second);
+});
+
+it("prompts for a new link if retry is rejected without deleting a different saved login", async () => {
+  Socket.instances = [];
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response(null, { status: 503 })).mockResolvedValueOnce(new Response(null, { status: 401 })));
+  vi.stubGlobal("WebSocket", Socket);
+  history.replaceState(null, "", `/#cap=${second}`);
+  const page = render(() => <App />);
+  fireEvent.click(await page.findByRole("button", { name: "Retry connection" }));
+  expect(await page.findByLabelText("Terminal login link")).toBeDefined();
+  expect(page.queryByRole("button", { name: "Retry connection" })).toBeNull();
+  expect(sessionStorage.getItem(storageKey)).toBe(first);
+  expect(Socket.instances).toHaveLength(0);
+});
+
 it("clears a rejected stored capability without opening a socket", async () => {
   Socket.instances = [];
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false })); vi.stubGlobal("WebSocket", Socket);
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 401 }))); vi.stubGlobal("WebSocket", Socket);
   const page = render(() => <App />);
   await vi.waitFor(() => expect(page.getByText("Authentication required")).toBeDefined());
   expect(sessionStorage.getItem(storageKey)).toBeNull();
@@ -369,15 +419,15 @@ it("clears a rejected stored capability without opening a socket", async () => {
 
 it.each(["accepted", "rejected", "failed"])("keeps the newest successful bootstrap when an older authentication finishes later (%s)", async (outcome) => {
   Socket.instances = [];
-  const completions: Array<{ resolve: (response: { ok: boolean }) => void; reject: (reason: Error) => void }> = [];
-  vi.stubGlobal("fetch", vi.fn(() => new Promise<{ ok: boolean }>((resolve, reject) => completions.push({ resolve, reject })))); vi.stubGlobal("WebSocket", Socket);
+  const completions: Array<{ resolve: (response: Response) => void; reject: (reason: Error) => void }> = [];
+  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve, reject) => completions.push({ resolve, reject })))); vi.stubGlobal("WebSocket", Socket);
   history.replaceState(null, "", `/#cap=${first}`); render(() => <App />);
   await vi.waitFor(() => expect(completions).toHaveLength(1));
   history.replaceState(null, "", `/#cap=${second}`); window.dispatchEvent(new HashChangeEvent("hashchange"));
   await vi.waitFor(() => expect(completions).toHaveLength(2));
-  completions[1].resolve({ ok: true }); await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
+  completions[1].resolve(new Response(null, { status: 204 })); await vi.waitFor(() => expect(Socket.instances).toHaveLength(1));
   if (outcome === "failed") completions[0].reject(new Error("Network unavailable"));
-  else completions[0].resolve({ ok: outcome === "accepted" });
+  else completions[0].resolve(new Response(null, { status: outcome === "accepted" ? 204 : 401 }));
   await Promise.resolve(); flush();
   expect(Socket.instances).toHaveLength(1);
   expect(Socket.instances[0].protocols).toEqual(["pi-web.v1", `pi-web.cap.${second}`]);

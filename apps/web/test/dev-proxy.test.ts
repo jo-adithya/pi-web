@@ -35,7 +35,7 @@ it("Vite preserves HTTP and socket proofs and keeps its HMR connection separate"
       req.setTimeout(5000, () => req.destroy(new Error("proxy test timeout")));
       req.end();
     });
-    for (const path of ["/auth", "/push", "/sw.js"]) {
+    for (const path of ["/auth"]) {
       expect(await send(path)).toEqual({ status: 200, body: "backend" });
       expect(seen.at(-1)).toEqual({ host: "machine.tailnet.ts.net", origin, path });
     }

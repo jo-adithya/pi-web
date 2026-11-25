@@ -7,6 +7,7 @@ import type { SessionModel } from "./session-model";
 import type { ThemePreference } from "./theme";
 import type { GroupOptions } from "./review-costs";
 import type { ResponseModel } from "./generated/protocol";
+import { setSwipeDebug, swipeDebugEnabled } from "./sidebar-swipe";
 import "./settings.css";
 
 /** Server-confirmed preferences shared by all conversations and connected devices. */
@@ -43,6 +44,10 @@ export function SettingsPage(props: SettingsPageProps) {
         options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]}
         change={value => { if (value === "system" || value === "light" || value === "dark") props.setTheme(value); }} />
     </section>
+    <section class="settings-section" aria-labelledby="diagnostics-title">
+      <div><h2 id="diagnostics-title">Diagnostics</h2><p>Show how this app handles sidebar gestures.</p></div>
+      <label><input type="checkbox" checked={swipeDebugEnabled()} onChange={event => setSwipeDebug(event.currentTarget.checked)} /> Swipe diagnostics</label>
+    </section>
     <section class="settings-section" aria-labelledby="response-settings-title">
       <div><h2 id="response-settings-title">Simple responses</h2><p>Always on. Each completed answer is simplified with this model. Shared across all workspaces and devices. Changes apply to new formatting calls; running calls keep their model.</p></div>
       <Show when={props.response} fallback={<p class="settings-help">Connect to load the simple response model.</p>}><ResponseSettings response={props.response!} model={props.model} /></Show>
@@ -61,7 +66,7 @@ function ResponseSettings(props: { response: ResponsePreferences; model?: Sessio
   const key = (model: ResponseModel) => JSON.stringify({ provider: model.provider, id: model.id });
   return <div class="settings-review">
     <SelectField class="settings-field" visibleLabel label="Simple response model" disabled={props.response.disabled()} value={value()}
-      description="Uses Pi’s existing credentials. Adds a separate model call; private details in the answer are sent to this provider. The coding model stays unchanged."
+      description="For new replies, this provider receives your prompt and Pi’s answer. It may also receive excerpts from cited or changed files unless Pi Web starts with --no-response-lookups. Lookups can add model calls. The coding model stays unchanged."
       options={[
         ...(!available().some(model => key(model) === value()) ? [{ value: value(), label: `${props.response.model().id} · ${props.response.model().provider} · currently unavailable`, disabled: true }] : []),
         ...available().map(model => ({ value: key(model), label: `${model.name} · ${model.provider}` })),

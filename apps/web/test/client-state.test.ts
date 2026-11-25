@@ -20,13 +20,34 @@ describe("snapshot and delta consistency", () => {
       expect(() => decodeServer(JSON.stringify(raw))).toThrow("Invalid server message");
     }
   });
+  it("associates delivery only with the matching live reply frame and forgets it on replacement", () => {
+    const state = setup();
+    const completed = snapshot(2);
+    if (completed.body.type !== "snapshot") throw new Error("Expected snapshot");
+    const saved = completed.body.messages[0];
+    saved.complete = true;
+    saved.presentation = { state: "ready", response: { summary: "The build passed. **It’s not deployed.**", blocks: [] } };
+    applyServer(state, completed);
+    const report: ServerBody = { type: "response_delivery", seq: 2, queueMs: 8, sendMs: 3 };
+    for (const stale of [frame({ ...report, seq: 1 }), frame(report, "old")]) {
+      applyServer(state, stale);
+      expect(state.replyArrivals?.m?.queueMs).toBeUndefined();
+    }
+    const decoded = decodeServer(JSON.stringify(frame(report)));
+    applyServer(state, decoded);
+    expect(state.replyArrivals?.m).toMatchObject({ queueMs: 8, sendMs: 3 });
+    expect(() => decodeServer(JSON.stringify(frame({ ...report, queueMs: -1 })))).toThrow("Invalid server message");
+    expect(() => decodeServer(JSON.stringify(frame({ ...report, sendMs: 1.5 })))).toThrow("Invalid server message");
+    applyServer(state, snapshot(3));
+    expect(state.replyArrivals).toEqual({});
+  });
   it("validates measured formatting durations and their stage relationships", () => {
     const raw = JSON.parse(JSON.stringify(snapshot()));
-    const timings = { model: "fixture/cheap", cached: false, totalMs: 3600, queueMs: 20, startupMs: 18, modelMs: 3560, firstTextMs: 1500, cleanupMs: 2 };
+    const timings = { model: "fixture/cheap", cached: false, totalMs: 3600, queueMs: 20, startupMs: 18, modelMs: 3560, firstTextMs: 1500, cleanupMs: 2, saveMs: 4 };
     for (const presentation of [{ state: "ready", response: { summary: "Done.", blocks: [] } }, { state: "error", message: "Timed out", retryable: true }]) {
       raw.body.messages[0].presentation = { ...presentation, timings };
       expect(() => decodeServer(JSON.stringify(raw))).not.toThrow();
-      for (const invalid of [null, {}, { ...timings, totalMs: -1 }, { ...timings, totalMs: Number.MAX_SAFE_INTEGER + 1 }, { ...timings, queueMs: 0.5 }, { ...timings, startupMs: 4000 }, { ...timings, modelMs: null }, { ...timings, firstTextMs: 3561 }, { ...timings, cleanupMs: 3 }, { ...timings, cached: "yes" }, { ...timings, model: " " }]) {
+      for (const invalid of [null, {}, { ...timings, totalMs: -1 }, { ...timings, totalMs: Number.MAX_SAFE_INTEGER + 1 }, { ...timings, queueMs: 0.5 }, { ...timings, startupMs: 4000 }, { ...timings, modelMs: null }, { ...timings, firstTextMs: 3561 }, { ...timings, cleanupMs: 3 }, { ...timings, saveMs: -1 }, { ...timings, cached: "yes" }, { ...timings, model: " " }]) {
         raw.body.messages[0].presentation = { ...presentation, timings: invalid };
         expect(() => decodeServer(JSON.stringify(raw))).toThrow("Invalid server message");
       }
@@ -48,6 +69,19 @@ describe("snapshot and delta consistency", () => {
     }
     raw.body.messages[0].presentation.response.blocks = [{ ...card, language: {} }];
     expect(() => decodeServer(JSON.stringify(raw))).toThrow("Invalid server message");
+  });
+  it("accepts bounded app-computed snippet rows and keeps legacy diffs as code", () => {
+    const raw = JSON.parse(JSON.stringify(snapshot()));
+    const diff = { type: "code", title: "Proposed edit", language: "diff", code: " same\n-old\n+new" };
+    raw.body.messages[0].presentation = { state: "ready", response: { summary: "Suggested, not applied.", blocks: [] } };
+    for (const card of [diff, { ...diff, snippetDiff: true }]) {
+      raw.body.messages[0].presentation.response.blocks = [card];
+      expect(() => decodeServer(JSON.stringify(raw))).not.toThrow();
+    }
+    for (const card of [{ ...diff, snippetDiff: false }, { ...diff, snippetDiff: true, code: "-old\nnew" }, { ...diff, snippetDiff: true, code: "-old\n" + "+line\n".repeat(240) + "+last" }]) {
+      raw.body.messages[0].presentation.response.blocks = [card];
+      expect(() => decodeServer(JSON.stringify(raw))).toThrow("Invalid server message");
+    }
   });
   it("accepts rectangular tables and rejects mismatched or empty cells", () => {
     const raw = JSON.parse(JSON.stringify(snapshot()));
@@ -76,11 +110,25 @@ describe("snapshot and delta consistency", () => {
     card.columns = Array(6).fill("Column"); card.rows = [Array(5).fill("Value")];
     expect(() => decodeServer(JSON.stringify(raw))).toThrow("Invalid server message");
   });
-  it("validates compact facts, before/after states and linear diagram labels", () => {
+  it("rejects invalid table purposes and incomplete conditional columns", () => {
+    const raw = JSON.parse(JSON.stringify(snapshot()));
+    const table = { type: "table", title: "Restart policy", purpose: "conditional", columns: ["Condition", "Action"], rows: [["Otherwise", "Keep running"]] };
+    raw.body.messages[0].presentation = { state: "ready", response: { summary: "Conditional action.", blocks: [table] } };
+    expect(() => decodeServer(JSON.stringify(raw))).not.toThrow();
+    for (const card of [
+      { ...table, purpose: "unknown" },
+      { ...table, columns: ["Condition"], rows: [["Otherwise"]] },
+      { ...table, purpose: "decision", columns: ["Option"], rows: [["Files"]] },
+    ]) {
+      raw.body.messages[0].presentation.response.blocks = [card];
+      expect(() => decodeServer(JSON.stringify(raw))).toThrow("Invalid server message");
+    }
+  });
+  it("validates compact facts, comparisons and linear diagram labels", () => {
     const raw = JSON.parse(JSON.stringify(snapshot()));
     const valid = [
       { type: "facts", title: "Key facts", items: [{ label: "Duration", value: "3.6 s" }] },
-      { type: "comparison", title: "Change", before: "Long wait.", after: "Short wait." },
+      { type: "comparison", title: "Change", left: { title: "Before", text: "Long wait." }, right: { title: "After", text: "Short wait." } },
       { type: "flow", title: "Answer path", items: ["Pi", "Formatter", "Answer"] },
     ];
     for (const card of valid) {
@@ -89,7 +137,11 @@ describe("snapshot and delta consistency", () => {
     }
     const invalid = [
       { ...valid[0], items: [] }, { ...valid[0], items: [{ label: " ", value: "3.6 s" }] },
-      { ...valid[1], before: " " }, { ...valid[2], items: ["Start", {}] },
+      { ...valid[1], left: { title: "Before", text: " " } },
+      { ...valid[1], right: { title: " ", text: "Short wait." } },
+      { ...valid[1], right: undefined },
+      { ...valid[1], mode: "unknown" },
+      { ...valid[2], items: ["Start", {}] },
     ];
     for (const card of invalid) {
       raw.body.messages[0].presentation.response.blocks = [card];
