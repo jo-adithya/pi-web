@@ -516,12 +516,21 @@ async fn lazy_listing_and_context_cache_skip_expanded_git_work() {
                 .all(|f| f["patch"].is_null())
         );
         let commands = fs::read_to_string(&log).unwrap();
-        assert_eq!(commands.lines().count(), 8, "{commands}");
-        assert_eq!(commands.matches("branch --show-current").count(), 1);
+        assert_eq!(list["currentBranch"], "main");
+        assert!(list["checkoutKey"].is_string());
+        // Eight listing/setup calls, plus Git directory, HEAD and branch before and after capture.
+        // Keep an upper bound so fewer metadata calls are not a regression.
+        assert!(commands.lines().count() <= 8 + 2 * 3, "{commands}");
+        assert_eq!(commands.matches("--name-status").count(), 1);
         assert_eq!(commands.matches("--numstat").count(), 1);
-        // Metadata stays lazy; one bounded full diff supplies content identity, not per-file patches.
+        // The only patch is the scope-wide identity diff, never a per-file patch.
         assert_eq!(commands.matches("--patch").count(), 1);
-        assert!(commands.contains("--binary --full-index"));
+        assert!(
+            commands
+                .lines()
+                .any(|line| line.ends_with("--patch --binary --full-index --")),
+            "{commands}"
+        );
         let input = f.context_input("unstaged", None, "file.txt").await;
         fs::write(&log, "").unwrap();
         let (status, first) = f.context(&input).await;
